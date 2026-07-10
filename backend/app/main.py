@@ -9,12 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import update
 
 from .api import router, websocket_endpoint
 from .auth_api import router as auth_router
 from .config import get_settings
 from .database import SessionLocal, init_db
-from .models import AuthUser, ConnectionConfig, EngineState
+from .models import AuthUser, BacktestRun, ConnectionConfig, EngineState, utcnow
 from .services.auth import SESSION_COOKIE, authenticate_raw_token, authenticate_request, validate_csrf
 from .services.alpaca_service import AlpacaService
 from .services.credentials import CredentialDecryptionError, decrypt_credential
@@ -33,11 +34,20 @@ async def lifespan(app: FastAPI):
     init_db()
     with SessionLocal() as db:
         seed_defaults(db)
+        db.execute(
+            update(BacktestRun)
+            .where(BacktestRun.status.in_(["queued", "running"]))
+            .values(
+                status="failed",
+                error="服务重启导致回测中断，请重新运行",
+                completed_at=utcnow(),
+            )
+        )
         if db.get(AuthUser, 1) is None:
             engine_state = db.get(EngineState, 1)
             engine_state.status = "paused"
             engine_state.reason = "等待首次创建管理员"
-            db.commit()
+        db.commit()
     alpaca = AlpacaService(settings)
     with SessionLocal() as db:
         saved_connection = db.get(ConnectionConfig, 1)
@@ -63,7 +73,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="QuantPilot",
     description="只连接 Alpaca Paper Trading 的自托管量化交易平台",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 app.add_middleware(

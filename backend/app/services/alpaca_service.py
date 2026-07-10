@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import logging
 import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -63,6 +65,8 @@ class AlpacaService:
         self._trade_stream: TradingStream | None = None
         self._stream_threads: list[threading.Thread] = []
         self._stream_symbols: tuple[str, ...] = ()
+        self._bars_cache: OrderedDict[tuple[Any, ...], tuple[float, dict[str, pd.DataFrame]]] = OrderedDict()
+        self._bars_cache_lock = threading.Lock()
         self.configure_from_env()
 
     @staticmethod
@@ -101,6 +105,8 @@ class AlpacaService:
         self.configured = self._credentials_valid(self.api_key_id, self.api_secret_key)
         self.historical = None
         self.trading = None
+        with self._bars_cache_lock:
+            self._bars_cache.clear()
         if self.configured:
             self.historical = StockHistoricalDataClient(self.api_key_id, self.api_secret_key)
             self.trading = TradingClient(self.api_key_id, self.api_secret_key, paper=True)
@@ -115,6 +121,8 @@ class AlpacaService:
         self.configured = False
         self.historical = None
         self.trading = None
+        with self._bars_cache_lock:
+            self._bars_cache.clear()
 
     def configure_from_env(self) -> None:
         if self.settings.alpaca_configured:
@@ -217,10 +225,25 @@ class AlpacaService:
         start: datetime,
         end: datetime,
         limit: int | None = None,
+        use_cache: bool = False,
     ) -> dict[str, pd.DataFrame]:
         self.require_connection()
+        normalized_symbols = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        cache_key = (
+            tuple(normalized_symbols),
+            timeframe,
+            start.isoformat(),
+            end.isoformat(),
+            limit,
+        )
+        if use_cache:
+            with self._bars_cache_lock:
+                cached = self._bars_cache.get(cache_key)
+                if cached is not None and time.monotonic() - cached[0] < 300:
+                    self._bars_cache.move_to_end(cache_key)
+                    return {symbol: frame.copy() for symbol, frame in cached[1].items()}
         request = StockBarsRequest(
-            symbol_or_symbols=symbols,
+            symbol_or_symbols=normalized_symbols,
             timeframe=self.timeframe(timeframe),
             start=start,
             end=end,
@@ -231,18 +254,37 @@ class AlpacaService:
         response = self.historical.get_stock_bars(request)
         frame = response.df.copy()
         if frame.empty:
-            return {symbol: pd.DataFrame() for symbol in symbols}
+            result = {symbol: pd.DataFrame() for symbol in normalized_symbols}
+            if use_cache:
+                self._store_bars_cache(cache_key, result)
+            return result
         result: dict[str, pd.DataFrame] = {}
         if isinstance(frame.index, pd.MultiIndex):
-            for symbol in symbols:
+            for symbol in normalized_symbols:
                 try:
                     symbol_frame = frame.xs(symbol, level="symbol").copy()
                 except (KeyError, ValueError):
                     symbol_frame = pd.DataFrame()
                 result[symbol] = self._normalize_bar_frame(symbol_frame)
         else:
-            result[symbols[0]] = self._normalize_bar_frame(frame)
+            result[normalized_symbols[0]] = self._normalize_bar_frame(frame)
+        if use_cache:
+            self._store_bars_cache(cache_key, result)
         return result
+
+    def _store_bars_cache(
+        self,
+        key: tuple[Any, ...],
+        frames: dict[str, pd.DataFrame],
+    ) -> None:
+        with self._bars_cache_lock:
+            self._bars_cache[key] = (
+                time.monotonic(),
+                {symbol: frame.copy() for symbol, frame in frames.items()},
+            )
+            self._bars_cache.move_to_end(key)
+            while len(self._bars_cache) > 8:
+                self._bars_cache.popitem(last=False)
 
     def recent_bars(self, symbols: list[str], timeframe: str, bars: int = 300) -> dict[str, pd.DataFrame]:
         minutes = {"5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 390}[timeframe]

@@ -80,6 +80,8 @@ export type BacktestRun = {
   completed_at: string | null
 }
 
+export type BacktestSummary = Omit<BacktestRun, 'equity_curve' | 'benchmark_curve' | 'trades'>
+
 export type DashboardData = {
   connection: { configured: boolean; connected: boolean; paper: boolean; feed: string; message: string }
   account: Record<string, string | number | boolean>

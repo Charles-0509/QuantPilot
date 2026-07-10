@@ -45,6 +45,9 @@ class BacktestResult:
     trades: list[dict[str, Any]]
 
 
+MAX_CHART_POINTS = 1200
+
+
 def _price_guard(entry_price: float, guard: PriceGuard | None, atr_value: float | None, side: str) -> float | None:
     if guard is None:
         return None
@@ -96,7 +99,10 @@ def run_backtest(
     if not frames:
         raise ValueError("没有可用于回测的K线数据")
 
-    timeline = sorted(set().union(*(frame.index for frame in frames.values())))
+    timeline = pd.DatetimeIndex([])
+    for frame in frames.values():
+        timeline = timeline.union(frame.index)
+    timeline = timeline.sort_values()
     cash = float(initial_cash)
     positions: dict[str, Position] = {}
     pending: dict[str, PendingAction] = {}
@@ -104,14 +110,13 @@ def run_backtest(
     trades: list[dict[str, Any]] = []
     equity_points: list[dict[str, Any]] = []
     exposure_points: list[float] = []
+    mark_prices: dict[str, float] = {}
     slippage = slippage_bps / 10_000
 
-    def current_equity(timestamp: pd.Timestamp) -> float:
+    def current_equity() -> float:
         value = cash
         for symbol, position in positions.items():
-            frame = frames[symbol]
-            eligible = frame.loc[frame.index <= timestamp]
-            mark = float(eligible.iloc[-1]["close"]) if not eligible.empty else position.average_price
+            mark = mark_prices.get(symbol, position.average_price)
             value += position.qty * mark
         return value
 
@@ -134,17 +139,33 @@ def run_backtest(
                 "pnl": round(pnl, 2),
                 "return_pct": round((exit_price / position.average_price - 1) * 100, 3),
                 "reason": reason,
-                "bars_held": int(sum(1 for t in frames[symbol].index if position.entry_time <= t <= timestamp)),
+                "bars_held": max(
+                    1,
+                    int(
+                        frames[symbol].index.searchsorted(timestamp, side="right")
+                        - frames[symbol].index.searchsorted(position.entry_time, side="left")
+                    ),
+                ),
             }
         )
 
     for timeline_index, timestamp in enumerate(timeline):
+        rows = {
+            symbol: frame.loc[timestamp]
+            for symbol, frame in frames.items()
+            if timestamp in frame.index
+        }
+        # Pending orders execute at the current open. Existing positions are
+        # marked to that open for sizing, avoiding both repeated history scans
+        # and accidental use of the current bar's future close.
+        for symbol, row in rows.items():
+            mark_prices[symbol] = float(row["open"])
+
         # Orders created at the previous close execute at this bar's open. Limit entries expire after one bar.
         for symbol, action in list(pending.items()):
-            frame = frames.get(symbol)
-            if frame is None or timestamp not in frame.index or timestamp <= action.created_at:
+            row = rows.get(symbol)
+            if row is None or timestamp <= action.created_at:
                 continue
-            row = frame.loc[timestamp]
             if action.action == "exit" and symbol in positions:
                 close_position(symbol, timestamp, float(row["open"]), "规则离场")
             elif action.action == "entry":
@@ -159,7 +180,7 @@ def run_backtest(
                 else:
                     raw_fill = float(row["open"])
                 fill = raw_fill * (1 + slippage)
-                equity = current_equity(timestamp)
+                equity = current_equity()
                 atr_value = float(signals[symbol][2].loc[timestamp]) if timestamp in signals[symbol][2].index else None
                 stop = _price_guard(fill, definition.order.stop_loss, atr_value, "stop")
                 take = _price_guard(fill, definition.order.take_profit, atr_value, "take")
@@ -197,10 +218,9 @@ def run_backtest(
 
         # Intrabar risk exits use conservative ordering: stop/trailing before take profit.
         for symbol, position in list(positions.items()):
-            frame = frames[symbol]
-            if timestamp not in frame.index:
+            row = rows.get(symbol)
+            if row is None:
                 continue
-            row = frame.loc[timestamp]
             position.high_water = max(position.high_water, float(row["high"]))
             trailing_price = None
             if position.trailing_value is not None:
@@ -221,7 +241,8 @@ def run_backtest(
 
         # Signals are generated only after the completed bar and execute on the next bar.
         for symbol, frame in frames.items():
-            if timestamp not in frame.index or symbol in pending:
+            row = rows.get(symbol)
+            if row is None or symbol in pending:
                 continue
             entry_signal, exit_signal, _ = signals[symbol]
             if symbol in positions and bool(exit_signal.loc[timestamp]):
@@ -235,12 +256,14 @@ def run_backtest(
             if can_add and cooldown_ok and bool(entry_signal.loc[timestamp]):
                 limit = None
                 if definition.order.type == "limit":
-                    limit = float(frame.loc[timestamp, "close"]) * (
+                    limit = float(row["close"]) * (
                         1 - definition.order.limit_offset_bps / 10_000
                     )
                 pending[symbol] = PendingAction(symbol, "entry", timestamp, limit)
 
-        equity = current_equity(timestamp)
+        for symbol, row in rows.items():
+            mark_prices[symbol] = float(row["close"])
+        equity = current_equity()
         invested = equity - cash
         equity_points.append({"timestamp": timestamp.isoformat(), "equity": round(equity, 2)})
         exposure_points.append(max(0, invested / equity) if equity else 0)
@@ -256,8 +279,19 @@ def run_backtest(
         equity_points[-1]["equity"] = round(cash, 2)
 
     metrics = calculate_metrics(equity_points, trades, initial_cash, exposure_points, definition.timeframe)
-    benchmark_curve = build_benchmark_curve(benchmark, initial_cash) if benchmark is not None else []
-    return BacktestResult(metrics, equity_points, benchmark_curve, trades)
+    benchmark_curve = (
+        build_benchmark_curve(
+            benchmark,
+            initial_cash,
+            [pd.Timestamp(point["timestamp"]) for point in equity_points],
+        )
+        if benchmark is not None
+        else []
+    )
+    sample_indices = curve_sample_indices(equity_points, MAX_CHART_POINTS)
+    sampled_equity = [equity_points[index] for index in sample_indices]
+    sampled_benchmark = [benchmark_curve[index] for index in sample_indices] if benchmark_curve else []
+    return BacktestResult(metrics, sampled_equity, sampled_benchmark, trades)
 
 
 def periods_per_year(timeframe: str) -> int:
@@ -316,12 +350,44 @@ def calculate_metrics(
     }
 
 
-def build_benchmark_curve(frame: pd.DataFrame, initial_cash: float) -> list[dict[str, Any]]:
+def curve_sample_indices(
+    curve: list[dict[str, Any]], max_points: int = MAX_CHART_POINTS
+) -> list[int]:
+    """Preserve endpoints and local extrema while bounding chart payload size."""
+    length = len(curve)
+    if length <= max_points:
+        return list(range(length))
+    interior = length - 2
+    bucket_count = max(1, (max_points - 2) // 2)
+    bucket_size = math.ceil(interior / bucket_count)
+    indices = [0]
+    for start in range(1, length - 1, bucket_size):
+        stop = min(length - 1, start + bucket_size)
+        bucket = range(start, stop)
+        minimum = min(bucket, key=lambda index: float(curve[index]["equity"]))
+        maximum = max(bucket, key=lambda index: float(curve[index]["equity"]))
+        indices.extend(sorted({minimum, maximum}))
+    indices.append(length - 1)
+    unique = sorted(set(indices))
+    if len(unique) > max_points:
+        return unique[: max_points - 1] + [unique[-1]]
+    return unique
+
+
+def build_benchmark_curve(
+    frame: pd.DataFrame,
+    initial_cash: float,
+    timestamps: list[pd.Timestamp] | None = None,
+) -> list[dict[str, Any]]:
     frame = ensure_frame(frame)
     if frame.empty:
         return []
     first = float(frame.iloc[0]["close"])
+    normalized = frame["close"].astype(float) / first * initial_cash
+    if timestamps is not None:
+        target = pd.DatetimeIndex(timestamps)
+        normalized = normalized.reindex(target, method="ffill").bfill()
     return [
-        {"timestamp": index.isoformat(), "equity": round(initial_cash * float(row["close"]) / first, 2)}
-        for index, row in frame.iterrows()
+        {"timestamp": index.isoformat(), "equity": round(float(value), 2)}
+        for index, value in normalized.items()
     ]

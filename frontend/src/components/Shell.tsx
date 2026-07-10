@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
@@ -29,6 +30,47 @@ const navigation = [
 
 export default function Shell() {
   const client = useQueryClient()
+  useEffect(() => {
+    let socket: WebSocket | null = null
+    let retryTimer: number | undefined
+    let stopped = false
+    let attempts = 0
+
+    const connect = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      socket = new WebSocket(`${protocol}//${window.location.host}/ws/events`)
+      socket.onopen = () => { attempts = 0 }
+      socket.onmessage = (message) => {
+        try {
+          const payload = JSON.parse(message.data) as { event?: string; data?: Record<string, unknown> }
+          if (payload.event === 'backtest') {
+            client.invalidateQueries({ queryKey: ['backtests'] })
+            if (payload.data?.id) client.invalidateQueries({ queryKey: ['backtest', String(payload.data.id)] })
+          }
+          if (payload.event === 'engine') client.invalidateQueries({ queryKey: ['engine'] })
+          if (['engine', 'signal', 'trade_update'].includes(payload.event || '')) {
+            client.invalidateQueries({ queryKey: ['dashboard'] })
+          }
+        } catch {
+          // Ignore malformed or forward-compatible event payloads.
+        }
+      }
+      socket.onclose = (event) => {
+        if (stopped || event.code === 4401) return
+        const delay = Math.min(30_000, 1000 * 2 ** attempts)
+        attempts += 1
+        retryTimer = window.setTimeout(connect, delay)
+      }
+    }
+
+    connect()
+    return () => {
+      stopped = true
+      if (retryTimer) window.clearTimeout(retryTimer)
+      socket?.close()
+    }
+  }, [client])
+
   const connection = useQuery({
     queryKey: ['connection'],
     queryFn: () => api<any>('/api/connection'),

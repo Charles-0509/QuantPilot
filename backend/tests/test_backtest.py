@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.schemas import RuleDefinition
-from app.services.backtest import run_backtest
+from app.services.backtest import MAX_CHART_POINTS, run_backtest
 
 
 def definition(stop: float | None = None, take: float | None = None) -> RuleDefinition:
@@ -74,3 +74,34 @@ def test_stop_is_conservative_when_stop_and_target_hit_same_bar() -> None:
     result = run_backtest(definition(stop=2, take=4), {"SPY": bars}, initial_cash=10_000, slippage_bps=0)
     assert result.trades[0]["reason"] == "止损/移动止损"
     assert result.trades[0]["exit_price"] == 98
+
+
+def test_large_curves_are_downsampled_and_benchmark_remains_aligned() -> None:
+    index = pd.date_range("2018-01-01", periods=2500, freq="D", tz="UTC")
+    prices = pd.Series(range(100, 2600), index=index, dtype=float)
+    bars = pd.DataFrame(
+        {
+            "open": prices,
+            "high": prices + 1,
+            "low": prices - 1,
+            "close": prices,
+            "volume": 1000,
+        },
+        index=index,
+    )
+    benchmark = bars.assign(close=prices * 1.1)
+    result = run_backtest(
+        definition(),
+        {"SPY": bars},
+        initial_cash=10_000,
+        slippage_bps=0,
+        benchmark=benchmark,
+    )
+
+    assert len(result.equity_curve) <= MAX_CHART_POINTS
+    assert len(result.equity_curve) == len(result.benchmark_curve)
+    assert [point["timestamp"] for point in result.equity_curve] == [
+        point["timestamp"] for point in result.benchmark_curve
+    ]
+    assert result.equity_curve[0]["timestamp"] == index[0].isoformat()
+    assert result.equity_curve[-1]["timestamp"] == index[-1].isoformat()

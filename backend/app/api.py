@@ -5,11 +5,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+import pandas as pd
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
-from .database import get_db
+from .database import SessionLocal, get_db
 from .models import (
     BacktestRun,
     ConnectionConfig,
@@ -26,6 +27,7 @@ from .models import (
 from .schemas import (
     BacktestRead,
     BacktestRequest,
+    BacktestSummaryRead,
     ConnectionConfigRead,
     ConnectionConfigUpdate,
     EngineAction,
@@ -44,6 +46,7 @@ from .services.engine import TradingEngine
 from .services.websocket import websocket_manager
 
 router = APIRouter(prefix="/api")
+backtest_semaphore = asyncio.Semaphore(2)
 
 
 def get_alpaca(request: Request) -> AlpacaService:
@@ -60,7 +63,7 @@ def service_error(exc: Exception) -> HTTPException:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.1.0"}
+    return {"status": "ok", "paper": True, "version": "1.2.0"}
 
 
 @router.get("/metadata")
@@ -416,9 +419,18 @@ def restore_strategy(strategy_id: str, version: int, db: Session = Depends(get_d
     return strategy
 
 
-@router.get("/backtests", response_model=list[BacktestRead])
+@router.get("/backtests", response_model=list[BacktestSummaryRead])
 def list_backtests(db: Session = Depends(get_db)) -> list[BacktestRun]:
-    return db.scalars(select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(50)).all()
+    return db.scalars(
+        select(BacktestRun)
+        .options(
+            defer(BacktestRun.equity_curve),
+            defer(BacktestRun.benchmark_curve),
+            defer(BacktestRun.trades),
+        )
+        .order_by(BacktestRun.created_at.desc())
+        .limit(50)
+    ).all()
 
 
 @router.get("/backtests/{run_id}", response_model=BacktestRead)
@@ -429,9 +441,77 @@ def get_backtest(run_id: str, db: Session = Depends(get_db)) -> BacktestRun:
     return run
 
 
-@router.post("/backtests", response_model=BacktestRead, status_code=201)
+async def execute_backtest_job(
+    run_id: str,
+    definition_data: dict[str, Any],
+    payload_data: dict[str, Any],
+    alpaca: AlpacaService,
+) -> None:
+    async with backtest_semaphore:
+        with SessionLocal() as db:
+            run = db.get(BacktestRun, run_id)
+            if run is None:
+                return
+            run.status = "running"
+            db.commit()
+        await websocket_manager.broadcast("backtest", {"id": run_id, "status": "running"})
+
+        definition = RuleDefinition.model_validate(definition_data)
+        payload = BacktestRequest.model_validate(payload_data)
+
+        def execute() -> tuple[dict, list, list, list]:
+            requested = list(dict.fromkeys([*definition.symbols, payload.benchmark]))
+            frames = alpaca.get_bars(
+                requested,
+                definition.timeframe,
+                payload.start,
+                payload.end,
+                use_cache=True,
+            )
+            result = run_backtest(
+                definition,
+                {symbol: frames.get(symbol, pd.DataFrame()) for symbol in definition.symbols},
+                initial_cash=payload.initial_cash,
+                slippage_bps=payload.slippage_bps,
+                commission=payload.commission,
+                benchmark=frames.get(payload.benchmark),
+            )
+            return result.metrics, result.equity_curve, result.benchmark_curve, result.trades
+
+        try:
+            metrics, equity, benchmark, trades = await asyncio.to_thread(execute)
+            with SessionLocal() as db:
+                run = db.get(BacktestRun, run_id)
+                if run is None:
+                    return
+                run.status = "completed"
+                run.metrics = metrics
+                run.equity_curve = equity
+                run.benchmark_curve = benchmark
+                run.trades = trades
+                run.error = None
+                run.completed_at = utcnow()
+                db.commit()
+            await websocket_manager.broadcast("backtest", {"id": run_id, "status": "completed"})
+        except Exception as exc:
+            with SessionLocal() as db:
+                run = db.get(BacktestRun, run_id)
+                if run is None:
+                    return
+                run.status = "failed"
+                run.error = str(exc)
+                run.completed_at = utcnow()
+                db.commit()
+            await websocket_manager.broadcast(
+                "backtest",
+                {"id": run_id, "status": "failed"},
+            )
+
+
+@router.post("/backtests", response_model=BacktestSummaryRead, status_code=202)
 async def create_backtest(
     payload: BacktestRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
 ) -> BacktestRun:
@@ -440,40 +520,35 @@ async def create_backtest(
         raise HTTPException(status_code=404, detail="策略不存在")
     if not alpaca.configured:
         raise HTTPException(status_code=503, detail="回测需要配置 Alpaca Paper API 密钥以获取历史行情")
-    definition = RuleDefinition.model_validate(strategy.definition)
+    definition_data = deepcopy(strategy.definition)
+    if payload.symbols:
+        definition_data["symbols"] = payload.symbols
+    definition = RuleDefinition.model_validate(definition_data)
+    max_days = {
+        "5Min": 730,
+        "15Min": 1825,
+        "30Min": 3650,
+        "1Hour": 5475,
+        "1Day": 10950,
+    }[definition.timeframe]
+    if (payload.end - payload.start).days > max_days:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{definition.timeframe} 回测区间最多支持 {max_days} 天，请缩短日期范围",
+        )
     parameters = payload.model_dump(mode="json")
-    run = BacktestRun(strategy_id=strategy.id, status="running", parameters=parameters)
+    parameters["symbols"] = definition.symbols
+    run = BacktestRun(strategy_id=strategy.id, status="queued", parameters=parameters)
     db.add(run)
     db.commit()
     db.refresh(run)
-
-    def execute() -> tuple[dict, list, list, list]:
-        frames = alpaca.get_bars(definition.symbols, definition.timeframe, payload.start, payload.end)
-        benchmark_frames = alpaca.get_bars([payload.benchmark], definition.timeframe, payload.start, payload.end)
-        result = run_backtest(
-            definition,
-            frames,
-            initial_cash=payload.initial_cash,
-            slippage_bps=payload.slippage_bps,
-            commission=payload.commission,
-            benchmark=benchmark_frames.get(payload.benchmark),
-        )
-        return result.metrics, result.equity_curve, result.benchmark_curve, result.trades
-
-    try:
-        metrics, equity, benchmark, trades = await asyncio.to_thread(execute)
-        run.status = "completed"
-        run.metrics = metrics
-        run.equity_curve = equity
-        run.benchmark_curve = benchmark
-        run.trades = trades
-        run.completed_at = utcnow()
-    except Exception as exc:
-        run.status = "failed"
-        run.error = str(exc)
-        run.completed_at = utcnow()
-    db.commit()
-    db.refresh(run)
+    background_tasks.add_task(
+        execute_backtest_job,
+        run.id,
+        definition.model_dump(mode="json"),
+        payload.model_dump(mode="json"),
+        alpaca,
+    )
     return run
 
 

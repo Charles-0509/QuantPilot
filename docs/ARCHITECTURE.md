@@ -29,7 +29,7 @@ SQLite audit trail + /ws/events
 - `alpaca_service.py`：唯一接触 Alpaca SDK 的适配层，强制 Paper 模式。
 - `indicators.py`：无第三方 TA 二进制依赖的 pandas 指标实现。
 - `rules.py`：递归条件树与交叉条件计算。
-- `backtest.py`：与实时规则解释器共用指标和条件的事件式回测。
+- `backtest.py`：与实时规则解释器共用指标和条件的事件式回测；使用常数时间持仓估值、对齐基准曲线和保极值降采样。
 - `risk.py`：账户、市场时段、行情新鲜度、仓位和回撤检查。
 - `engine.py`：后台策略循环、流订阅、幂等信号、下单和订单对账。
 - `auth.py` / `auth_api.py`：Argon2id 单管理员认证、OAuth2 Password 接口、不透明会话与 CSRF 校验。
@@ -54,6 +54,8 @@ SQLite 开启 WAL、外键和 NORMAL synchronous。主要数据包括：
 - 最近市场K线、事件日志、风险配置和引擎状态。
 
 Alpaca 密钥以 Fernet 密文进入数据库，解密侧车密钥保存在 `data/.credentials.key`；管理员密码仅保存 Argon2id 哈希，OAuth2 令牌仅保存 SHA-256 摘要。容器重启后 `data/` 中的 SQLite 数据与有效会话通过卷挂载保留。
+
+回测任务先以 `queued` 状态写入 SQLite，再由后台线程获取并缓存历史K线、执行计算并保存结果。列表接口只读取摘要字段，完整曲线和交易明细只在打开具体结果时加载；服务重启会把未完成任务标记为中断，避免任务永久卡在运行中。
 
 ## 外部部署
 

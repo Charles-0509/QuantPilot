@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import {
   Area,
   AreaChart,
@@ -11,16 +12,20 @@ import {
 export default function EquityChart({
   equity,
   benchmark = [],
+  benchmarkLabel = '基准',
 }: {
   equity: Array<{ timestamp: string; equity: number }>
   benchmark?: Array<{ timestamp: string; equity: number }>
+  benchmarkLabel?: string
 }) {
-  const benchmarkMap = new Map(benchmark.map((item) => [item.timestamp, item.equity]))
-  const data = equity.map((item) => ({
-    ...item,
-    label: new Date(item.timestamp).toLocaleDateString('zh-CN'),
-    benchmark: benchmarkMap.get(item.timestamp),
-  }))
+  const data = useMemo(() => {
+    const benchmarkMap = new Map(benchmark.map((item) => [item.timestamp, item.equity]))
+    return equity.map((item) => ({
+      ...item,
+      label: new Date(item.timestamp).toLocaleDateString('zh-CN'),
+      benchmark: benchmarkMap.get(item.timestamp),
+    }))
+  }, [benchmark, equity])
   return (
     <div className="chart-frame">
       <ResponsiveContainer width="100%" height={310}>
@@ -35,8 +40,8 @@ export default function EquityChart({
           <XAxis dataKey="label" stroke="#60748f" tickLine={false} axisLine={false} minTickGap={40} />
           <YAxis stroke="#60748f" tickLine={false} axisLine={false} width={70} />
           <Tooltip contentStyle={{ background: '#0b1320', border: '1px solid #24354d', borderRadius: 12 }} />
-          <Area type="monotone" dataKey="equity" stroke="#3df6de" strokeWidth={2} fill="url(#equityFill)" />
-          {benchmark.length > 0 && <Area type="monotone" dataKey="benchmark" stroke="#a775ff" fill="transparent" strokeWidth={1.5} />}
+          <Area name="策略净值" type="monotone" dataKey="equity" stroke="#3df6de" strokeWidth={2} fill="url(#equityFill)" isAnimationActive={false} />
+          {benchmark.length > 0 && <Area name={`${benchmarkLabel} 基准`} type="monotone" dataKey="benchmark" stroke="#a775ff" fill="transparent" strokeWidth={1.5} isAnimationActive={false} />}
         </AreaChart>
       </ResponsiveContainer>
     </div>

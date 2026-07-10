@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
@@ -175,7 +176,30 @@ class BacktestRequest(BaseModel):
     initial_cash: float = Field(default=100_000, gt=0)
     slippage_bps: float = Field(default=5, ge=0, le=1000)
     commission: float = Field(default=0, ge=0)
+    symbols: list[str] | None = Field(default=None, min_length=1, max_length=10)
     benchmark: str = "SPY"
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_backtest_symbols(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        symbols = [symbol.strip().upper() for symbol in value if symbol.strip()]
+        if not symbols:
+            raise ValueError("至少需要一个回测标的")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("回测标的不能重复")
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol) for symbol in symbols):
+            raise ValueError("回测标的代码格式不正确")
+        return symbols
+
+    @field_validator("benchmark")
+    @classmethod
+    def normalize_benchmark(cls, value: str) -> str:
+        symbol = value.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
+            raise ValueError("基准代码格式不正确")
+        return symbol
 
     @model_validator(mode="after")
     def validate_range(self) -> "BacktestRequest":
@@ -195,6 +219,19 @@ class BacktestRead(BaseModel):
     equity_curve: list[dict[str, Any]]
     benchmark_curve: list[dict[str, Any]]
     trades: list[dict[str, Any]]
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class BacktestSummaryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    strategy_id: str
+    status: str
+    parameters: dict[str, Any]
+    metrics: dict[str, Any]
     error: str | None
     created_at: datetime
     completed_at: datetime | None

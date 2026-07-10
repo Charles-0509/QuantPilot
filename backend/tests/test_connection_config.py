@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -51,6 +53,46 @@ def test_service_runtime_configuration_is_always_paper(monkeypatch: pytest.Monke
     assert service.source == "web"
     assert service.trading.paper is True
     assert service.connection_config()["api_key_hint"] == "...ABCD"
+
+
+def test_historical_backtest_bars_use_short_lived_cache(tmp_path: Path) -> None:
+    index = pd.date_range("2025-01-01", periods=3, freq="D", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [100, 101, 102],
+            "high": [101, 102, 103],
+            "low": [99, 100, 101],
+            "close": [100, 101, 102],
+            "volume": [1000, 1000, 1000],
+        },
+        index=index,
+    )
+
+    class Response:
+        df = frame
+
+    class FakeHistorical:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_stock_bars(self, _request):
+            self.calls += 1
+            return Response()
+
+    service = AlpacaService(local_settings(tmp_path))
+    historical = FakeHistorical()
+    service.configured = True
+    service.historical = historical
+    service.trading = object()
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2025, 1, 4, tzinfo=timezone.utc)
+
+    first = service.get_bars(["SPY"], "1Day", start, end, use_cache=True)
+    first["SPY"].iloc[0, 0] = -1
+    second = service.get_bars(["SPY"], "1Day", start, end, use_cache=True)
+
+    assert historical.calls == 1
+    assert second["SPY"].iloc[0]["open"] == 100
 
 
 @pytest.mark.asyncio

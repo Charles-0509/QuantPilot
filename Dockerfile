@@ -19,7 +19,7 @@ COPY backend/ ./backend/
 COPY alembic.ini ./
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 RUN mkdir -p /app/data
-EXPOSE 8080
+EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8080 --workers 1"]
+  CMD curl -fsS http://127.0.0.1:10000/api/health || exit 1
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --app-dir backend --host ${QUANTPILOT_HOST:-0.0.0.0} --port ${QUANTPILOT_PORT:-10000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]

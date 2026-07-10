@@ -1,9 +1,9 @@
 import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, Database, Eye, EyeOff, KeyRound, LockKeyhole, Save, Server, ShieldCheck, Trash2, WifiOff } from 'lucide-react'
+import { CheckCircle2, Database, Eye, EyeOff, KeyRound, LockKeyhole, LogOut, Save, Server, ShieldCheck, Trash2, UserRound, WifiOff } from 'lucide-react'
 import { api, ApiError, formatTime } from '../api'
 import { Badge, Button, Card, Field, Loading, PageHeader } from '../components/UI'
-import type { ConnectionConfig } from '../types'
+import type { AuthUser, ConnectionConfig } from '../types'
 
 type ConnectionStatus = {
   configured: boolean
@@ -79,7 +79,7 @@ export default function SettingsPage() {
 
   return <>
     <PageHeader
-      eyebrow="LOCAL SYSTEM CONFIG"
+      eyebrow="SECURE SYSTEM CONFIG"
       title="设置"
       description="直接在此验证并更新 Alpaca Paper 密钥。程序没有实盘开关，也不会将密钥返回到浏览器。"
       actions={<Badge tone={status?.connected ? 'success' : 'warning'}>{status?.connected ? '模拟盘已连接' : '未连接'}</Badge>}
@@ -121,17 +121,74 @@ export default function SettingsPage() {
       </Card>
     </div>
     <Card style={{ marginTop: 16 } as any}>
-      <div className="card-header"><div><h2>本机存储与系统边界</h2><p>连接凭据只在当前 Mac 的 Docker 数据卷内使用</p></div></div>
+      <div className="card-header"><div><h2>服务器存储与系统边界</h2><p>连接凭据只在当前 QuantPilot 实例的 Docker 数据卷内使用</p></div></div>
       <div className="settings-security-grid">
-        <SecurityItem label="加密保存" value="密文存入 SQLite，解密密钥保存在 data/.credentials.key" />
+        <SecurityItem label="加密保存" value="密文存入 SQLite，解密密钥保存在服务器 data/.credentials.key" />
         <SecurityItem label="覆盖顺序" value="网页加密配置优先；移除后自动使用 .env 后备配置" />
         <SecurityItem label="变更保护" value="保存或移除配置后，引擎会暂停且不会自动恢复" />
         <SecurityItem label="资产范围" value="美股 / ETF，只做多；常规交易时段" />
         <SecurityItem label="实时订阅" value="IEX 最多 30 个股票代码" />
-        <SecurityItem label="部署要求" value="保护 data/ 目录，Mac 运行自动交易时需保持开机联网" />
+        <SecurityItem label="部署要求" value="保护 data/ 目录，运行自动交易的主机需保持开机联网" />
       </div>
     </Card>
+    <AccountSecurity />
   </>
+}
+
+function AccountSecurity() {
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [error, setError] = useState('')
+  const me = useQuery({ queryKey: ['auth-me'], queryFn: () => api<AuthUser>('/api/auth/me') })
+  const changePassword = useMutation({
+    mutationFn: () => api<void>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }),
+    onSuccess: () => window.location.reload(),
+    onError: (requestError: Error) => setError(requestError instanceof ApiError ? requestError.message : '修改密码失败'),
+  })
+  const logoutAll = useMutation({
+    mutationFn: () => api<void>('/api/auth/logout-all', { method: 'POST' }),
+    onSuccess: () => window.location.reload(),
+    onError: () => setError('注销会话失败，请稍后重试'),
+  })
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    setError('')
+    if (newPassword.length < 12) {
+      setError('新密码至少需要12位')
+      return
+    }
+    if (newPassword !== confirmPassword) {
+      setError('两次输入的新密码不一致')
+      return
+    }
+    changePassword.mutate()
+  }
+  const revokeAll = () => {
+    if (window.confirm('注销包括当前浏览器在内的全部登录会话？')) logoutAll.mutate()
+  }
+
+  return <Card style={{ marginTop: 16 } as any}>
+    <div className="card-header"><div><h2>管理员与会话安全</h2><p>OAuth2 不透明会话令牌仅以摘要形式保存</p></div><UserRound size={19} color="#a775ff" /></div>
+    <div className="two-column card-pad">
+      <div className="stack">
+        <StatusRow icon={<UserRound size={16} />} label="当前管理员" value={me.data?.username || '—'} />
+        <StatusRow icon={<LockKeyhole size={16} />} label="会话有效期" value="12小时" />
+        <div className="warning-callout">修改密码后会注销全部设备，需要使用新密码重新登录。</div>
+        <Button type="button" variant="danger" onClick={revokeAll} disabled={logoutAll.isPending}><LogOut size={15} />{logoutAll.isPending ? '正在注销...' : '退出所有设备'}</Button>
+      </div>
+      <form className="stack" onSubmit={submit}>
+        <Field label="当前密码"><input aria-label="当前密码" type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Field>
+        <Field label="新密码" hint="长度至少12位"><input aria-label="新密码" type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></Field>
+        <Field label="确认新密码"><input aria-label="确认新密码" type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></Field>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <Button type="submit" disabled={changePassword.isPending}><KeyRound size={15} />{changePassword.isPending ? '正在更新...' : '修改密码并注销会话'}</Button>
+      </form>
+    </div>
+  </Card>
 }
 
 function StatusRow({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {

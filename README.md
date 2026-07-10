@@ -31,7 +31,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-3. 打开 [http://localhost:8080](http://localhost:8080)，在 Alpaca Dashboard 切换到 **Paper Account** 后，进入“设置”直接填写并验证 API Key 与 Secret。网页配置会以密文保存到本机 SQLite 数据库；解密密钥仅保存在同一台机器的 `data/.credentials.key`，请保护 Docker 的 `data/` 目录。
+3. 打开 [http://localhost:10000](http://localhost:10000)。首次启动先创建唯一管理员；登录后，在 Alpaca Dashboard 切换到 **Paper Account**，进入“设置”填写并验证 API Key 与 Secret。网页配置会以密文保存到本机 SQLite 数据库；解密密钥仅保存在同一台机器的 `data/.credentials.key`，请保护 Docker 的 `data/` 目录。
 
 4. `.env` 仍可作为无界面部署的后备配置：
 
@@ -41,7 +41,9 @@ APCA_API_SECRET_KEY=你的模拟盘Secret
 ALPACA_DATA_FEED=iex
 ```
 
-Docker 仅映射到 `127.0.0.1`。网页中更新 Alpaca 配置后，交易引擎会进入安全暂停状态，需在“自动交易”页面确认后重新启动。网页配置优先于 `.env`；移除网页配置后会自动回退到 `.env`。如果未填写密钥，应用仍会启动并展示策略模板，但行情、回测和下单功能保持禁用。
+Docker 默认将 `10000` 端口发布到 `0.0.0.0`，可供局域网、FRP 或反向代理访问。生产环境必须使用 HTTPS，并在 `.env` 中设置 `QUANTPILOT_COOKIE_SECURE=true`。网页中更新 Alpaca 配置后，交易引擎会进入安全暂停状态，需在“自动交易”页面确认后重新启动。网页配置优先于 `.env`；移除网页配置后会自动回退到 `.env`。
+
+也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.1.0` 或 `ghcr.io/charles-0509/quantpilot:latest`。
 
 ## 推荐使用顺序
 
@@ -69,7 +71,7 @@ npm test
 docker compose run --rm quantpilot pytest -q
 ```
 
-API 文档位于 [http://localhost:8080/docs](http://localhost:8080/docs)。
+登录后的 API 文档位于 [http://localhost:10000/docs](http://localhost:10000/docs)。FRP、Nginx 与 HTTPS 配置参见 [部署说明](docs/DEPLOYMENT.md)。
 
 ## 数据与模拟限制
 

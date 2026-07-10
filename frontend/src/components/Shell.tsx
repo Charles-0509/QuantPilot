@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   BarChart3,
@@ -7,12 +7,14 @@ import {
   ChartCandlestick,
   FlaskConical,
   Gauge,
+  LogOut,
   Orbit,
   Settings,
   ShieldCheck,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
+import type { AuthUser } from '../types'
 import { Badge } from './UI'
 
 const navigation = [
@@ -26,10 +28,19 @@ const navigation = [
 ]
 
 export default function Shell() {
+  const client = useQueryClient()
   const connection = useQuery({
     queryKey: ['connection'],
     queryFn: () => api<any>('/api/connection'),
     refetchInterval: 15000,
+  })
+  const me = useQuery({ queryKey: ['auth-me'], queryFn: () => api<AuthUser>('/api/auth/me') })
+  const logout = useMutation({
+    mutationFn: () => api<void>('/api/auth/logout', { method: 'POST' }),
+    onSuccess: () => {
+      client.clear()
+      window.location.reload()
+    },
   })
 
   return (
@@ -54,7 +65,7 @@ export default function Shell() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="system-pulse"><span /> 系统本地运行</div>
+          <div className="system-pulse"><span /> 系统安全运行</div>
           <p>交易接口被永久锁定为模拟盘</p>
         </div>
       </aside>
@@ -69,6 +80,8 @@ export default function Shell() {
             <Badge tone={connection.data?.connected ? 'success' : 'warning'}>
               {connection.data?.connected ? '模拟盘已连接' : '等待 Alpaca 密钥'}
             </Badge>
+            <span className="topbar-user">{me.data?.username || '管理员'}</span>
+            <button className="button button-ghost icon-button" aria-label="退出登录" title="退出登录" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={15} /></button>
           </div>
         </div>
         <div className="page-container"><Outlet /></div>

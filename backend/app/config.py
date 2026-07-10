@@ -20,11 +20,12 @@ class Settings(BaseSettings):
     apca_api_secret_key: str = ""
     alpaca_data_feed: str = "iex"
     investor_db_path: str = "data/investor.db"
-    investor_host: str = "127.0.0.1"
-    investor_port: int = 8080
+    quantpilot_host: str = "0.0.0.0"
+    quantpilot_port: int = 10000
+    quantpilot_cookie_secure: bool = False
+    quantpilot_session_hours: int = Field(default=12, ge=1, le=168)
     quote_interval_seconds: int = Field(default=5, ge=5, le=300)
     default_symbols: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["SPY", "QQQ"])
-    investor_basic_auth: str | None = None
     log_level: str = "INFO"
 
     @field_validator("default_symbols", mode="before")

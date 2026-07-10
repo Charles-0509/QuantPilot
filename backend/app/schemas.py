@@ -236,6 +236,37 @@ class ConnectionConfigRead(BaseModel):
     updated_at: datetime | None = None
 
 
+class AuthSetupRequest(BaseModel):
+    # Password validation is intentionally performed manually so FastAPI never
+    # echoes password values in a validation error response.
+    username: str = ""
+    password: str = ""
+
+
+class AuthPasswordChange(BaseModel):
+    current_password: str = ""
+    new_password: str = ""
+
+
+class AuthUserRead(BaseModel):
+    username: str
+    created_at: datetime
+    last_login_at: datetime | None = None
+
+
+class AuthStatusRead(BaseModel):
+    setup_required: bool
+    authenticated: bool
+    user: AuthUserRead | None = None
+
+
+class OAuthTokenRead(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    scope: Literal["admin"] = "admin"
+
+
 class WatchlistUpdate(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=30)
 

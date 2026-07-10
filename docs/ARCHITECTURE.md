@@ -32,7 +32,16 @@ SQLite audit trail + /ws/events
 - `backtest.py`：与实时规则解释器共用指标和条件的事件式回测。
 - `risk.py`：账户、市场时段、行情新鲜度、仓位和回撤检查。
 - `engine.py`：后台策略循环、流订阅、幂等信号、下单和订单对账。
+- `auth.py` / `auth_api.py`：Argon2id 单管理员认证、OAuth2 Password 接口、不透明会话与 CSRF 校验。
 - `api.py`：策略、回测、行情、风险和引擎控制接口。
+
+## 认证边界
+
+首次启动且数据库中不存在管理员时，公开初始化页允许创建固定 `id=1` 的唯一管理员。数据库唯一约束保证并发初始化只有一个请求成功；完成后初始化接口永久返回 409。
+
+密码使用 Argon2id 自带的独立随机盐进行哈希。登录通过 OAuth2 Password 表单签发 12 小时有效的不透明随机令牌，数据库只保存令牌及 CSRF 值的 SHA-256 摘要，不保存原始令牌，也不使用 JWT。浏览器会话保存在 `HttpOnly`、`SameSite=Strict` Cookie 中；写操作同时要求可读 CSRF Cookie 与 `X-CSRF-Token` 请求头。API 客户端可以使用 `Authorization: Bearer <token>`，此模式不要求 CSRF。
+
+除健康检查、认证状态、首次初始化、登录和前端静态资源外，REST API、OpenAPI 文档和 WebSocket 都需要有效会话。WebSocket 还验证同源 `Origin`，认证失败分别使用 4401/4403 关闭码。
 
 ## 持久化
 
@@ -44,7 +53,11 @@ SQLite 开启 WAL、外键和 NORMAL synchronous。主要数据包括：
 - Alpaca 订单镜像。
 - 最近市场K线、事件日志、风险配置和引擎状态。
 
-密钥不进入数据库。容器重启后 `data/` 中的 SQLite 数据通过卷挂载保留。
+Alpaca 密钥以 Fernet 密文进入数据库，解密侧车密钥保存在 `data/.credentials.key`；管理员密码仅保存 Argon2id 哈希，OAuth2 令牌仅保存 SHA-256 摘要。容器重启后 `data/` 中的 SQLite 数据与有效会话通过卷挂载保留。
+
+## 外部部署
+
+容器内 Uvicorn 与 Docker 发布端口统一为 `0.0.0.0:10000`。公网部署建议只让 FRP 或可信网络访问源站端口，由 Nginx 终止 HTTPS，并传递 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` 以及 WebSocket Upgrade 头。HTTPS 环境必须设置 `QUANTPILOT_COOKIE_SECURE=true`。完整示例见 `docs/DEPLOYMENT.md`。
 
 ## 失败模式
 

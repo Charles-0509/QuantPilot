@@ -1,0 +1,14 @@
+name: quantpilot
+
+services:
+  quantpilot:
+    image: quantpilot:latest
+    build: .
+    container_name: quantpilot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped

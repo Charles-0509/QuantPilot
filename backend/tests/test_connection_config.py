@@ -144,6 +144,7 @@ async def test_web_config_endpoint_persists_ciphertext_and_pauses_engine(
         db=session,
         alpaca=fake_alpaca,
         engine=fake_engine,
+        user_id=1,
     )
 
     saved = session.get(ConnectionConfig, 1)

@@ -286,9 +286,28 @@ class AuthPasswordChange(BaseModel):
 
 
 class AuthUserRead(BaseModel):
+    id: int
     username: str
+    role: Literal["admin", "user"]
+    is_active: bool
+    alpaca_configured: bool = False
     created_at: datetime
     last_login_at: datetime | None = None
+
+
+class UserCreateRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    role: Literal["admin", "user"] = "user"
+
+
+class UserUpdateRequest(BaseModel):
+    role: Literal["admin", "user"] | None = None
+    is_active: bool | None = None
+
+
+class UserPasswordResetRequest(BaseModel):
+    password: str = ""
 
 
 class AuthStatusRead(BaseModel):
@@ -301,7 +320,7 @@ class OAuthTokenRead(BaseModel):
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: int
-    scope: Literal["admin"] = "admin"
+    scope: Literal["admin", "user"] = "user"
 
 
 class WatchlistUpdate(BaseModel):

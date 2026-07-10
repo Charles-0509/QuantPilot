@@ -77,7 +77,7 @@ describe('AuthGate', () => {
     mocks.apiForm.mockResolvedValue({ access_token: 'opaque-token', token_type: 'bearer' })
     renderGate()
     expect(await screen.findByRole('heading', { name: '欢迎回来' })).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('管理员用户名'), { target: { value: 'charles' } })
+    fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'charles' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'correct-horse-battery' } })
     fireEvent.click(screen.getByRole('button', { name: '登录 QuantPilot' }))
     await waitFor(() => expect(mocks.apiForm).toHaveBeenCalledWith(

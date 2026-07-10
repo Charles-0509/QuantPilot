@@ -22,6 +22,9 @@ class Strategy(Base):
     __tablename__ = "strategies"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4str)
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     template_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
@@ -54,6 +57,9 @@ class BacktestRun(Base):
     __tablename__ = "backtest_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4str)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), default=1, index=True
+    )
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -70,6 +76,9 @@ class Signal(Base):
     __tablename__ = "signals"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4str)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), default=1, index=True
+    )
     unique_key: Mapped[str] = mapped_column(String(220), unique=True, index=True)
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id", ondelete="CASCADE"), index=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
@@ -86,6 +95,9 @@ class OrderRecord(Base):
     __tablename__ = "orders"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), default=1, index=True
+    )
     client_order_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     strategy_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     signal_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
@@ -123,6 +135,9 @@ class EventLog(Base):
     __tablename__ = "event_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     level: Mapped[str] = mapped_column(String(16), default="info", index=True)
     category: Mapped[str] = mapped_column(String(32), default="system", index=True)
     message: Mapped[str] = mapped_column(Text)
@@ -133,7 +148,10 @@ class EventLog(Base):
 class RiskSettings(Base):
     __tablename__ = "risk_settings"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), unique=True, index=True, default=1
+    )
     max_symbol_pct: Mapped[float] = mapped_column(Float, default=10.0)
     max_total_exposure_pct: Mapped[float] = mapped_column(Float, default=80.0)
     max_positions: Mapped[int] = mapped_column(Integer, default=8)
@@ -146,7 +164,10 @@ class RiskSettings(Base):
 class EngineState(Base):
     __tablename__ = "engine_state"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), unique=True, index=True, default=1
+    )
     status: Mapped[str] = mapped_column(String(24), default="paused")
     reason: Mapped[str] = mapped_column(Text, default="首次启动，等待用户开启")
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -159,6 +180,9 @@ class EngineState(Base):
 class WatchlistItem(Base):
     __tablename__ = "watchlist"
 
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), primary_key=True, default=1
+    )
     symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -168,7 +192,10 @@ class ConnectionConfig(Base):
 
     __tablename__ = "connection_config"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), unique=True, index=True, default=1
+    )
     api_key_cipher: Mapped[str] = mapped_column(Text)
     api_secret_cipher: Mapped[str] = mapped_column(Text)
     data_feed: Mapped[str] = mapped_column(String(12), default="iex")
@@ -178,12 +205,11 @@ class ConnectionConfig(Base):
 class AuthUser(Base):
     __tablename__ = "auth_users"
 
-    # QuantPilot intentionally supports one administrator. A fixed primary key
-    # makes concurrent first-run setup attempts safe at the database boundary.
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(64))
     username_normalized: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(String(16), default="user", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

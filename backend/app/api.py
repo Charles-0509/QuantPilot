@@ -10,6 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, defer
 
+from .auth_api import require_session
 from .database import SessionLocal, get_db
 from .models import (
     BacktestRun,
@@ -40,21 +41,35 @@ from .schemas import (
     WatchlistUpdate,
 )
 from .services.alpaca_service import AlpacaService
+from .services.auth import AuthenticatedSession
 from .services.backtest import run_backtest
 from .services.credentials import encrypt_credential
 from .services.engine import TradingEngine
+from .services.runtime import UserRuntime, UserRuntimeManager
 from .services.websocket import websocket_manager
 
 router = APIRouter(prefix="/api")
 backtest_semaphore = asyncio.Semaphore(2)
 
 
-def get_alpaca(request: Request) -> AlpacaService:
-    return request.app.state.alpaca
+def current_user_id(session: AuthenticatedSession = Depends(require_session)) -> int:
+    return session.user.id
 
 
-def get_engine(request: Request) -> TradingEngine:
-    return request.app.state.trading_engine
+async def get_runtime(
+    request: Request,
+    session: AuthenticatedSession = Depends(require_session),
+) -> UserRuntime:
+    manager: UserRuntimeManager = request.app.state.runtime_manager
+    return await manager.ensure(session.user.id)
+
+
+def get_alpaca(runtime: UserRuntime = Depends(get_runtime)) -> AlpacaService:
+    return runtime.alpaca
+
+
+def get_engine(runtime: UserRuntime = Depends(get_runtime)) -> TradingEngine:
+    return runtime.engine
 
 
 def service_error(exc: Exception) -> HTTPException:
@@ -63,7 +78,7 @@ def service_error(exc: Exception) -> HTTPException:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.2.0"}
+    return {"status": "ok", "paper": True, "version": "1.3.0"}
 
 
 @router.get("/metadata")
@@ -106,6 +121,7 @@ async def update_connection_config(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
     engine: TradingEngine = Depends(get_engine),
+    user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
     api_key_id = payload.api_key_id.strip()
     api_secret_key = payload.api_secret_key.strip()
@@ -125,10 +141,10 @@ async def update_connection_config(
     except Exception as exc:
         raise HTTPException(status_code=500, detail="无法安全保存本机 Alpaca 配置") from exc
 
-    saved = db.get(ConnectionConfig, 1)
+    saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
     if saved is None:
         saved = ConnectionConfig(
-            id=1,
+            user_id=user_id,
             api_key_cipher=api_key_cipher,
             api_secret_cipher=api_secret_cipher,
             data_feed="iex",
@@ -160,13 +176,17 @@ async def delete_connection_config(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
     engine: TradingEngine = Depends(get_engine),
+    user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
-    saved = db.get(ConnectionConfig, 1)
+    saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
     if saved is not None:
         db.delete(saved)
         db.commit()
     await engine.pause("已移除网页 Alpaca 配置，请检查后重新启动引擎", cancel_orders=False)
-    alpaca.configure_from_env()
+    if user_id == 1:
+        alpaca.configure_from_env()
+    else:
+        alpaca.clear_configuration()
     engine.reset_connection()
     return alpaca.connection_config()
 
@@ -246,27 +266,52 @@ async def market_bars(
 
 
 @router.get("/watchlist")
-def get_watchlist(db: Session = Depends(get_db)) -> list[str]:
-    return db.scalars(select(WatchlistItem.symbol).order_by(WatchlistItem.symbol)).all()
+def get_watchlist(
+    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+) -> list[str]:
+    return db.scalars(
+        select(WatchlistItem.symbol)
+        .where(WatchlistItem.user_id == user_id)
+        .order_by(WatchlistItem.symbol)
+    ).all()
 
 
 @router.put("/watchlist")
-def update_watchlist(payload: WatchlistUpdate, db: Session = Depends(get_db)) -> list[str]:
-    db.execute(delete(WatchlistItem))
+def update_watchlist(
+    payload: WatchlistUpdate,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> list[str]:
+    db.execute(delete(WatchlistItem).where(WatchlistItem.user_id == user_id))
     for symbol in payload.symbols:
-        db.add(WatchlistItem(symbol=symbol))
+        db.add(WatchlistItem(user_id=user_id, symbol=symbol))
     db.commit()
     return payload.symbols
 
 
 @router.get("/strategies", response_model=list[StrategyRead])
-def list_strategies(db: Session = Depends(get_db)) -> list[Strategy]:
-    return db.scalars(select(Strategy).order_by(Strategy.is_template.desc(), Strategy.updated_at.desc())).all()
+def list_strategies(
+    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+) -> list[Strategy]:
+    return db.scalars(
+        select(Strategy)
+        .where((Strategy.is_template.is_(True)) | (Strategy.owner_user_id == user_id))
+        .order_by(Strategy.is_template.desc(), Strategy.updated_at.desc())
+    ).all()
 
 
 @router.get("/strategies/{strategy_id}", response_model=StrategyRead)
-def get_strategy(strategy_id: str, db: Session = Depends(get_db)) -> Strategy:
-    strategy = db.get(Strategy, strategy_id)
+def get_strategy(
+    strategy_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
+    strategy = db.scalar(
+        select(Strategy).where(
+            Strategy.id == strategy_id,
+            (Strategy.is_template.is_(True)) | (Strategy.owner_user_id == user_id),
+        )
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     return strategy
@@ -278,9 +323,14 @@ def validate_strategy(definition: RuleDefinition) -> dict[str, Any]:
 
 
 @router.post("/strategies", response_model=StrategyRead, status_code=201)
-def create_strategy(payload: StrategyCreate, db: Session = Depends(get_db)) -> Strategy:
+def create_strategy(
+    payload: StrategyCreate,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
     definition = payload.definition.model_dump(mode="json")
     strategy = Strategy(
+        owner_user_id=user_id,
         name=payload.definition.name,
         description=payload.definition.description,
         definition=definition,
@@ -297,8 +347,15 @@ def create_strategy(payload: StrategyCreate, db: Session = Depends(get_db)) -> S
 
 
 @router.put("/strategies/{strategy_id}", response_model=StrategyRead)
-def update_strategy(strategy_id: str, payload: StrategyCreate, db: Session = Depends(get_db)) -> Strategy:
-    strategy = db.get(Strategy, strategy_id)
+def update_strategy(
+    strategy_id: str,
+    payload: StrategyCreate,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
+    strategy = db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     if strategy.is_template:
@@ -316,13 +373,23 @@ def update_strategy(strategy_id: str, payload: StrategyCreate, db: Session = Dep
 
 
 @router.post("/strategies/{strategy_id}/clone", response_model=StrategyRead, status_code=201)
-def clone_strategy(strategy_id: str, db: Session = Depends(get_db)) -> Strategy:
-    source = db.get(Strategy, strategy_id)
+def clone_strategy(
+    strategy_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
+    source = db.scalar(
+        select(Strategy).where(
+            Strategy.id == strategy_id,
+            (Strategy.is_template.is_(True)) | (Strategy.owner_user_id == user_id),
+        )
+    )
     if source is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     definition = deepcopy(source.definition)
     definition["name"] = f"{source.name} - 副本"
     clone = Strategy(
+        owner_user_id=user_id,
         name=definition["name"],
         description=source.description,
         definition=definition,
@@ -339,8 +406,14 @@ def clone_strategy(strategy_id: str, db: Session = Depends(get_db)) -> Strategy:
 
 
 @router.delete("/strategies/{strategy_id}", status_code=204)
-def delete_strategy(strategy_id: str, db: Session = Depends(get_db)) -> None:
-    strategy = db.get(Strategy, strategy_id)
+def delete_strategy(
+    strategy_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> None:
+    strategy = db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     if strategy.is_template:
@@ -354,8 +427,11 @@ def enable_strategy(
     strategy_id: str,
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
 ) -> Strategy:
-    strategy = db.get(Strategy, strategy_id)
+    strategy = db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     if strategy.is_template:
@@ -363,7 +439,11 @@ def enable_strategy(
     if not alpaca.configured:
         raise HTTPException(status_code=503, detail="请先配置 Alpaca Paper API 密钥")
     RuleDefinition.model_validate(strategy.definition)
-    enabled = db.scalars(select(Strategy).where(Strategy.enabled.is_(True))).all()
+    enabled = db.scalars(
+        select(Strategy).where(
+            Strategy.enabled.is_(True), Strategy.owner_user_id == user_id
+        )
+    ).all()
     symbols = set(strategy.definition["symbols"])
     for item in enabled:
         symbols.update(item.definition.get("symbols", []))
@@ -376,8 +456,14 @@ def enable_strategy(
 
 
 @router.post("/strategies/{strategy_id}/disable", response_model=StrategyRead)
-def disable_strategy(strategy_id: str, db: Session = Depends(get_db)) -> Strategy:
-    strategy = db.get(Strategy, strategy_id)
+def disable_strategy(
+    strategy_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
+    strategy = db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     strategy.enabled = False
@@ -387,7 +473,19 @@ def disable_strategy(strategy_id: str, db: Session = Depends(get_db)) -> Strateg
 
 
 @router.get("/strategies/{strategy_id}/versions", response_model=list[StrategyVersionRead])
-def strategy_versions(strategy_id: str, db: Session = Depends(get_db)) -> list[StrategyVersion]:
+def strategy_versions(
+    strategy_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> list[StrategyVersion]:
+    strategy = db.scalar(
+        select(Strategy.id).where(
+            Strategy.id == strategy_id,
+            (Strategy.is_template.is_(True)) | (Strategy.owner_user_id == user_id),
+        )
+    )
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="策略不存在")
     return db.scalars(
         select(StrategyVersion)
         .where(StrategyVersion.strategy_id == strategy_id)
@@ -396,8 +494,15 @@ def strategy_versions(strategy_id: str, db: Session = Depends(get_db)) -> list[S
 
 
 @router.post("/strategies/{strategy_id}/restore/{version}", response_model=StrategyRead)
-def restore_strategy(strategy_id: str, version: int, db: Session = Depends(get_db)) -> Strategy:
-    strategy = db.get(Strategy, strategy_id)
+def restore_strategy(
+    strategy_id: str,
+    version: int,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> Strategy:
+    strategy = db.scalar(
+        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
+    )
     saved = db.scalar(
         select(StrategyVersion).where(
             StrategyVersion.strategy_id == strategy_id,
@@ -420,9 +525,12 @@ def restore_strategy(strategy_id: str, version: int, db: Session = Depends(get_d
 
 
 @router.get("/backtests", response_model=list[BacktestSummaryRead])
-def list_backtests(db: Session = Depends(get_db)) -> list[BacktestRun]:
+def list_backtests(
+    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+) -> list[BacktestRun]:
     return db.scalars(
         select(BacktestRun)
+        .where(BacktestRun.user_id == user_id)
         .options(
             defer(BacktestRun.equity_curve),
             defer(BacktestRun.benchmark_curve),
@@ -434,14 +542,21 @@ def list_backtests(db: Session = Depends(get_db)) -> list[BacktestRun]:
 
 
 @router.get("/backtests/{run_id}", response_model=BacktestRead)
-def get_backtest(run_id: str, db: Session = Depends(get_db)) -> BacktestRun:
-    run = db.get(BacktestRun, run_id)
+def get_backtest(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> BacktestRun:
+    run = db.scalar(
+        select(BacktestRun).where(BacktestRun.id == run_id, BacktestRun.user_id == user_id)
+    )
     if run is None:
         raise HTTPException(status_code=404, detail="回测记录不存在")
     return run
 
 
 async def execute_backtest_job(
+    user_id: int,
     run_id: str,
     definition_data: dict[str, Any],
     payload_data: dict[str, Any],
@@ -449,12 +564,16 @@ async def execute_backtest_job(
 ) -> None:
     async with backtest_semaphore:
         with SessionLocal() as db:
-            run = db.get(BacktestRun, run_id)
+            run = db.scalar(
+                select(BacktestRun).where(
+                    BacktestRun.id == run_id, BacktestRun.user_id == user_id
+                )
+            )
             if run is None:
                 return
             run.status = "running"
             db.commit()
-        await websocket_manager.broadcast("backtest", {"id": run_id, "status": "running"})
+        await websocket_manager.broadcast(user_id, "backtest", {"id": run_id, "status": "running"})
 
         definition = RuleDefinition.model_validate(definition_data)
         payload = BacktestRequest.model_validate(payload_data)
@@ -481,7 +600,11 @@ async def execute_backtest_job(
         try:
             metrics, equity, benchmark, trades = await asyncio.to_thread(execute)
             with SessionLocal() as db:
-                run = db.get(BacktestRun, run_id)
+                run = db.scalar(
+                    select(BacktestRun).where(
+                        BacktestRun.id == run_id, BacktestRun.user_id == user_id
+                    )
+                )
                 if run is None:
                     return
                 run.status = "completed"
@@ -492,10 +615,16 @@ async def execute_backtest_job(
                 run.error = None
                 run.completed_at = utcnow()
                 db.commit()
-            await websocket_manager.broadcast("backtest", {"id": run_id, "status": "completed"})
+            await websocket_manager.broadcast(
+                user_id, "backtest", {"id": run_id, "status": "completed"}
+            )
         except Exception as exc:
             with SessionLocal() as db:
-                run = db.get(BacktestRun, run_id)
+                run = db.scalar(
+                    select(BacktestRun).where(
+                        BacktestRun.id == run_id, BacktestRun.user_id == user_id
+                    )
+                )
                 if run is None:
                     return
                 run.status = "failed"
@@ -503,6 +632,7 @@ async def execute_backtest_job(
                 run.completed_at = utcnow()
                 db.commit()
             await websocket_manager.broadcast(
+                user_id,
                 "backtest",
                 {"id": run_id, "status": "failed"},
             )
@@ -514,8 +644,14 @@ async def create_backtest(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
 ) -> BacktestRun:
-    strategy = db.get(Strategy, payload.strategy_id)
+    strategy = db.scalar(
+        select(Strategy).where(
+            Strategy.id == payload.strategy_id,
+            (Strategy.is_template.is_(True)) | (Strategy.owner_user_id == user_id),
+        )
+    )
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     if not alpaca.configured:
@@ -538,12 +674,15 @@ async def create_backtest(
         )
     parameters = payload.model_dump(mode="json")
     parameters["symbols"] = definition.symbols
-    run = BacktestRun(strategy_id=strategy.id, status="queued", parameters=parameters)
+    run = BacktestRun(
+        user_id=user_id, strategy_id=strategy.id, status="queued", parameters=parameters
+    )
     db.add(run)
     db.commit()
     db.refresh(run)
     background_tasks.add_task(
         execute_backtest_job,
+        user_id,
         run.id,
         definition.model_dump(mode="json"),
         payload.model_dump(mode="json"),
@@ -553,9 +692,15 @@ async def create_backtest(
 
 
 @router.get("/engine")
-def engine_status(db: Session = Depends(get_db)) -> dict[str, Any]:
-    state = db.get(EngineState, 1)
-    enabled_count = db.scalar(select(func.count()).select_from(Strategy).where(Strategy.enabled.is_(True)))
+def engine_status(
+    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+) -> dict[str, Any]:
+    state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
+    enabled_count = db.scalar(
+        select(func.count())
+        .select_from(Strategy)
+        .where(Strategy.enabled.is_(True), Strategy.owner_user_id == user_id)
+    )
     return {
         "status": state.status,
         "reason": state.reason,
@@ -600,13 +745,19 @@ async def emergency_liquidate(
 
 
 @router.get("/risk-settings", response_model=RiskSettingsRead)
-def get_risk_settings(db: Session = Depends(get_db)) -> RiskSettings:
-    return db.get(RiskSettings, 1)
+def get_risk_settings(
+    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+) -> RiskSettings:
+    return db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
 
 
 @router.put("/risk-settings", response_model=RiskSettingsRead)
-def update_risk_settings(payload: RiskSettingsUpdate, db: Session = Depends(get_db)) -> RiskSettings:
-    settings = db.get(RiskSettings, 1)
+def update_risk_settings(
+    payload: RiskSettingsUpdate,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
+) -> RiskSettings:
+    settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
     for key, value in payload.model_dump().items():
         setattr(settings, key, value)
     db.commit()
@@ -618,8 +769,14 @@ def update_risk_settings(payload: RiskSettingsUpdate, db: Session = Depends(get_
 def events(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
 ) -> list[dict[str, Any]]:
-    rows = db.scalars(select(EventLog).order_by(EventLog.created_at.desc()).limit(limit)).all()
+    rows = db.scalars(
+        select(EventLog)
+        .where(EventLog.user_id == user_id)
+        .order_by(EventLog.created_at.desc())
+        .limit(limit)
+    ).all()
     return [
         {
             "id": row.id,
@@ -637,8 +794,14 @@ def events(
 def signals(
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
+    user_id: int = Depends(current_user_id),
 ) -> list[dict[str, Any]]:
-    rows = db.scalars(select(Signal).order_by(Signal.created_at.desc()).limit(limit)).all()
+    rows = db.scalars(
+        select(Signal)
+        .where(Signal.user_id == user_id)
+        .order_by(Signal.created_at.desc())
+        .limit(limit)
+    ).all()
     return [
         {
             "id": row.id,
@@ -659,6 +822,7 @@ def signals(
 async def dashboard(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
     connection_status = await asyncio.to_thread(alpaca.connection_status)
     account_data: dict[str, Any] = {}
@@ -675,9 +839,19 @@ async def dashboard(
             )
         except Exception:
             pass
-    state = db.get(EngineState, 1)
-    recent_events = db.scalars(select(EventLog).order_by(EventLog.created_at.desc()).limit(12)).all()
-    recent_signals = db.scalars(select(Signal).order_by(Signal.created_at.desc()).limit(8)).all()
+    state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
+    recent_events = db.scalars(
+        select(EventLog)
+        .where(EventLog.user_id == user_id)
+        .order_by(EventLog.created_at.desc())
+        .limit(12)
+    ).all()
+    recent_signals = db.scalars(
+        select(Signal)
+        .where(Signal.user_id == user_id)
+        .order_by(Signal.created_at.desc())
+        .limit(8)
+    ).all()
     return {
         "connection": connection_status,
         "account": account_data,
@@ -712,8 +886,8 @@ async def dashboard(
     }
 
 
-async def websocket_endpoint(websocket: WebSocket) -> None:
-    await websocket_manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, user_id: int) -> None:
+    await websocket_manager.connect(websocket, user_id)
     try:
         await websocket.send_json({"event": "connected", "data": {"paper": True}})
         while True:

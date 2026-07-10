@@ -50,7 +50,7 @@ export default function SettingsPage() {
       setApiKeyId('')
       setApiSecretKey('')
       setFormError('')
-      setNotice('网页 Alpaca 配置已移除。系统已回退到 .env 配置（如已填写），且交易引擎保持暂停。')
+      setNotice('当前账户的网页 Alpaca 配置已移除，交易引擎保持暂停。')
       refresh()
     },
     onError: () => setFormError('移除网页配置失败，请稍后重试'),
@@ -71,7 +71,7 @@ export default function SettingsPage() {
     save.mutate()
   }
   const removeWebConfig = () => {
-    if (window.confirm('移除网页保存的 Alpaca Paper 密钥？系统将回退到 .env（如有），并暂停交易引擎。')) {
+    if (window.confirm('移除当前账户保存的 Alpaca Paper 密钥并暂停交易引擎？')) {
       setNotice('')
       remove.mutate()
     }
@@ -124,7 +124,7 @@ export default function SettingsPage() {
       <div className="card-header"><div><h2>服务器存储与系统边界</h2><p>连接凭据只在当前 QuantPilot 实例的 Docker 数据卷内使用</p></div></div>
       <div className="settings-security-grid">
         <SecurityItem label="加密保存" value="密文存入 SQLite，解密密钥保存在服务器 data/.credentials.key" />
-        <SecurityItem label="覆盖顺序" value="网页加密配置优先；移除后自动使用 .env 后备配置" />
+        <SecurityItem label="账户隔离" value="每个 QuantPilot 用户单独保存并使用自己的 Alpaca Paper 凭据" />
         <SecurityItem label="变更保护" value="保存或移除配置后，引擎会暂停且不会自动恢复" />
         <SecurityItem label="资产范围" value="美股 / ETF，只做多；常规交易时段" />
         <SecurityItem label="实时订阅" value="IEX 最多 30 个股票代码" />
@@ -172,10 +172,10 @@ function AccountSecurity() {
   }
 
   return <Card style={{ marginTop: 16 } as any}>
-    <div className="card-header"><div><h2>管理员与会话安全</h2><p>OAuth2 不透明会话令牌仅以摘要形式保存</p></div><UserRound size={19} color="#a775ff" /></div>
+    <div className="card-header"><div><h2>账户与会话安全</h2><p>OAuth2 不透明会话令牌仅以摘要形式保存</p></div><UserRound size={19} color="#a775ff" /></div>
     <div className="two-column card-pad">
       <div className="stack">
-        <StatusRow icon={<UserRound size={16} />} label="当前管理员" value={me.data?.username || '—'} />
+        <StatusRow icon={<UserRound size={16} />} label="当前账户" value={me.data ? `${me.data.username} · ${me.data.role === 'admin' ? '管理员' : '普通用户'}` : '—'} />
         <StatusRow icon={<LockKeyhole size={16} />} label="会话有效期" value="12小时" />
         <div className="warning-callout">修改密码后会注销全部设备，需要使用新密码重新登录。</div>
         <Button type="button" variant="danger" onClick={revokeAll} disabled={logoutAll.isPending}><LogOut size={15} />{logoutAll.isPending ? '正在注销...' : '退出所有设备'}</Button>

@@ -12,6 +12,7 @@ import {
   Orbit,
   Settings,
   ShieldCheck,
+  Users,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
@@ -99,7 +100,7 @@ export default function Shell() {
         </div>
         <div className="paper-seal"><Activity size={14} /> ALPACA PAPER ONLY</div>
         <nav>
-          {navigation.map(({ to, label, icon: Icon }) => (
+          {[...navigation, ...(me.data?.role === 'admin' ? [{ to: '/users', label: '用户管理', icon: Users }] : [])].map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
               <Icon size={18} />
               <span>{label}</span>
@@ -122,7 +123,8 @@ export default function Shell() {
             <Badge tone={connection.data?.connected ? 'success' : 'warning'}>
               {connection.data?.connected ? '模拟盘已连接' : '等待 Alpaca 密钥'}
             </Badge>
-            <span className="topbar-user">{me.data?.username || '管理员'}</span>
+            {me.data && <Badge tone={me.data.role === 'admin' ? 'info' : 'neutral'}>{me.data.role === 'admin' ? '管理员' : '用户'}</Badge>}
+            <span className="topbar-user">{me.data?.username || '用户'}</span>
             <button className="button button-ghost icon-button" aria-label="退出登录" title="退出登录" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={15} /></button>
           </div>
         </div>

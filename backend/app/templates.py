@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import EngineState, RiskSettings, Strategy, StrategyVersion, WatchlistItem
+from .models import AuthUser, EngineState, RiskSettings, Strategy, StrategyVersion, WatchlistItem
 from .schemas import RuleDefinition
 
 
@@ -352,12 +352,13 @@ TEMPLATES: dict[str, dict] = {
 }
 
 
-def seed_defaults(db: Session) -> None:
+def seed_templates(db: Session) -> None:
     for key, definition in TEMPLATES.items():
         existing = db.scalar(select(Strategy).where(Strategy.template_key == key))
         if existing:
             continue
         strategy = Strategy(
+            owner_user_id=None,
             name=definition["name"],
             description=definition["description"],
             template_key=key,
@@ -370,14 +371,28 @@ def seed_defaults(db: Session) -> None:
         db.flush()
         db.add(StrategyVersion(strategy_id=strategy.id, version=1, definition=definition))
 
-    if db.get(RiskSettings, 1) is None:
-        db.add(RiskSettings(id=1))
-    if db.get(EngineState, 1) is None:
-        db.add(EngineState(id=1))
+    db.commit()
+
+
+def seed_user_defaults(db: Session, user_id: int) -> None:
+    if db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id)) is None:
+        db.add(RiskSettings(user_id=user_id))
+    if db.scalar(select(EngineState).where(EngineState.user_id == user_id)) is None:
+        db.add(EngineState(user_id=user_id))
 
     settings = get_settings()
-    existing_symbols = set(db.scalars(select(WatchlistItem.symbol)).all())
+    existing_symbols = set(
+        db.scalars(select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)).all()
+    )
     for symbol in settings.default_symbols:
         if symbol not in existing_symbols:
-            db.add(WatchlistItem(symbol=symbol))
+            db.add(WatchlistItem(user_id=user_id, symbol=symbol))
     db.commit()
+
+
+def seed_defaults(db: Session) -> None:
+    """Compatibility entry point used by tests and older integrations."""
+    seed_templates(db)
+    admin = db.get(AuthUser, 1)
+    if admin is not None:
+        seed_user_defaults(db, admin.id)

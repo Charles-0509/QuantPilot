@@ -86,10 +86,10 @@ function AuthPage({ setup, onSuccess }: { setup: boolean; onSuccess: () => void 
       <div className="auth-status"><ShieldCheck size={15} /> OPAQUE OAUTH2 SESSION · PAPER ONLY</div>
       <p className="eyebrow">{setup ? 'FIRST RUN INITIALIZATION' : 'AUTHORIZED ACCESS'}</p>
       <h1>{setup ? '创建管理员' : '欢迎回来'}</h1>
-      <p className="auth-description">{setup ? '这是首次启动。创建唯一管理员后，公开初始化入口将永久关闭。' : '登录后才能访问策略、账户、行情和自动交易控制。'}</p>
+      <p className="auth-description">{setup ? '这是首次启动。创建初始管理员后，公开初始化入口将永久关闭。' : '登录后进入你自己的策略、账户、行情和自动交易空间。'}</p>
       <form className="auth-form" onSubmit={submit}>
-        <Field label="管理员用户名" hint={setup ? '3至64位，可使用字母、数字、点、下划线和短横线。' : undefined}>
-          <input aria-label="管理员用户名" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="输入管理员用户名" />
+        <Field label={setup ? '管理员用户名' : '用户名'} hint={setup ? '3至64位，可使用字母、数字、点、下划线和短横线。' : undefined}>
+          <input aria-label={setup ? '管理员用户名' : '用户名'} autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="输入用户名" />
         </Field>
         <Field label="密码" hint={setup ? '至少12位；密码只以 Argon2id 加盐哈希保存。' : undefined}>
           <div className="input-with-action">

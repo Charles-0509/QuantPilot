@@ -51,7 +51,7 @@ def serialize_model(value: Any) -> Any:
 class AlpacaService:
     """Thin adapter that is permanently locked to Alpaca paper trading."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, use_env: bool = True):
         self.settings = settings
         self.configured = False
         self.api_key_id = ""
@@ -67,7 +67,10 @@ class AlpacaService:
         self._stream_symbols: tuple[str, ...] = ()
         self._bars_cache: OrderedDict[tuple[Any, ...], tuple[float, dict[str, pd.DataFrame]]] = OrderedDict()
         self._bars_cache_lock = threading.Lock()
-        self.configure_from_env()
+        if use_env:
+            self.configure_from_env()
+        else:
+            self.clear_configuration()
 
     @staticmethod
     def _credentials_valid(api_key_id: str, api_secret_key: str) -> bool:

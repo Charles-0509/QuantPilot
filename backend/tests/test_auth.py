@@ -23,6 +23,7 @@ from app.services.auth import (
     set_session_cookies,
     verify_password,
 )
+from app.templates import TEMPLATES
 
 
 @pytest.fixture()
@@ -41,14 +42,9 @@ def auth_app(tmp_path, monkeypatch: pytest.MonkeyPatch):
         finally:
             db.close()
 
-    class FakeAlpaca:
+    class FakeRuntimeManager:
         def __init__(self, settings):
             self.settings = settings
-
-    class FakeTradingEngine:
-        def __init__(self, settings, alpaca):
-            self.settings = settings
-            self.alpaca = alpaca
 
         async def start(self) -> None:
             return None
@@ -56,10 +52,15 @@ def auth_app(tmp_path, monkeypatch: pytest.MonkeyPatch):
         async def shutdown(self) -> None:
             return None
 
+        async def ensure(self, _user_id: int):
+            return None
+
+        async def disable(self, _user_id: int) -> None:
+            return None
+
     monkeypatch.setattr(main, "SessionLocal", testing_session)
     monkeypatch.setattr(database, "SessionLocal", testing_session)
-    monkeypatch.setattr(main, "AlpacaService", FakeAlpaca)
-    monkeypatch.setattr(main, "TradingEngine", FakeTradingEngine)
+    monkeypatch.setattr(main, "UserRuntimeManager", FakeRuntimeManager)
     main.app.dependency_overrides[get_db] = override_db
     main.app.openapi_schema = None
     yield main.app, testing_session
@@ -139,10 +140,7 @@ def test_engine_stays_paused_until_first_admin_exists(auth_app) -> None:
     with TestClient(app) as client:
         assert client.get("/api/auth/status").json()["setup_required"] is True
     with sessions() as db:
-        state = db.get(EngineState, 1)
-        assert state is not None
-        assert state.status == "paused"
-        assert state.reason == "等待首次创建管理员"
+        assert db.get(EngineState, 1) is None
 
 
 def test_setup_validation_duplicate_and_concurrent_initialization(auth_app) -> None:
@@ -172,7 +170,7 @@ def test_setup_validation_duplicate_and_concurrent_initialization(auth_app) -> N
     with _sessions() as db:
         state = db.get(EngineState, 1)
         assert state is not None
-        assert state.reason == "管理员已创建，等待用户开启交易引擎"
+        assert state.reason == "等待用户开启交易引擎"
 
 
 def test_login_lockout_after_five_failures(auth_app) -> None:
@@ -295,7 +293,7 @@ def test_protected_api_docs_openapi_and_websocket(auth_app) -> None:
         body = schema.json()
         assert body["components"]["securitySchemes"]["OAuth2PasswordBearer"]["flows"]["password"]["tokenUrl"] == "/api/auth/token"
         assert body["paths"]["/api/metadata"]["get"]["security"] == [
-            {"OAuth2PasswordBearer": ["admin"]}
+            {"OAuth2PasswordBearer": ["user"]}
         ]
         assert "security" not in body["paths"]["/api/health"]["get"]
 
@@ -309,3 +307,63 @@ def test_protected_api_docs_openapi_and_websocket(auth_app) -> None:
             ):
                 pass
         assert cross_origin.value.code == 4403
+
+
+def test_admin_creates_users_and_business_data_is_isolated(auth_app) -> None:
+    app, sessions = auth_app
+    with TestClient(app) as admin_client:
+        setup(admin_client)
+        created = admin_client.post(
+            "/api/users",
+            headers=csrf_header(admin_client),
+            json={
+                "username": "trader-two",
+                "password": "second-user-password",
+                "role": "user",
+            },
+        )
+        assert created.status_code == 201, created.text
+        user_id = created.json()["id"]
+        assert created.json()["alpaca_configured"] is False
+
+        assert admin_client.put(
+            "/api/watchlist",
+            headers=csrf_header(admin_client),
+            json={"symbols": ["AAPL"]},
+        ).status_code == 200
+        strategy_definition = dict(TEMPLATES["sma_cross"])
+        strategy_definition["name"] = "管理员私有策略"
+        admin_strategy = admin_client.post(
+            "/api/strategies",
+            headers=csrf_header(admin_client),
+            json={"definition": strategy_definition},
+        )
+        assert admin_strategy.status_code == 201, admin_strategy.text
+
+        with TestClient(app) as user_client:
+            login = user_client.post(
+                "/api/auth/token",
+                data={"username": "trader-two", "password": "second-user-password"},
+            )
+            assert login.status_code == 200
+            assert user_client.get("/api/users").status_code == 403
+            assert user_client.get("/api/watchlist").json() != ["AAPL"]
+            names = [item["name"] for item in user_client.get("/api/strategies").json()]
+            assert "管理员私有策略" not in names
+
+            user_definition = dict(TEMPLATES["sma_cross"])
+            user_definition["name"] = "用户私有策略"
+            response = user_client.post(
+                "/api/strategies",
+                headers=csrf_header(user_client),
+                json={"definition": user_definition},
+            )
+            assert response.status_code == 201, response.text
+
+        admin_names = [item["name"] for item in admin_client.get("/api/strategies").json()]
+        assert "用户私有策略" not in admin_names
+
+    with sessions() as db:
+        user = db.get(AuthUser, user_id)
+        assert user is not None and user.role == "user"
+        assert db.scalar(select(EngineState).where(EngineState.user_id == user_id)) is not None

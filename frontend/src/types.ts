@@ -113,7 +113,11 @@ export type ConnectionConfig = {
 }
 
 export type AuthUser = {
+  id: number
   username: string
+  role: 'admin' | 'user'
+  is_active: boolean
+  alpaca_configured: boolean
   created_at: string
   last_login_at: string | null
 }
@@ -128,5 +132,5 @@ export type OAuthToken = {
   access_token: string
   token_type: 'bearer'
   expires_in: number
-  scope: 'admin'
+  scope: 'admin' | 'user'
 }

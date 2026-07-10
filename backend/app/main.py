@@ -9,18 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from .api import router, websocket_endpoint
 from .auth_api import router as auth_router
+from .users_api import router as users_router
 from .config import get_settings
 from .database import SessionLocal, init_db
-from .models import AuthUser, BacktestRun, ConnectionConfig, EngineState, utcnow
+from .models import AuthUser, BacktestRun, EngineState, utcnow
 from .services.auth import SESSION_COOKIE, authenticate_raw_token, authenticate_request, validate_csrf
-from .services.alpaca_service import AlpacaService
-from .services.credentials import CredentialDecryptionError, decrypt_credential
-from .services.engine import TradingEngine
-from .templates import seed_defaults
+from .services.runtime import UserRuntimeManager
+from .templates import seed_templates, seed_user_defaults
 
 settings = get_settings()
 logging.basicConfig(
@@ -33,7 +32,10 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     init_db()
     with SessionLocal() as db:
-        seed_defaults(db)
+        seed_templates(db)
+        users = db.scalars(select(AuthUser)).all()
+        for user in users:
+            seed_user_defaults(db, user.id)
         db.execute(
             update(BacktestRun)
             .where(BacktestRun.status.in_(["queued", "running"]))
@@ -43,37 +45,22 @@ async def lifespan(app: FastAPI):
                 completed_at=utcnow(),
             )
         )
-        if db.get(AuthUser, 1) is None:
-            engine_state = db.get(EngineState, 1)
-            engine_state.status = "paused"
-            engine_state.reason = "等待首次创建管理员"
+        if db.get(AuthUser, 1) is not None:
+            engine_state = db.scalar(select(EngineState).where(EngineState.user_id == 1))
+            if engine_state is not None and engine_state.reason == "首次启动，等待用户开启":
+                engine_state.reason = "等待用户开启交易引擎"
         db.commit()
-    alpaca = AlpacaService(settings)
-    with SessionLocal() as db:
-        saved_connection = db.get(ConnectionConfig, 1)
-        if saved_connection is not None:
-            try:
-                alpaca.configure(
-                    decrypt_credential(saved_connection.api_key_cipher, settings),
-                    decrypt_credential(saved_connection.api_secret_cipher, settings),
-                    feed=saved_connection.data_feed,
-                    source="web",
-                    updated_at=saved_connection.updated_at,
-                )
-            except (CredentialDecryptionError, ValueError):
-                logging.getLogger(__name__).warning("Stored web Alpaca credentials could not be decrypted")
-    trading_engine = TradingEngine(settings, alpaca)
-    app.state.alpaca = alpaca
-    app.state.trading_engine = trading_engine
-    await trading_engine.start()
+    runtime_manager = UserRuntimeManager(settings)
+    app.state.runtime_manager = runtime_manager
+    await runtime_manager.start()
     yield
-    await trading_engine.shutdown()
+    await runtime_manager.shutdown()
 
 
 app = FastAPI(
     title="QuantPilot",
     description="只连接 Alpaca Paper Trading 的自托管量化交易平台",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -116,6 +103,7 @@ async def oauth_session_auth(request: Request, call_next):
 
 
 app.include_router(auth_router)
+app.include_router(users_router)
 app.include_router(router)
 
 
@@ -135,7 +123,10 @@ def protected_openapi() -> dict:
         "flows": {
             "password": {
                 "tokenUrl": "/api/auth/token",
-                "scopes": {"admin": "QuantPilot 单管理员访问权限"},
+                "scopes": {
+                    "user": "QuantPilot 用户访问权限",
+                    "admin": "QuantPilot 管理员访问权限",
+                },
             }
         },
     }
@@ -144,7 +135,7 @@ def protected_openapi() -> dict:
             continue
         for method, operation in operations.items():
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}:
-                operation["security"] = [{"OAuth2PasswordBearer": ["admin"]}]
+                operation["security"] = [{"OAuth2PasswordBearer": ["user"]}]
     app.openapi_schema = schema
     return schema
 
@@ -168,7 +159,7 @@ async def events_socket(websocket: WebSocket) -> None:
     if auth_session is None:
         await websocket.close(code=4401)
         return
-    await websocket_endpoint(websocket)
+    await websocket_endpoint(websocket, auth_session.user.id)
 
 
 frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"

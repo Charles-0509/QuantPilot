@@ -77,6 +77,7 @@ async def test_background_job_batches_symbols_and_persists_result(monkeypatch, t
     )
 
     await api.execute_backtest_job(
+        1,
         "run-id",
         definition,
         payload.model_dump(mode="json"),

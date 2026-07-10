@@ -2,7 +2,7 @@
 
 ## 监听与安全
 
-QuantPilot 默认监听 `0.0.0.0:10000`。首次启动可直接访问初始化页面创建唯一管理员。生产环境建议只允许 FRP 或可信内网访问目标服务器的10000端口，公网流量由阿里云 Nginx 终止 HTTPS。
+QuantPilot 默认监听 `0.0.0.0:10000`。首次启动可直接访问初始化页面创建初始管理员，之后由管理员在“用户管理”创建账户。生产环境建议只允许 FRP 或可信内网访问目标服务器的10000端口，公网流量由阿里云 Nginx 终止 HTTPS。
 
 生产服务器 `.env`：
 
@@ -16,7 +16,7 @@ QUANTPILOT_SESSION_HOURS=12
 公开镜像支持 AMD64 与 ARM64：
 
 ```bash
-docker pull ghcr.io/charles-0509/quantpilot:1.2.0
+docker pull ghcr.io/charles-0509/quantpilot:1.3.0
 ```
 
 使用仓库中的 `docker-compose.yml` 时，执行 `docker compose pull && docker compose up -d` 即可拉取并运行 `latest`；需要从源码重新构建时仍可使用 `docker compose up --build`。

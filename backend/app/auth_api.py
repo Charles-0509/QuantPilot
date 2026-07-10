@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
-from .models import AuthUser, EngineState
+from .models import AuthUser, ConnectionConfig, EngineState
 from .schemas import (
     AuthPasswordChange,
     AuthSetupRequest,
@@ -30,6 +31,7 @@ from .services.auth import (
     validate_username,
     verify_password,
 )
+from .templates import seed_user_defaults
 
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -41,9 +43,25 @@ def prevent_token_caching(response: Response) -> None:
     response.headers["Pragma"] = "no-cache"
 
 
-def user_read(user: AuthUser) -> AuthUserRead:
+def user_read(user: AuthUser, db: Session | None = None) -> AuthUserRead:
     return AuthUserRead(
+        id=user.id,
         username=user.username,
+        role=user.role,
+        is_active=user.is_active,
+        alpaca_configured=(
+            (
+                db.scalar(
+                    select(ConnectionConfig.id).where(ConnectionConfig.user_id == user.id)
+                )
+                is not None
+            )
+            if db is not None
+            else False
+        )
+        or (
+            user.id == 1 and settings.alpaca_configured
+        ),
         created_at=user.created_at,
         last_login_at=user.last_login_at,
     )
@@ -63,7 +81,7 @@ def auth_status(request: Request, db: Session = Depends(get_db)) -> AuthStatusRe
     return AuthStatusRead(
         setup_required=user is None,
         authenticated=session is not None,
-        user=user_read(session.user) if session else None,
+        user=user_read(session.user, db) if session else None,
     )
 
 
@@ -82,6 +100,7 @@ def setup_admin(
         username=username,
         username_normalized=normalize_username(username),
         password_hash=hash_password(payload.password),
+        role="admin",
         is_active=True,
     )
     db.add(user)
@@ -91,7 +110,8 @@ def setup_admin(
         db.rollback()
         raise HTTPException(status_code=409, detail="管理员已经初始化") from exc
     session = issue_session(db, user, settings)
-    engine_state = db.get(EngineState, 1)
+    seed_user_defaults(db, user.id)
+    engine_state = db.scalar(select(EngineState).where(EngineState.user_id == user.id))
     if engine_state is not None and engine_state.reason == "等待首次创建管理员":
         engine_state.reason = "管理员已创建，等待用户开启交易引擎"
     db.commit()
@@ -100,6 +120,7 @@ def setup_admin(
     return OAuthTokenRead(
         access_token=session.access_token,
         expires_in=settings.quantpilot_session_hours * 3600,
+        scope=user.role,
     )
 
 
@@ -119,12 +140,16 @@ def oauth_token(
     return OAuthTokenRead(
         access_token=session.access_token,
         expires_in=settings.quantpilot_session_hours * 3600,
+        scope=user.role,
     )
 
 
 @router.get("/me", response_model=AuthUserRead)
-def current_user(session: AuthenticatedSession = Depends(require_session)) -> AuthUserRead:
-    return user_read(session.user)
+def current_user(
+    session: AuthenticatedSession = Depends(require_session),
+    db: Session = Depends(get_db),
+) -> AuthUserRead:
+    return user_read(session.user, db)
 
 
 @router.post("/logout", status_code=204)

@@ -12,6 +12,7 @@ const Backtests = lazy(() => import('./pages/Backtests'))
 const Trading = lazy(() => import('./pages/Trading'))
 const Risk = lazy(() => import('./pages/Risk'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
+const Users = lazy(() => import('./pages/Users'))
 
 export default function App() {
   return (
@@ -28,6 +29,7 @@ export default function App() {
             <Route path="trading" element={<Trading />} />
             <Route path="risk" element={<Risk />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="users" element={<Users />} />
           </Route>
         </Routes>
       </Suspense>

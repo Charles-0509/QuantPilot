@@ -44,9 +44,10 @@ TIMEFRAME_SECONDS = {
 
 
 class TradingEngine:
-    def __init__(self, settings: Settings, alpaca: AlpacaService):
+    def __init__(self, settings: Settings, alpaca: AlpacaService, user_id: int = 1):
         self.settings = settings
         self.alpaca = alpaca
+        self.user_id = user_id
         self.risk = RiskManager()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -58,7 +59,7 @@ class TradingEngine:
         if self._task and not self._task.done():
             return
         self._stop.clear()
-        self._task = asyncio.create_task(self._run_loop(), name="trading-engine")
+        self._task = asyncio.create_task(self._run_loop(), name=f"trading-engine-{self.user_id}")
 
     async def shutdown(self) -> None:
         self._stop.set()
@@ -84,7 +85,9 @@ class TradingEngine:
                 if self.alpaca.configured:
                     await self._sync_streams()
                     with SessionLocal() as db:
-                        state = db.get(EngineState, 1)
+                        state = db.scalar(
+                            select(EngineState).where(EngineState.user_id == self.user_id)
+                        )
                         running = state is not None and state.status == "running"
                     if running:
                         await self.evaluate_active_strategies()
@@ -103,15 +106,21 @@ class TradingEngine:
 
     async def _heartbeat(self) -> None:
         with SessionLocal() as db:
-            state = db.get(EngineState, 1)
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
             if state:
                 state.last_heartbeat = datetime.now(timezone.utc)
                 db.commit()
 
     async def _sync_streams(self) -> None:
         with SessionLocal() as db:
-            active = db.scalars(select(Strategy).where(Strategy.enabled.is_(True))).all()
-            watchlist = db.scalars(select(WatchlistItem.symbol)).all()
+            active = db.scalars(
+                select(Strategy).where(
+                    Strategy.enabled.is_(True), Strategy.owner_user_id == self.user_id
+                )
+            ).all()
+            watchlist = db.scalars(
+                select(WatchlistItem.symbol).where(WatchlistItem.user_id == self.user_id)
+            ).all()
         symbols = sorted(
             set(watchlist).union(
                 symbol
@@ -125,14 +134,18 @@ class TradingEngine:
             self._stream_signature = signature
 
     async def handle_bar_update(self, payload: dict[str, Any]) -> None:
-        await websocket_manager.broadcast("market_bar", payload)
+        await websocket_manager.broadcast(self.user_id, "market_bar", payload)
 
     async def handle_trade_update(self, payload: dict[str, Any]) -> None:
         event = str(payload.get("event", "update"))
         order = payload.get("order") or {}
         order_id = str(order.get("id", ""))
         with SessionLocal() as db:
-            record = db.get(OrderRecord, order_id) if order_id else None
+            record = db.scalar(
+                select(OrderRecord).where(
+                    OrderRecord.id == order_id, OrderRecord.user_id == self.user_id
+                )
+            ) if order_id else None
             if record:
                 record.status = str(order.get("status", event))
                 filled = order.get("filled_avg_price")
@@ -153,6 +166,7 @@ class TradingEngine:
                                 )
                                 db.add(
                                     OrderRecord(
+                                        user_id=self.user_id,
                                         id=str(trailing_order["id"]),
                                         client_order_id=str(trailing_order.get("client_order_id", client_id)),
                                         strategy_id=record.strategy_id,
@@ -169,12 +183,13 @@ class TradingEngine:
                                 db.commit()
                             except Exception as exc:  # pragma: no cover - network dependent
                                 await self.log("error", "order", f"创建移动止损失败: {exc}")
-        await websocket_manager.broadcast("trade_update", payload)
+        await websocket_manager.broadcast(self.user_id, "trade_update", payload)
 
     async def evaluate_active_strategies(self) -> None:
         with SessionLocal() as db:
             strategies = db.scalars(
                 select(Strategy).where(Strategy.enabled.is_(True), Strategy.is_template.is_(False))
+                .where(Strategy.owner_user_id == self.user_id)
             ).all()
         for strategy in strategies:
             try:
@@ -184,7 +199,11 @@ class TradingEngine:
 
     async def evaluate_strategy(self, strategy_id: str) -> None:
         with SessionLocal() as db:
-            strategy = db.get(Strategy, strategy_id)
+            strategy = db.scalar(
+                select(Strategy).where(
+                    Strategy.id == strategy_id, Strategy.owner_user_id == self.user_id
+                )
+            )
             if strategy is None or not strategy.enabled:
                 return
             definition = RuleDefinition.model_validate(strategy.definition)
@@ -240,6 +259,7 @@ class TradingEngine:
                 select(Signal)
                 .where(
                     Signal.strategy_id == strategy_id,
+                    Signal.user_id == self.user_id,
                     Signal.symbol == symbol,
                     Signal.action == "buy",
                 )
@@ -289,8 +309,10 @@ class TradingEngine:
 
         asset = self.alpaca.get_asset(symbol)
         with SessionLocal() as db:
-            risk_settings = db.get(RiskSettings, 1)
-            state = db.get(EngineState, 1)
+            risk_settings = db.scalar(
+                select(RiskSettings).where(RiskSettings.user_id == self.user_id)
+            )
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
             max_age = max(risk_settings.stale_data_seconds, TIMEFRAME_SECONDS[definition.timeframe] * 3)
             decision = self.risk.check_entry(
                 symbol=symbol,
@@ -323,7 +345,7 @@ class TradingEngine:
         )
         if signal is None:
             return
-        client_id = f"inv-{strategy.id[:8]}-{symbol}-{int(frame.index[-1].timestamp())}"[:48]
+        client_id = f"qp-u{self.user_id}-{strategy.id[:8]}-{symbol}-{int(frame.index[-1].timestamp())}"[:48]
         limit_price = price * (1 - definition.order.limit_offset_bps / 10_000)
         try:
             order = self.alpaca.submit_entry_order(
@@ -340,6 +362,7 @@ class TradingEngine:
             with SessionLocal() as db:
                 db.add(
                     OrderRecord(
+                        user_id=self.user_id,
                         id=str(order["id"]),
                         client_order_id=str(order.get("client_order_id", client_id)),
                         strategy_id=strategy.id,
@@ -357,7 +380,11 @@ class TradingEngine:
                 saved_signal.status = "submitted"
                 db.commit()
             await self.log("info", "order", f"{strategy.name}: 已提交 {symbol} 模拟买单")
-            await websocket_manager.broadcast("signal", {"action": "buy", "symbol": symbol, "strategy": strategy.name})
+            await websocket_manager.broadcast(
+                self.user_id,
+                "signal",
+                {"action": "buy", "symbol": symbol, "strategy": strategy.name},
+            )
         except Exception as exc:
             with SessionLocal() as db:
                 saved_signal = db.get(Signal, signal.id)
@@ -384,6 +411,7 @@ class TradingEngine:
             with SessionLocal() as db:
                 db.add(
                     OrderRecord(
+                        user_id=self.user_id,
                         id=str(order["id"]),
                         client_order_id=str(order.get("client_order_id", f"exit-{signal.id[:12]}")),
                         strategy_id=strategy.id,
@@ -407,9 +435,10 @@ class TradingEngine:
     async def _insert_signal(
         self, strategy: Strategy, symbol: str, timestamp: datetime, action: str, price: float, reason: str
     ) -> Signal | None:
-        unique_key = f"{strategy.id}:{symbol}:{timestamp.isoformat()}:{action}"
+        unique_key = f"{self.user_id}:{strategy.id}:{symbol}:{timestamp.isoformat()}:{action}"
         with SessionLocal() as db:
             signal = Signal(
+                user_id=self.user_id,
                 unique_key=unique_key,
                 strategy_id=strategy.id,
                 symbol=symbol,
@@ -479,7 +508,12 @@ class TradingEngine:
             with SessionLocal() as db:
                 for order in orders:
                     order_id = str(order.get("id"))
-                    record = db.get(OrderRecord, order_id)
+                    record = db.scalar(
+                        select(OrderRecord).where(
+                            OrderRecord.id == order_id,
+                            OrderRecord.user_id == self.user_id,
+                        )
+                    )
                     if record:
                         record.status = str(order.get("status", record.status))
                         record.filled_avg_price = as_float(order.get("filled_avg_price")) or None
@@ -492,12 +526,12 @@ class TradingEngine:
         if not self.alpaca.configured:
             raise RuntimeError("请先配置 Alpaca Paper API 密钥")
         with SessionLocal() as db:
-            state = db.get(EngineState, 1)
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
             state.status = "running"
             state.reason = reason
             db.commit()
         await self.log("info", "engine", "交易引擎已开启")
-        await websocket_manager.broadcast("engine", {"status": "running"})
+        await websocket_manager.broadcast(self.user_id, "engine", {"status": "running"})
 
     async def pause(self, reason: str = "用户暂停", cancel_orders: bool = True) -> None:
         if cancel_orders and self.alpaca.configured:
@@ -506,25 +540,36 @@ class TradingEngine:
             except Exception as exc:
                 await self.log("warning", "order", f"取消订单时出现异常: {exc}")
         with SessionLocal() as db:
-            state = db.get(EngineState, 1)
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
             state.status = "paused"
             state.reason = reason
             db.commit()
         await self.log("warning", "engine", f"交易引擎已暂停：{reason}")
-        await websocket_manager.broadcast("engine", {"status": "paused", "reason": reason})
+        await websocket_manager.broadcast(
+            self.user_id, "engine", {"status": "paused", "reason": reason}
+        )
 
     async def emergency_liquidate(self, reason: str = "用户紧急平仓") -> list[Any]:
         await self.pause(reason, cancel_orders=True)
         result = self.alpaca.close_all_positions()
         await self.log("critical", "risk", "已向 Alpaca 模拟盘发送全部平仓指令")
-        await websocket_manager.broadcast("engine", {"status": "liquidating"})
+        await websocket_manager.broadcast(self.user_id, "engine", {"status": "liquidating"})
         return result
 
     async def log(self, level: str, category: str, message: str, details: dict | None = None) -> None:
         with SessionLocal() as db:
-            db.add(EventLog(level=level, category=category, message=message, details=details or {}))
+            db.add(
+                EventLog(
+                    user_id=self.user_id,
+                    level=level,
+                    category=category,
+                    message=message,
+                    details=details or {},
+                )
+            )
             db.commit()
         await websocket_manager.broadcast(
+            self.user_id,
             "log",
             {
                 "level": level,

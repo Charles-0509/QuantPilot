@@ -109,3 +109,22 @@ export type ConnectionConfig = {
   feed: 'iex'
   updated_at: string | null
 }
+
+export type AuthUser = {
+  username: string
+  created_at: string
+  last_login_at: string | null
+}
+
+export type AuthStatus = {
+  setup_required: boolean
+  authenticated: boolean
+  user: AuthUser | null
+}
+
+export type OAuthToken = {
+  access_token: string
+  token_type: 'bearer'
+  expires_in: number
+  scope: 'admin'
+}

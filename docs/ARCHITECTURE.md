@@ -63,7 +63,7 @@ SQLite 开启 WAL、外键和 NORMAL synchronous。主要数据包括：
 
 ## 外部部署
 
-容器内 Uvicorn 与 Docker 发布端口统一为 `0.0.0.0:10000`。公网部署建议只让 FRP 或可信网络访问源站端口，由 Nginx 终止 HTTPS，并传递 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` 以及 WebSocket Upgrade 头。HTTPS 环境必须设置 `QUANTPILOT_COOKIE_SECURE=true`。完整示例见 `docs/DEPLOYMENT.md`。
+容器内 Uvicorn 监听 `0.0.0.0:10000`，宿主机发布端口可由安装器自定义。可信网络可通过 HTTP IP 直接访问；公网部署建议由 Nginx/Caddy 终止 HTTPS，并传递 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` 以及 WebSocket Upgrade 头。仅允许 HTTPS 时建议设置 `QUANTPILOT_COOKIE_SECURE=true`。完整示例见 `docs/DEPLOYMENT.md`。
 
 ## 失败模式
 

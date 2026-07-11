@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { formatShanghaiDate } from '../time'
 
 export default function EquityChart({
   equity,
@@ -22,7 +23,7 @@ export default function EquityChart({
     const benchmarkMap = new Map(benchmark.map((item) => [item.timestamp, item.equity]))
     return equity.map((item) => ({
       ...item,
-      label: new Date(item.timestamp).toLocaleDateString('zh-CN'),
+      label: formatShanghaiDate(item.timestamp),
       benchmark: benchmarkMap.get(item.timestamp),
     }))
   }, [benchmark, equity])

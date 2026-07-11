@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
-import { createChart, ColorType, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
+import { createChart, ColorType, type IChartApi, type Time, type UTCTimestamp } from 'lightweight-charts'
+import { formatShanghaiChartTick, formatShanghaiDateTime, parseUtcDate } from '../time'
 
 export default function CandleChart({ bars }: { bars: Array<any> }) {
   const container = useRef<HTMLDivElement | null>(null)
@@ -12,7 +13,14 @@ export default function CandleChart({ bars }: { bars: Array<any> }) {
       layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#8293aa' },
       grid: { vertLines: { color: '#152134' }, horzLines: { color: '#152134' } },
       rightPriceScale: { borderColor: '#24354d' },
-      timeScale: { borderColor: '#24354d', timeVisible: true },
+      localization: {
+        timeFormatter: (time: Time) => formatShanghaiDateTime(Number(time) * 1000),
+      },
+      timeScale: {
+        borderColor: '#24354d',
+        timeVisible: true,
+        tickMarkFormatter: (time: Time) => formatShanghaiChartTick(Number(time)),
+      },
       crosshair: { vertLine: { color: '#3df6de55' }, horzLine: { color: '#a775ff55' } },
     })
     chartRef.current = chart
@@ -24,11 +32,11 @@ export default function CandleChart({ bars }: { bars: Array<any> }) {
       priceFormat: { type: 'volume' }, priceScaleId: '', color: '#52678366',
     })
     candles.setData(bars.map((bar) => ({
-      time: Math.floor(new Date(bar.timestamp).getTime() / 1000) as UTCTimestamp,
+      time: Math.floor(parseUtcDate(bar.timestamp).getTime() / 1000) as UTCTimestamp,
       open: bar.open, high: bar.high, low: bar.low, close: bar.close,
     })))
     volume.setData(bars.map((bar) => ({
-      time: Math.floor(new Date(bar.timestamp).getTime() / 1000) as UTCTimestamp,
+      time: Math.floor(parseUtcDate(bar.timestamp).getTime() / 1000) as UTCTimestamp,
       value: bar.volume,
       color: bar.close >= bar.open ? '#29d9b055' : '#ff647c55',
     })))

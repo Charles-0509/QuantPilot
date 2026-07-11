@@ -363,6 +363,24 @@ class AlpacaService:
             params["trail_price"] = value
         return serialize_model(self.trading.submit_order(order_data=TrailingStopOrderRequest(**params)))
 
+    def submit_exit_order(
+        self, symbol: str, qty: float, client_order_id: str
+    ) -> dict[str, Any]:
+        """Sell only the quantity attributed to one QuantPilot strategy."""
+        self.require_connection()
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=round(qty, 6),
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
+        )
+        return serialize_model(self.trading.submit_order(order_data=request))
+
+    def cancel_order(self, order_id: str) -> None:
+        self.require_connection()
+        self.trading.cancel_order_by_id(order_id)
+
     def cancel_all_orders(self) -> list[Any]:
         self.require_connection()
         return serialize_model(self.trading.cancel_orders())

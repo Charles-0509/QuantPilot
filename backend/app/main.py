@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="QuantPilot",
     description="只连接 Alpaca Paper Trading 的自托管量化交易平台",
-    version="1.3.0",
+    version="1.3.1",
     lifespan=lifespan,
 )
 app.add_middleware(

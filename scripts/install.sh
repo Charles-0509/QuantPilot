@@ -8,7 +8,7 @@ TTY_PATH="${QUANTPILOT_TTY:-/dev/tty}"
 OS_RELEASE_FILE="${QUANTPILOT_OS_RELEASE:-/etc/os-release}"
 REPO_SLUG="Charles-0509/QuantPilot"
 IMAGE="ghcr.io/charles-0509/quantpilot:latest"
-INSTALL_REF="${QUANTPILOT_INSTALL_REF:-v1.3.3}"
+INSTALL_REF="${QUANTPILOT_INSTALL_REF:-v1.3.4}"
 MARKER_FILE=".quantpilot-install"
 
 die() {

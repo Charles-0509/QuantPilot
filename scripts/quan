@@ -142,6 +142,29 @@ update_self() {
     rm -f "$temporary"
 }
 
+cleanup_old_images() {
+    local previous_image_id="$1" current_image_id image_ref image_id removed=0
+    current_image_id="$("${SUDO[@]}" docker inspect -f '{{.Image}}' quantpilot 2>/dev/null || true)"
+    if [[ -n "$previous_image_id" && "$previous_image_id" != "$current_image_id" ]]; then
+        if "${SUDO[@]}" docker image rm "$previous_image_id" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+        fi
+    fi
+    while IFS='|' read -r image_ref image_id; do
+        [[ -n "$image_ref" && "$image_id" != "$current_image_id" ]] || continue
+        if "${SUDO[@]}" docker image rm "$image_ref" >/dev/null 2>&1; then
+            removed=$((removed + 1))
+        fi
+    done < <("${SUDO[@]}" docker images \
+        --filter reference='ghcr.io/charles-0509/quantpilot:*' \
+        --format '{{.Repository}}:{{.Tag}}|{{.ID}}' 2>/dev/null || true)
+    if (( removed > 0 )); then
+        echo "$(message "已清理 ${removed} 个旧版 QuantPilot 镜像。" "Removed ${removed} old QuantPilot image(s).")"
+    else
+        echo "$(message "没有需要清理的旧版 QuantPilot 镜像。" "No old QuantPilot images needed cleanup.")"
+    fi
+}
+
 do_update() {
     local current latest
     echo "$(message ":: 正在同步 QuantPilot 软件包数据库……" ":: Synchronizing QuantPilot package database...")"
@@ -160,9 +183,10 @@ do_update() {
 }
 
 do_upgrade() {
-    local latest
+    local latest previous_image_id
     check_installation
     latest="$(latest_version)"
+    previous_image_id="$("${SUDO[@]}" docker inspect -f '{{.Image}}' quantpilot 2>/dev/null || true)"
     echo "$(message "正在将 QuantPilot 升级到 ${latest}……" "Upgrading QuantPilot to ${latest}...")"
     compose pull
     compose up -d --remove-orphans
@@ -173,6 +197,7 @@ do_upgrade() {
         echo "$(message "警告：QuantPilot 已升级，但 quan 命令未能更新自身。" "Warning: QuantPilot was upgraded, but the quan command could not update itself.")" >&2
         return 1
     fi
+    cleanup_old_images "$previous_image_id"
     echo
     compose ps
     echo "$(message "QuantPilot 升级完成。" "QuantPilot upgrade completed.")"

@@ -57,7 +57,7 @@ for argument in "$@"; do
   previous="$argument"
 done
 if [[ "$url" == *"/api/health" ]]; then
-  printf '%s\n' "${FAKE_HEALTH_JSON:-{\"status\":\"ok\",\"paper\":true,\"version\":\"1.3.2\"}}"
+  printf '%s\n' "${FAKE_HEALTH_JSON:-{\"status\":\"ok\",\"paper\":true,\"version\":\"1.3.3\"}}"
 elif [[ "$url" == *"api.github.com"* ]]; then
   printf '%s\n' "$FAKE_TAGS_JSON"
 elif [[ "$url" == *"raw.githubusercontent.com"* && -n "$output" ]]; then
@@ -71,8 +71,10 @@ fi
     environment.update(
         {
             "PATH": f"{bin_dir}:{environment['PATH']}",
+            "LC_ALL": "C",
+            "LANG": "C",
             "FAKE_DOCKER_LOG": str(docker_log),
-            "FAKE_TAGS_JSON": '[{"name":"v1.3.2"},{"name":"v1.3.1"}]',
+            "FAKE_TAGS_JSON": '[{"name":"v1.3.3"},{"name":"v1.3.2"}]',
             "FAKE_QUAN_SOURCE": str(QUAN),
         }
     )
@@ -105,7 +107,7 @@ def test_quan_update_reports_nothing_to_do(tmp_path: Path) -> None:
     config = tmp_path / "quan.conf"
     write_quan_config(config, install_dir)
     environment["QUAN_CONFIG_FILE"] = str(config)
-    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.2"}'
+    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.3"}'
 
     result = run_script(QUAN, "update", env=environment)
 
@@ -113,6 +115,43 @@ def test_quan_update_reports_nothing_to_do(tmp_path: Path) -> None:
     assert "Synchronizing QuantPilot package database" in result.stdout
     assert "Nothing to do" in result.stdout
     assert "quan upgrade" not in result.stdout
+
+
+def test_quan_uses_chinese_for_chinese_locale_but_keeps_nothing_to_do(tmp_path: Path) -> None:
+    environment, _ = fake_environment(tmp_path)
+    install_dir = tmp_path / "quantpilot"
+    install_dir.mkdir()
+    config = tmp_path / "quan.conf"
+    write_quan_config(config, install_dir)
+    environment["QUAN_CONFIG_FILE"] = str(config)
+    environment.pop("LC_ALL", None)
+    environment.pop("LC_MESSAGES", None)
+    environment["LANG"] = "zh_CN.UTF-8"
+    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.3"}'
+
+    update = run_script(QUAN, "update", env=environment)
+    help_result = run_script(QUAN, "help", env=environment)
+
+    assert update.returncode == 0, update.stderr
+    assert "正在同步 QuantPilot 软件包数据库" in update.stdout
+    assert "Nothing to do" in update.stdout
+    assert "QuantPilot 管理命令" in help_result.stdout
+    assert "检查是否有新的稳定版本" in help_result.stdout
+
+
+def test_quan_locale_priority_allows_lc_all_to_override_lang(tmp_path: Path) -> None:
+    environment, _ = fake_environment(tmp_path)
+    config = tmp_path / "quan.conf"
+    write_quan_config(config, tmp_path / "quantpilot")
+    environment["QUAN_CONFIG_FILE"] = str(config)
+    environment["LANG"] = "zh_CN.UTF-8"
+    environment["LC_ALL"] = "C"
+
+    result = run_script(QUAN, "help", env=environment)
+
+    assert result.returncode == 0
+    assert "QuantPilot management command" in result.stdout
+    assert "QuantPilot 管理命令" not in result.stdout
 
 
 def test_quan_update_reports_newer_version_and_ignores_prerelease(tmp_path: Path) -> None:
@@ -124,13 +163,13 @@ def test_quan_update_reports_newer_version_and_ignores_prerelease(tmp_path: Path
     environment["QUAN_CONFIG_FILE"] = str(config)
     environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.1"}'
     environment["FAKE_TAGS_JSON"] = (
-        '[{"name":"v1.4.0-beta.1"},{"name":"v1.3.2"},{"name":"not-a-version"}]'
+        '[{"name":"v1.4.0-beta.1"},{"name":"v1.3.3"},{"name":"not-a-version"}]'
     )
 
     result = run_script(QUAN, "update", env=environment)
 
     assert result.returncode == 0, result.stderr
-    assert "quantpilot 1.3.1 -> 1.3.2" in result.stdout
+    assert "quantpilot 1.3.1 -> 1.3.3" in result.stdout
     assert "Run 'quan upgrade' to update." in result.stdout
 
 
@@ -160,7 +199,7 @@ def test_quan_management_commands_use_configured_compose_file(tmp_path: Path) ->
     config = tmp_path / "quan.conf"
     write_quan_config(config, install_dir, port=19400)
     environment["QUAN_CONFIG_FILE"] = str(config)
-    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.2"}'
+    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.3"}'
 
     for arguments in [("status",), ("start",), ("restart",), ("stop",), ("logs", "25")]:
         result = run_script(QUAN, *arguments, env=environment)
@@ -184,12 +223,12 @@ def test_quan_upgrade_pulls_image_checks_version_and_updates_itself(tmp_path: Pa
     installed_quan.parent.mkdir()
     write_quan_config(config, install_dir, quan_bin=installed_quan)
     environment["QUAN_CONFIG_FILE"] = str(config)
-    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.2"}'
+    environment["FAKE_HEALTH_JSON"] = '{"status":"ok","paper":true,"version":"1.3.3"}'
 
     result = run_script(QUAN, "upgrade", env=environment)
 
     assert result.returncode == 0, result.stderr
-    assert "Upgrading QuantPilot to 1.3.2" in result.stdout
+    assert "Upgrading QuantPilot to 1.3.3" in result.stdout
     assert installed_quan.read_text() == QUAN.read_text()
     assert installed_quan.stat().st_mode & 0o777 == 0o755
     calls = docker_log.read_text()

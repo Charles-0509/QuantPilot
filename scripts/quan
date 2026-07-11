@@ -1,19 +1,40 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2005
 set -Eeuo pipefail
+
+LOCALE_VALUE="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+USE_CHINESE=false
+case "$LOCALE_VALUE" in
+    zh*|ZH*) USE_CHINESE=true ;;
+esac
+
+message() {
+    if [[ "$USE_CHINESE" == "true" ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s' "$2"
+    fi
+}
 
 CONFIG_FILE="${QUAN_CONFIG_FILE:-/etc/quantpilot/quan.conf}"
 
 if [[ ! -r "$CONFIG_FILE" ]]; then
-    echo "Error: QuantPilot configuration not found: $CONFIG_FILE" >&2
-    echo "Re-run the QuantPilot installer to repair the management command." >&2
+    echo "$(message "错误：找不到 QuantPilot 配置：$CONFIG_FILE" "Error: QuantPilot configuration not found: $CONFIG_FILE")" >&2
+    echo "$(message "请重新运行 QuantPilot 安装器以修复管理命令。" "Re-run the QuantPilot installer to repair the management command.")" >&2
     exit 1
 fi
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-: "${QUANTPILOT_DIR:?QUANTPILOT_DIR is missing from $CONFIG_FILE}"
-: "${QUANTPILOT_PORT:?QUANTPILOT_PORT is missing from $CONFIG_FILE}"
+if [[ -z "${QUANTPILOT_DIR:-}" ]]; then
+    echo "$(message "错误：$CONFIG_FILE 中缺少 QUANTPILOT_DIR" "Error: QUANTPILOT_DIR is missing from $CONFIG_FILE")" >&2
+    exit 1
+fi
+if [[ -z "${QUANTPILOT_PORT:-}" ]]; then
+    echo "$(message "错误：$CONFIG_FILE 中缺少 QUANTPILOT_PORT" "Error: QUANTPILOT_PORT is missing from $CONFIG_FILE")" >&2
+    exit 1
+fi
 COMPOSE_FILE="${COMPOSE_FILE:-$QUANTPILOT_DIR/docker-compose.yml}"
 REPO_SLUG="${REPO_SLUG:-Charles-0509/QuantPilot}"
 IMAGE="${IMAGE:-ghcr.io/charles-0509/quantpilot:latest}"
@@ -35,7 +56,7 @@ compose() {
 
 check_installation() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
-        echo "Error: Docker Compose file not found: $COMPOSE_FILE" >&2
+        echo "$(message "错误：找不到 Docker Compose 文件：$COMPOSE_FILE" "Error: Docker Compose file not found: $COMPOSE_FILE")" >&2
         exit 1
     fi
 }
@@ -47,13 +68,13 @@ extract_json_version() {
 local_version() {
     local response version
     if ! response="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)"; then
-        echo "Error: QuantPilot is not running or its health endpoint is unavailable: $HEALTH_URL" >&2
-        echo "Run 'quan start' and try again." >&2
+        echo "$(message "错误：QuantPilot 未运行或健康检查接口不可用：$HEALTH_URL" "Error: QuantPilot is not running or its health endpoint is unavailable: $HEALTH_URL")" >&2
+        echo "$(message "请运行 'quan start' 后重试。" "Run 'quan start' and try again.")" >&2
         return 1
     fi
     version="$(printf '%s\n' "$response" | extract_json_version)"
     if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Error: The running container returned an invalid version." >&2
+        echo "$(message "错误：正在运行的容器返回了无效版本号。" "Error: The running container returned an invalid version.")" >&2
         return 1
     fi
     printf '%s\n' "$version"
@@ -65,7 +86,7 @@ latest_version() {
         -H 'Accept: application/vnd.github+json' \
         -H 'User-Agent: QuantPilot-quan' \
         "$GITHUB_API" 2>/dev/null)"; then
-        echo "Error: Unable to query the latest QuantPilot version from GitHub." >&2
+        echo "$(message "错误：无法从 GitHub 查询 QuantPilot 最新版本。" "Error: Unable to query the latest QuantPilot version from GitHub.")" >&2
         return 1
     fi
     versions="$(printf '%s\n' "$response" \
@@ -73,7 +94,7 @@ latest_version() {
         | sed -E 's/.*"v([0-9]+\.[0-9]+\.[0-9]+)"/\1/' || true)"
     latest="$(printf '%s\n' "$versions" | sed '/^$/d' | sort -V | tail -n 1)"
     if [[ ! "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Error: GitHub did not return a stable QuantPilot version." >&2
+        echo "$(message "错误：GitHub 未返回有效的 QuantPilot 稳定版本。" "Error: GitHub did not return a stable QuantPilot version.")" >&2
         return 1
     fi
     printf '%s\n' "$latest"
@@ -88,19 +109,19 @@ version_is_newer() {
 
 wait_for_health() {
     local expected="${1:-}" response version
-    echo "Waiting for QuantPilot..."
+    echo "$(message "正在等待 QuantPilot 启动……" "Waiting for QuantPilot...")"
     for _ in {1..30}; do
         if response="$(curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null)"; then
             version="$(printf '%s\n' "$response" | extract_json_version)"
             if [[ -z "$expected" || "$version" == "$expected" ]]; then
                 printf '%s\n' "$response"
-                echo "QuantPilot is healthy."
+                echo "$(message "QuantPilot 运行正常。" "QuantPilot is healthy.")"
                 return 0
             fi
         fi
         sleep 2
     done
-    echo "Error: QuantPilot did not pass its health check within 60 seconds." >&2
+    echo "$(message "错误：QuantPilot 未能在60秒内通过健康检查。" "Error: QuantPilot did not pass its health check within 60 seconds.")" >&2
     compose logs --tail=100 >&2 || true
     return 1
 }
@@ -123,16 +144,16 @@ update_self() {
 
 do_update() {
     local current latest
-    echo ":: Synchronizing QuantPilot package database..."
+    echo "$(message ":: 正在同步 QuantPilot 软件包数据库……" ":: Synchronizing QuantPilot package database...")"
     current="$(local_version)"
     latest="$(latest_version)"
     if version_is_newer "$current" "$latest"; then
         echo "quantpilot ${current} -> ${latest}"
-        echo ":: A new QuantPilot version is available."
-        echo "Run 'quan upgrade' to update."
+        echo "$(message ":: 发现新的 QuantPilot 版本。" ":: A new QuantPilot version is available.")"
+        echo "$(message "请运行 'quan upgrade' 进行更新。" "Run 'quan upgrade' to update.")"
     else
         if [[ "$current" != "$latest" ]]; then
-            echo "quantpilot ${current} (newer than published ${latest})"
+            echo "$(message "quantpilot ${current}（高于已发布版本 ${latest}）" "quantpilot ${current} (newer than published ${latest})")"
         fi
         echo "Nothing to do"
     fi
@@ -142,28 +163,28 @@ do_upgrade() {
     local latest
     check_installation
     latest="$(latest_version)"
-    echo "Upgrading QuantPilot to ${latest}..."
+    echo "$(message "正在将 QuantPilot 升级到 ${latest}……" "Upgrading QuantPilot to ${latest}...")"
     compose pull
     compose up -d --remove-orphans
     wait_for_health "$latest"
     if update_self "$latest"; then
-        echo "Updated $QUAN_BIN_PATH."
+        echo "$(message "已更新 $QUAN_BIN_PATH。" "Updated $QUAN_BIN_PATH.")"
     else
-        echo "Warning: QuantPilot was upgraded, but the quan command could not update itself." >&2
+        echo "$(message "警告：QuantPilot 已升级，但 quan 命令未能更新自身。" "Warning: QuantPilot was upgraded, but the quan command could not update itself.")" >&2
         return 1
     fi
     echo
     compose ps
-    echo "QuantPilot upgrade completed."
+    echo "$(message "QuantPilot 升级完成。" "QuantPilot upgrade completed.")"
 }
 
 do_status() {
     check_installation
-    echo "QuantPilot containers:"
+    echo "$(message "QuantPilot 容器状态：" "QuantPilot containers:")"
     echo
     compose ps
     echo
-    echo "Health check:"
+    echo "$(message "健康检查：" "Health check:")"
     local_version >/dev/null
     curl -fsS --max-time 5 "$HEALTH_URL"
     echo
@@ -173,17 +194,17 @@ do_logs() {
     check_installation
     local lines="${1:-200}"
     if [[ ! "$lines" =~ ^[0-9]+$ ]] || (( lines < 1 )); then
-        echo "Error: log line count must be a positive integer." >&2
-        echo "Example: quan logs 500" >&2
+        echo "$(message "错误：日志行数必须是正整数。" "Error: log line count must be a positive integer.")" >&2
+        echo "$(message "示例：quan logs 500" "Example: quan logs 500")" >&2
         exit 1
     fi
-    echo "Showing the last ${lines} lines. Press Ctrl+C to exit."
+    echo "$(message "显示最后 ${lines} 行日志，按 Ctrl+C 退出。" "Showing the last ${lines} lines. Press Ctrl+C to exit.")"
     compose logs --tail="$lines" -f
 }
 
 do_restart() {
     check_installation
-    echo "Restarting QuantPilot..."
+    echo "$(message "正在重启 QuantPilot……" "Restarting QuantPilot...")"
     compose restart
     wait_for_health
     compose ps
@@ -191,7 +212,7 @@ do_restart() {
 
 do_start() {
     check_installation
-    echo "Starting QuantPilot..."
+    echo "$(message "正在启动 QuantPilot……" "Starting QuantPilot...")"
     compose up -d --remove-orphans
     wait_for_health
     compose ps
@@ -199,14 +220,30 @@ do_start() {
 
 do_stop() {
     check_installation
-    echo "Stopping QuantPilot..."
+    echo "$(message "正在停止 QuantPilot……" "Stopping QuantPilot...")"
     compose stop
     compose ps
-    echo "QuantPilot stopped. Persistent data was not removed."
+    echo "$(message "QuantPilot 已停止，持久化数据未被删除。" "QuantPilot stopped. Persistent data was not removed.")"
 }
 
 show_help() {
-    cat <<'HELP'
+    if [[ "$USE_CHINESE" == "true" ]]; then
+        cat <<'HELP_ZH'
+QuantPilot 管理命令
+
+用法：
+  quan update         检查是否有新的稳定版本
+  quan upgrade        拉取并安装最新稳定版本
+  quan status         查看容器和健康状态
+  quan logs           持续显示最后200行日志
+  quan logs 500       持续显示最后500行日志
+  quan restart        重启 QuantPilot
+  quan start          启动 QuantPilot
+  quan stop           停止 QuantPilot，但不删除数据
+  quan help           显示此帮助
+HELP_ZH
+    else
+        cat <<'HELP_EN'
 QuantPilot management command
 
 Usage:
@@ -219,7 +256,8 @@ Usage:
   quan start          Start QuantPilot
   quan stop           Stop QuantPilot without deleting data
   quan help           Show this help
-HELP
+HELP_EN
+    fi
 }
 
 command="${1:-help}"
@@ -235,7 +273,7 @@ case "$command" in
     stop) do_stop "$@" ;;
     help|-h|--help) show_help ;;
     *)
-        echo "Unknown command: $command" >&2
+        echo "$(message "未知命令：$command" "Unknown command: $command")" >&2
         echo >&2
         show_help >&2
         exit 1

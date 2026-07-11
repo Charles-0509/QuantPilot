@@ -72,7 +72,7 @@ ALPACA_DATA_FEED=iex
 
 Docker 默认将 `10000` 端口发布到 `0.0.0.0`，可通过 `HTTP + IP` 直接访问，也可由 Nginx/Caddy 提供 `HTTPS + 域名/IP`。默认 `QUANTPILOT_COOKIE_SECURE=false` 兼容两种入口；公网 HTTP 会明文传输密码和会话，不应在不可信网络使用。仅允许 HTTPS 访问时可设置 `QUANTPILOT_COOKIE_SECURE=true`。网页中更新 Alpaca 配置后，该用户的交易引擎会进入安全暂停状态，需在“自动交易”页面确认后重新启动。管理员网页配置优先于 `.env`；普通用户没有共享的 `.env` 后备凭据。
 
-也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.3.2` 或 `ghcr.io/charles-0509/quantpilot:latest`。
+也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.3.3` 或 `ghcr.io/charles-0509/quantpilot:latest`。
 
 已有部署在线升级（Alembic 会自动保留数据并把原有记录归到管理员）：
 

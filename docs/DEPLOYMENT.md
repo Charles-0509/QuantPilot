@@ -36,7 +36,7 @@ QUANTPILOT_SESSION_HOURS=12
 公开镜像支持 AMD64 与 ARM64：
 
 ```bash
-docker pull ghcr.io/charles-0509/quantpilot:1.3.2
+docker pull ghcr.io/charles-0509/quantpilot:1.3.3
 ```
 
 使用仓库中的 `docker-compose.yml` 时，执行 `docker compose pull && docker compose up -d` 即可拉取并运行 `latest`。需要从源码构建时执行 `docker build -t quantpilot:local .`。

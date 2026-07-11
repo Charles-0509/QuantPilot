@@ -5,6 +5,7 @@ import { api, ApiError, formatTime, money, number } from '../api'
 import type { BacktestRun, BacktestSummary, Strategy } from '../types'
 import EquityChart from '../components/EquityChart'
 import { Badge, Button, Card, Empty, ErrorPanel, Field, Loading, PageHeader } from '../components/UI'
+import { shanghaiDateOffset } from '../time'
 
 const SYMBOL_PRESETS = ['GOOGL', 'AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'TSLA', 'SPY', 'QQQ', 'IWM']
 const BENCHMARKS = [
@@ -18,12 +19,6 @@ const BENCHMARKS = [
   ['XLK', '美国科技板块'],
 ] as const
 const TRADE_PAGE_SIZE = 50
-
-function dateOffset(days: number) {
-  const date = new Date()
-  date.setDate(date.getDate() + days)
-  return date.toISOString().slice(0, 10)
-}
 
 function parseSymbols(value: string) {
   return [...new Set(value.split(/[,，\s]+/).map((item) => item.trim().toUpperCase()).filter(Boolean))]
@@ -54,8 +49,8 @@ export default function Backtests() {
   const [strategyId, setStrategyId] = useState('')
   const [symbolInput, setSymbolInput] = useState('')
   const [benchmark, setBenchmark] = useState('SPY')
-  const [start, setStart] = useState(dateOffset(-365))
-  const [end, setEnd] = useState(dateOffset(-1))
+  const [start, setStart] = useState(shanghaiDateOffset(-365))
+  const [end, setEnd] = useState(shanghaiDateOffset(-1))
   const [capital, setCapital] = useState(100000)
   const [slippage, setSlippage] = useState(5)
   const [activeRunId, setActiveRunId] = useState('')

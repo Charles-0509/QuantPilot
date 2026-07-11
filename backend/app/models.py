@@ -107,9 +107,30 @@ class OrderRecord(Base):
     qty: Mapped[float | None] = mapped_column(Float, nullable=True)
     notional: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
     filled_avg_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StrategyPosition(Base):
+    """Quantity opened by one strategy; manual and other-strategy holdings are excluded."""
+
+    __tablename__ = "strategy_positions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "strategy_id", "symbol", name="uq_strategy_position"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), index=True
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

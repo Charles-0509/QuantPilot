@@ -78,7 +78,7 @@ def service_error(exc: Exception) -> HTTPException:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.3.0"}
+    return {"status": "ok", "paper": True, "version": "1.3.1"}
 
 
 @router.get("/metadata")

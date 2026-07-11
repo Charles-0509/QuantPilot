@@ -20,6 +20,7 @@ from app.models import (
     RiskSettings,
     Signal,
     Strategy,
+    StrategyPosition,
     WatchlistItem,
 )
 from app.schemas import RuleDefinition
@@ -146,18 +147,53 @@ class TradingEngine:
                     OrderRecord.id == order_id, OrderRecord.user_id == self.user_id
                 )
             ) if order_id else None
+            if record is None and order_id:
+                parent_id = str(order.get("parent_order_id") or "")
+                parent = db.scalar(
+                    select(OrderRecord).where(
+                        OrderRecord.id == parent_id,
+                        OrderRecord.user_id == self.user_id,
+                    )
+                ) if parent_id else None
+                if parent is not None:
+                    record = OrderRecord(
+                        user_id=self.user_id,
+                        id=order_id,
+                        client_order_id=str(
+                            order.get("client_order_id") or f"leg-{order_id[:20]}"
+                        ),
+                        strategy_id=parent.strategy_id,
+                        signal_id=parent.signal_id,
+                        symbol=str(order.get("symbol") or parent.symbol),
+                        side=self._order_side(order),
+                        order_type=str(order.get("type") or "bracket_leg"),
+                        qty=as_float(order.get("qty")) or None,
+                        notional=None,
+                        status=str(order.get("status", event)),
+                        raw=payload,
+                    )
+                    db.add(record)
+                    db.flush()
             if record:
                 record.status = str(order.get("status", event))
                 filled = order.get("filled_avg_price")
                 record.filled_avg_price = as_float(filled) if filled is not None else None
                 record.raw = payload
+                self._apply_fill_delta(db, record, order)
                 db.commit()
                 if event in {"fill", "filled"} and record.side == "buy" and record.strategy_id:
                     strategy = db.get(Strategy, record.strategy_id)
                     if strategy:
                         definition = RuleDefinition.model_validate(strategy.definition)
                         trailing = definition.order.trailing_stop
-                        if trailing:
+                        existing_trailing = db.scalar(
+                            select(OrderRecord.id).where(
+                                OrderRecord.user_id == self.user_id,
+                                OrderRecord.signal_id == record.signal_id,
+                                OrderRecord.order_type == "trailing_stop",
+                            )
+                        )
+                        if trailing and existing_trailing is None:
                             qty = as_float(order.get("filled_qty") or order.get("qty"))
                             client_id = f"trail-{record.client_order_id}"[:48]
                             try:
@@ -177,13 +213,88 @@ class TradingEngine:
                                         qty=qty,
                                         notional=None,
                                         status=str(trailing_order.get("status", "accepted")),
+                                        filled_qty=as_float(trailing_order.get("filled_qty")),
                                         raw=trailing_order,
                                     )
                                 )
                                 db.commit()
                             except Exception as exc:  # pragma: no cover - network dependent
                                 await self.log("error", "order", f"创建移动止损失败: {exc}")
+            elif self._order_side(order) == "sell" and as_float(order.get("filled_qty")) > 0:
+                # A manual or otherwise untracked sell makes attribution uncertain.
+                # Clear ownership so no strategy can later close a manual holding.
+                db.query(StrategyPosition).filter(
+                    StrategyPosition.user_id == self.user_id,
+                    StrategyPosition.symbol == str(order.get("symbol", "")).upper(),
+                ).update({StrategyPosition.qty: 0.0})
+                db.commit()
         await websocket_manager.broadcast(self.user_id, "trade_update", payload)
+
+    @staticmethod
+    def _order_side(order: dict[str, Any]) -> str:
+        value = str(order.get("side", "")).lower()
+        return "sell" if "sell" in value else "buy"
+
+    def _apply_fill_delta(
+        self, db, record: OrderRecord, order: dict[str, Any]
+    ) -> None:
+        if not record.strategy_id:
+            return
+        new_filled_qty = as_float(order.get("filled_qty"))
+        if new_filled_qty <= record.filled_qty:
+            return
+        delta = new_filled_qty - record.filled_qty
+        record.filled_qty = new_filled_qty
+        position = db.scalar(
+            select(StrategyPosition).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.strategy_id == record.strategy_id,
+                StrategyPosition.symbol == record.symbol,
+            )
+        )
+        if position is None:
+            position = StrategyPosition(
+                user_id=self.user_id,
+                strategy_id=record.strategy_id,
+                symbol=record.symbol,
+                qty=0,
+            )
+            db.add(position)
+        if record.side == "buy":
+            position.qty += delta
+        else:
+            position.qty = max(0.0, position.qty - delta)
+
+    def _owned_qty(self, strategy_id: str, symbol: str) -> float:
+        with SessionLocal() as db:
+            position = db.scalar(
+                select(StrategyPosition).where(
+                    StrategyPosition.user_id == self.user_id,
+                    StrategyPosition.strategy_id == strategy_id,
+                    StrategyPosition.symbol == symbol,
+                )
+            )
+            return max(0.0, position.qty if position else 0.0)
+
+    def _cancel_strategy_symbol_orders(self, strategy_id: str, symbol: str) -> None:
+        with SessionLocal() as db:
+            own_order_ids = set(
+                db.scalars(
+                    select(OrderRecord.id).where(
+                        OrderRecord.user_id == self.user_id,
+                        OrderRecord.strategy_id == strategy_id,
+                        OrderRecord.symbol == symbol,
+                    )
+                ).all()
+            )
+        for order in self.alpaca.get_orders("open"):
+            order_id = str(order.get("id", ""))
+            parent_id = str(order.get("parent_order_id") or "")
+            if order_id in own_order_ids or parent_id in own_order_ids:
+                try:
+                    self.alpaca.cancel_order(order_id)
+                except Exception as exc:  # pragma: no cover - network dependent
+                    logger.warning("Unable to cancel strategy order %s: %s", order_id, exc)
 
     async def evaluate_active_strategies(self) -> None:
         with SessionLocal() as db:
@@ -221,6 +332,7 @@ class TradingEngine:
         positions = self.alpaca.get_positions()
         position_map = {str(position.get("symbol")): position for position in positions}
         account = self.alpaca.get_account()
+        open_orders = self._enrich_open_orders(self.alpaca.get_orders("open"))
 
         for symbol, frame in bars_by_symbol.items():
             if frame.empty or len(frame) < 3:
@@ -240,18 +352,50 @@ class TradingEngine:
 
             entry = evaluate_latest(frame, definition.entry)
             exit_ = evaluate_latest(frame, definition.exit)
-            has_position = symbol in position_map and as_float(position_map[symbol].get("qty")) > 0
+            account_position_qty = as_float(position_map.get(symbol, {}).get("qty"))
+            owned_qty = min(self._owned_qty(strategy.id, symbol), account_position_qty)
+            has_position = owned_qty > 0
 
             if has_position and exit_.matched:
-                await self._create_exit_signal(strategy, definition, symbol, frame, exit_)
+                await self._create_exit_signal(
+                    strategy, definition, symbol, frame, exit_, owned_qty
+                )
                 continue
             can_pyramid = definition.position.allow_pyramiding and await self._cooldown_passed(
                 strategy.id, symbol, definition
             )
             if entry.matched and (not has_position or can_pyramid):
                 await self._create_entry_signal(
-                    strategy, definition, symbol, frame, entry, account, positions, clock
+                    strategy,
+                    definition,
+                    symbol,
+                    frame,
+                    entry,
+                    account,
+                    positions,
+                    open_orders,
+                    clock,
                 )
+
+    def _enrich_open_orders(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        order_ids = [str(order.get("id", "")) for order in orders if order.get("id")]
+        if not order_ids:
+            return orders
+        with SessionLocal() as db:
+            records = db.scalars(
+                select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id,
+                    OrderRecord.id.in_(order_ids),
+                )
+            ).all()
+        notional_by_id = {record.id: record.notional for record in records if record.notional}
+        return [
+            {
+                **order,
+                "_estimated_notional": notional_by_id.get(str(order.get("id", ""))),
+            }
+            for order in orders
+        ]
 
     async def _cooldown_passed(self, strategy_id: str, symbol: str, definition: RuleDefinition) -> bool:
         with SessionLocal() as db:
@@ -282,6 +426,7 @@ class TradingEngine:
         result,
         account: dict[str, Any],
         positions: list[dict[str, Any]],
+        open_orders: list[dict[str, Any]],
         clock: dict[str, Any],
     ) -> None:
         price = float(frame.iloc[-1]["close"])
@@ -327,6 +472,8 @@ class TradingEngine:
                 state=state,
                 strategy_max_symbol_pct=definition.risk.max_symbol_pct,
                 strategy_max_positions=definition.risk.max_positions,
+                open_orders=open_orders,
+                reference_price=price,
             )
             db.commit()
         if not decision.allowed:
@@ -373,12 +520,14 @@ class TradingEngine:
                         qty=qty,
                         notional=desired_notional,
                         status=str(order.get("status", "accepted")),
+                        filled_qty=as_float(order.get("filled_qty")),
                         raw=order,
                     )
                 )
                 saved_signal = db.get(Signal, signal.id)
                 saved_signal.status = "submitted"
                 db.commit()
+            open_orders.append({**order, "_estimated_notional": desired_notional})
             await self.log("info", "order", f"{strategy.name}: 已提交 {symbol} 模拟买单")
             await websocket_manager.broadcast(
                 self.user_id,
@@ -394,7 +543,9 @@ class TradingEngine:
                     db.commit()
             await self.log("error", "order", f"{symbol} 下单失败: {exc}")
 
-    async def _create_exit_signal(self, strategy, definition, symbol, frame, result) -> None:
+    async def _create_exit_signal(
+        self, strategy, definition, symbol, frame, result, owned_qty: float
+    ) -> None:
         price = float(frame.iloc[-1]["close"])
         signal = await self._insert_signal(
             strategy,
@@ -407,7 +558,9 @@ class TradingEngine:
         if signal is None:
             return
         try:
-            order = self.alpaca.close_position(symbol)
+            self._cancel_strategy_symbol_orders(strategy.id, symbol)
+            client_id = f"qp-exit-u{self.user_id}-{signal.id[:20]}"[:48]
+            order = self.alpaca.submit_exit_order(symbol, owned_qty, client_id)
             with SessionLocal() as db:
                 db.add(
                     OrderRecord(
@@ -422,6 +575,7 @@ class TradingEngine:
                         qty=as_float(order.get("qty")),
                         notional=None,
                         status=str(order.get("status", "accepted")),
+                        filled_qty=as_float(order.get("filled_qty")),
                         raw=order,
                     )
                 )
@@ -514,10 +668,38 @@ class TradingEngine:
                             OrderRecord.user_id == self.user_id,
                         )
                     )
+                    if record is None:
+                        parent_id = str(order.get("parent_order_id") or "")
+                        parent = db.scalar(
+                            select(OrderRecord).where(
+                                OrderRecord.id == parent_id,
+                                OrderRecord.user_id == self.user_id,
+                            )
+                        ) if parent_id else None
+                        if parent is not None:
+                            record = OrderRecord(
+                                user_id=self.user_id,
+                                id=order_id,
+                                client_order_id=str(
+                                    order.get("client_order_id") or f"leg-{order_id[:20]}"
+                                ),
+                                strategy_id=parent.strategy_id,
+                                signal_id=parent.signal_id,
+                                symbol=str(order.get("symbol") or parent.symbol),
+                                side=self._order_side(order),
+                                order_type=str(order.get("type") or "bracket_leg"),
+                                qty=as_float(order.get("qty")) or None,
+                                notional=None,
+                                status=str(order.get("status", "accepted")),
+                                raw=order,
+                            )
+                            db.add(record)
+                            db.flush()
                     if record:
                         record.status = str(order.get("status", record.status))
                         record.filled_avg_price = as_float(order.get("filled_avg_price")) or None
                         record.raw = order
+                        self._apply_fill_delta(db, record, order)
                 db.commit()
         except Exception as exc:  # pragma: no cover - network dependent
             await self.log("warning", "connection", f"订单对账失败: {exc}")
@@ -552,6 +734,11 @@ class TradingEngine:
     async def emergency_liquidate(self, reason: str = "用户紧急平仓") -> list[Any]:
         await self.pause(reason, cancel_orders=True)
         result = self.alpaca.close_all_positions()
+        with SessionLocal() as db:
+            db.query(StrategyPosition).filter(
+                StrategyPosition.user_id == self.user_id
+            ).update({StrategyPosition.qty: 0.0})
+            db.commit()
         await self.log("critical", "risk", "已向 Alpaca 模拟盘发送全部平仓指令")
         await websocket_manager.broadcast(self.user_id, "engine", {"status": "liquidating"})
         return result

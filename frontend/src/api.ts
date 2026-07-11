@@ -1,3 +1,5 @@
+import { formatShanghaiDateTime } from './time'
+
 export class ApiError extends Error {
   status: number
   constructor(message: string, status: number) {
@@ -76,5 +78,5 @@ export function number(value: unknown, digits = 2) {
 
 export function formatTime(value?: string | null) {
   if (!value) return '—'
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+  return formatShanghaiDateTime(value)
 }

@@ -50,7 +50,7 @@ def test_auth_migration_handles_fresh_and_existing_sqlite(tmp_path: Path) -> Non
     )
     with upgraded.connect() as connection:
         assert connection.scalar(text("SELECT value FROM preserved_records")) == "keep-me"
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_multi_user"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_trade_safety"
     upgraded.dispose()
 
 
@@ -94,5 +94,7 @@ def test_multi_user_migration_assigns_existing_records_to_admin(tmp_path: Path) 
         assert connection.scalar(text("SELECT owner_user_id FROM strategies WHERE id='template'")) is None
         for table in ("backtest_runs", "signals", "orders", "event_logs", "risk_settings", "engine_state", "connection_config", "watchlist"):
             assert connection.scalar(text(f"SELECT user_id FROM {table} LIMIT 1")) == 1
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_multi_user"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_trade_safety"
+        assert "filled_qty" in {column["name"] for column in inspect(upgraded).get_columns("orders")}
+        assert "strategy_positions" in inspect(upgraded).get_table_names()
     upgraded.dispose()

@@ -3,7 +3,6 @@ name: quantpilot
 services:
   quantpilot:
     image: ghcr.io/charles-0509/quantpilot:latest
-    build: .
     container_name: quantpilot
     env_file:
       - .env

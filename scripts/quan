@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="${QUAN_CONFIG_FILE:-/etc/quantpilot/quan.conf}"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+    echo "Error: QuantPilot configuration not found: $CONFIG_FILE" >&2
+    echo "Re-run the QuantPilot installer to repair the management command." >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${QUANTPILOT_DIR:?QUANTPILOT_DIR is missing from $CONFIG_FILE}"
+: "${QUANTPILOT_PORT:?QUANTPILOT_PORT is missing from $CONFIG_FILE}"
+COMPOSE_FILE="${COMPOSE_FILE:-$QUANTPILOT_DIR/docker-compose.yml}"
+REPO_SLUG="${REPO_SLUG:-Charles-0509/QuantPilot}"
+IMAGE="${IMAGE:-ghcr.io/charles-0509/quantpilot:latest}"
+QUAN_BIN_PATH="${QUAN_BIN_PATH:-/usr/local/bin/quan}"
+HEALTH_URL="http://127.0.0.1:${QUANTPILOT_PORT}/api/health"
+GITHUB_API="https://api.github.com/repos/${REPO_SLUG}/tags?per_page=100"
+
+if [[ $EUID -eq 0 ]]; then
+    SUDO=()
+else
+    SUDO=(sudo)
+fi
+
+compose() {
+    "${SUDO[@]}" docker compose \
+        --project-directory "$QUANTPILOT_DIR" \
+        -f "$COMPOSE_FILE" "$@"
+}
+
+check_installation() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        echo "Error: Docker Compose file not found: $COMPOSE_FILE" >&2
+        exit 1
+    fi
+}
+
+extract_json_version() {
+    sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' | head -n 1
+}
+
+local_version() {
+    local response version
+    if ! response="$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null)"; then
+        echo "Error: QuantPilot is not running or its health endpoint is unavailable: $HEALTH_URL" >&2
+        echo "Run 'quan start' and try again." >&2
+        return 1
+    fi
+    version="$(printf '%s\n' "$response" | extract_json_version)"
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: The running container returned an invalid version." >&2
+        return 1
+    fi
+    printf '%s\n' "$version"
+}
+
+latest_version() {
+    local response versions latest
+    if ! response="$(curl -fsSL --max-time 15 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: QuantPilot-quan' \
+        "$GITHUB_API" 2>/dev/null)"; then
+        echo "Error: Unable to query the latest QuantPilot version from GitHub." >&2
+        return 1
+    fi
+    versions="$(printf '%s\n' "$response" \
+        | grep -oE '"name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' \
+        | sed -E 's/.*"v([0-9]+\.[0-9]+\.[0-9]+)"/\1/' || true)"
+    latest="$(printf '%s\n' "$versions" | sed '/^$/d' | sort -V | tail -n 1)"
+    if [[ ! "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: GitHub did not return a stable QuantPilot version." >&2
+        return 1
+    fi
+    printf '%s\n' "$latest"
+}
+
+version_is_newer() {
+    local current="$1" latest="$2" first
+    [[ "$current" != "$latest" ]] || return 1
+    first="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | head -n 1)"
+    [[ "$first" == "$current" ]]
+}
+
+wait_for_health() {
+    local expected="${1:-}" response version
+    echo "Waiting for QuantPilot..."
+    for _ in {1..30}; do
+        if response="$(curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null)"; then
+            version="$(printf '%s\n' "$response" | extract_json_version)"
+            if [[ -z "$expected" || "$version" == "$expected" ]]; then
+                printf '%s\n' "$response"
+                echo "QuantPilot is healthy."
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    echo "Error: QuantPilot did not pass its health check within 60 seconds." >&2
+    compose logs --tail=100 >&2 || true
+    return 1
+}
+
+update_self() {
+    local version="$1" url temporary
+    url="https://raw.githubusercontent.com/${REPO_SLUG}/v${version}/scripts/quan"
+    temporary="$(mktemp)"
+    if ! curl -fsSL --max-time 20 "$url" -o "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    if ! bash -n "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    "${SUDO[@]}" install -m 0755 "$temporary" "$QUAN_BIN_PATH"
+    rm -f "$temporary"
+}
+
+do_update() {
+    local current latest
+    echo ":: Synchronizing QuantPilot package database..."
+    current="$(local_version)"
+    latest="$(latest_version)"
+    if version_is_newer "$current" "$latest"; then
+        echo "quantpilot ${current} -> ${latest}"
+        echo ":: A new QuantPilot version is available."
+        echo "Run 'quan upgrade' to update."
+    else
+        if [[ "$current" != "$latest" ]]; then
+            echo "quantpilot ${current} (newer than published ${latest})"
+        fi
+        echo "Nothing to do"
+    fi
+}
+
+do_upgrade() {
+    local latest
+    check_installation
+    latest="$(latest_version)"
+    echo "Upgrading QuantPilot to ${latest}..."
+    compose pull
+    compose up -d --remove-orphans
+    wait_for_health "$latest"
+    if update_self "$latest"; then
+        echo "Updated $QUAN_BIN_PATH."
+    else
+        echo "Warning: QuantPilot was upgraded, but the quan command could not update itself." >&2
+        return 1
+    fi
+    echo
+    compose ps
+    echo "QuantPilot upgrade completed."
+}
+
+do_status() {
+    check_installation
+    echo "QuantPilot containers:"
+    echo
+    compose ps
+    echo
+    echo "Health check:"
+    local_version >/dev/null
+    curl -fsS --max-time 5 "$HEALTH_URL"
+    echo
+}
+
+do_logs() {
+    check_installation
+    local lines="${1:-200}"
+    if [[ ! "$lines" =~ ^[0-9]+$ ]] || (( lines < 1 )); then
+        echo "Error: log line count must be a positive integer." >&2
+        echo "Example: quan logs 500" >&2
+        exit 1
+    fi
+    echo "Showing the last ${lines} lines. Press Ctrl+C to exit."
+    compose logs --tail="$lines" -f
+}
+
+do_restart() {
+    check_installation
+    echo "Restarting QuantPilot..."
+    compose restart
+    wait_for_health
+    compose ps
+}
+
+do_start() {
+    check_installation
+    echo "Starting QuantPilot..."
+    compose up -d --remove-orphans
+    wait_for_health
+    compose ps
+}
+
+do_stop() {
+    check_installation
+    echo "Stopping QuantPilot..."
+    compose stop
+    compose ps
+    echo "QuantPilot stopped. Persistent data was not removed."
+}
+
+show_help() {
+    cat <<'HELP'
+QuantPilot management command
+
+Usage:
+  quan update         Check whether a newer stable version is available
+  quan upgrade        Pull and install the newest stable version
+  quan status         Show containers and health status
+  quan logs           Follow the last 200 log lines
+  quan logs 500       Follow the last 500 log lines
+  quan restart        Restart QuantPilot
+  quan start          Start QuantPilot
+  quan stop           Stop QuantPilot without deleting data
+  quan help           Show this help
+HELP
+}
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+    update) do_update "$@" ;;
+    upgrade) do_upgrade "$@" ;;
+    status) do_status "$@" ;;
+    logs) do_logs "$@" ;;
+    restart) do_restart "$@" ;;
+    start) do_start "$@" ;;
+    stop) do_stop "$@" ;;
+    help|-h|--help) show_help ;;
+    *)
+        echo "Unknown command: $command" >&2
+        echo >&2
+        show_help >&2
+        exit 1
+        ;;
+esac

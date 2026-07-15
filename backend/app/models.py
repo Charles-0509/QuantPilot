@@ -166,6 +166,32 @@ class EventLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class ExecutionIncident(Base):
+    """Persistent long-only quarantine for one user and symbol."""
+
+    __tablename__ = "execution_incidents"
+    __table_args__ = (
+        UniqueConstraint("user_id", "symbol", name="uq_execution_incident_user_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    trigger_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class RiskSettings(Base):
     __tablename__ = "risk_settings"
 

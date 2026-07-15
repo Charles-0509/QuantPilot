@@ -3,16 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Database, Eye, EyeOff, KeyRound, LockKeyhole, LogOut, Save, Server, ShieldCheck, Trash2, UserRound, WifiOff } from 'lucide-react'
 import { api, ApiError, formatTime } from '../api'
 import { Badge, Button, Card, Field, Loading, PageHeader } from '../components/UI'
-import type { AuthUser, ConnectionConfig } from '../types'
-
-type ConnectionStatus = {
-  configured: boolean
-  connected: boolean
-  paper: boolean
-  feed: string
-  source: 'web' | 'env' | 'none'
-  message: string
-}
+import { connectionPresentation, errorCategoryLabel } from '../status'
+import type { AuthUser, ConnectionConfig, ConnectionStatus } from '../types'
 
 export default function SettingsPage() {
   const client = useQueryClient()
@@ -59,6 +51,8 @@ export default function SettingsPage() {
   if (connection.isLoading || config.isLoading) return <Loading label="正在读取本机连接配置" />
   const status = connection.data
   const saved = config.data
+  const connectionView = connectionPresentation(status, Boolean(connection.error))
+  const statusIconColor = connectionView.tone === 'success' ? '#42e6a4' : connectionView.tone === 'danger' ? '#ff647c' : '#f2bd5c'
   const sourceLabel = saved?.source === 'web' ? '网页加密配置' : saved?.source === 'env' ? '.env 后备配置' : '尚未配置'
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -82,7 +76,7 @@ export default function SettingsPage() {
       eyebrow="SECURE SYSTEM CONFIG"
       title="设置"
       description="直接在此验证并更新 Alpaca Paper 密钥。程序没有实盘开关，也不会将密钥返回到浏览器。"
-      actions={<Badge tone={status?.connected ? 'success' : 'warning'}>{status?.connected ? '模拟盘已连接' : '未连接'}</Badge>}
+      actions={<Badge tone={connectionView.tone}>{connectionView.label}</Badge>}
     />
     <div className="two-column">
       <Card>
@@ -109,14 +103,22 @@ export default function SettingsPage() {
         </form>
       </Card>
       <Card>
-        <div className="card-header"><div><h2>当前连接状态</h2><p>固定为 Alpaca Paper Trading</p></div>{status?.connected ? <CheckCircle2 size={19} color="#42e6a4" /> : <WifiOff size={19} color="#f2bd5c" />}</div>
+        <div className="card-header"><div><h2>当前连接状态</h2><p>固定为 Alpaca Paper Trading</p></div>{connectionView.state === 'connected' ? <CheckCircle2 size={19} color={statusIconColor} /> : <WifiOff size={19} color={statusIconColor} />}</div>
         <div className="card-pad stack">
+          <StatusRow icon={<ShieldCheck size={16} />} label="运行状态" value={connectionView.label} />
           <StatusRow icon={<KeyRound size={16} />} label="配置来源" value={sourceLabel} />
           <StatusRow icon={<KeyRound size={16} />} label="API 密钥" value={saved?.configured ? (saved.api_key_hint || '已保存') : '尚未配置'} />
           <StatusRow icon={<LockKeyhole size={16} />} label="交易环境" value="Paper Trading（硬编码）" />
           <StatusRow icon={<Server size={16} />} label="行情数据源" value="IEX 免费实时数据" />
           <StatusRow icon={<Database size={16} />} label="最后更新" value={saved?.updated_at ? formatTime(saved.updated_at) : '—'} />
-          <div className="warning-callout">{status?.message}</div>
+          <StatusRow icon={<CheckCircle2 size={16} />} label="最近连接成功" value={formatTime(status?.last_success_at)} />
+          <StatusRow icon={<WifiOff size={16} />} label="最近连接失败" value={formatTime(status?.last_failure_at)} />
+          <StatusRow icon={<Server size={16} />} label="下次自动重试" value={formatTime(status?.retry_at)} />
+          <StatusRow icon={<WifiOff size={16} />} label="连续失败" value={status?.consecutive_failures === undefined ? '—' : `${status.consecutive_failures} 次`} />
+          <StatusRow icon={<WifiOff size={16} />} label="最近错误类型" value={errorCategoryLabel(status?.last_error_category)} />
+          <div className={connectionView.tone === 'danger' ? 'danger-callout' : 'warning-callout'}>
+            {connection.error ? '无法读取 Alpaca 连接状态，请稍后重试。' : status?.message || connectionView.label}
+          </div>
         </div>
       </Card>
     </div>

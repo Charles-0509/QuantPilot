@@ -16,7 +16,8 @@ import {
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
-import type { AuthUser } from '../types'
+import { connectionPresentation } from '../status'
+import type { AuthUser, ConnectionStatus } from '../types'
 import { Badge } from './UI'
 
 const navigation = [
@@ -49,7 +50,11 @@ export default function Shell() {
             if (payload.data?.id) client.invalidateQueries({ queryKey: ['backtest', String(payload.data.id)] })
           }
           if (payload.event === 'engine') client.invalidateQueries({ queryKey: ['engine'] })
-          if (['engine', 'signal', 'trade_update'].includes(payload.event || '')) {
+          if (payload.event === 'connection') {
+            client.invalidateQueries({ queryKey: ['connection'] })
+            client.invalidateQueries({ queryKey: ['engine'] })
+          }
+          if (['connection', 'engine', 'signal', 'trade_update'].includes(payload.event || '')) {
             client.invalidateQueries({ queryKey: ['dashboard'] })
           }
         } catch {
@@ -74,7 +79,7 @@ export default function Shell() {
 
   const connection = useQuery({
     queryKey: ['connection'],
-    queryFn: () => api<any>('/api/connection'),
+    queryFn: () => api<ConnectionStatus>('/api/connection'),
     refetchInterval: 15000,
   })
   const me = useQuery({ queryKey: ['auth-me'], queryFn: () => api<AuthUser>('/api/auth/me') })
@@ -85,6 +90,7 @@ export default function Shell() {
       window.location.reload()
     },
   })
+  const connectionView = connectionPresentation(connection.data, Boolean(connection.error))
 
   return (
     <div className="app-shell">
@@ -108,7 +114,7 @@ export default function Shell() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="system-pulse"><span /> 系统安全运行</div>
+          <div className="system-pulse"><span /> QuantPilot 服务在线</div>
           <p>交易接口被永久锁定为模拟盘</p>
         </div>
       </aside>
@@ -119,9 +125,9 @@ export default function Shell() {
             <span>美股 / ETF · IEX 免费行情</span>
           </div>
           <div className="connection-status">
-            <span className={connection.data?.connected ? 'connection-dot online' : 'connection-dot'} />
-            <Badge tone={connection.data?.connected ? 'success' : 'warning'}>
-              {connection.data?.connected ? '模拟盘已连接' : '等待 Alpaca 密钥'}
+            <span className={`connection-dot ${connectionView.dotClass}`} />
+            <Badge tone={connectionView.tone}>
+              <span title={connection.data?.message || connectionView.label}>{connectionView.label}</span>
             </Badge>
             {me.data && <Badge tone={me.data.role === 'admin' ? 'info' : 'neutral'}>{me.data.role === 'admin' ? '管理员' : '用户'}</Badge>}
             <span className="topbar-user">{me.data?.username || '用户'}</span>

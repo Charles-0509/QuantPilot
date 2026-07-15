@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.models import EngineState, RiskSettings
+
+
+ET = ZoneInfo("America/New_York")
 
 
 def as_float(value: Any, default: float = 0) -> float:
@@ -22,6 +26,38 @@ class RiskDecision:
 
 
 class RiskManager:
+    def update_equity_state(
+        self,
+        *,
+        account: dict[str, Any],
+        state: EngineState,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist the session baseline independently from entry signals.
+
+        Alpaca's ``last_equity`` is the previous regular-session close and is a
+        safer day-start reference than whichever intraday value happens to be
+        observed when the first strategy signal arrives.  The high-water mark
+        is refreshed by the engine throughout the session, including while the
+        user has new entries paused.
+        """
+        observed_at = now or datetime.now(timezone.utc)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        equity = as_float(account.get("equity"))
+        if equity <= 0:
+            return
+        session_date = observed_at.astimezone(ET).date().isoformat()
+        if state.session_date != session_date:
+            previous_close = as_float(account.get("last_equity"))
+            day_start = previous_close if previous_close > 0 else equity
+            state.session_date = session_date
+            state.day_start_equity = day_start
+            state.daily_high_equity = max(day_start, equity)
+            return
+        state.day_start_equity = state.day_start_equity or equity
+        state.daily_high_equity = max(state.daily_high_equity or equity, equity)
+
     def check_entry(
         self,
         *,
@@ -61,13 +97,7 @@ class RiskManager:
         if equity <= 0:
             return RiskDecision(False, "账户净值无效")
 
-        current_day = now.date().isoformat()
-        if state.session_date != current_day:
-            state.session_date = current_day
-            state.day_start_equity = equity
-            state.daily_high_equity = equity
-        state.day_start_equity = state.day_start_equity or equity
-        state.daily_high_equity = max(state.daily_high_equity or equity, equity)
+        self.update_equity_state(account=account, state=state, now=now)
 
         daily_loss_pct = (state.day_start_equity - equity) / state.day_start_equity * 100
         drawdown_pct = (state.daily_high_equity - equity) / state.daily_high_equity * 100

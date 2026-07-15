@@ -1,11 +1,14 @@
-FROM node:22-alpine AS frontend-builder
+ARG NODE_IMAGE=node:22-alpine
+ARG PYTHON_IMAGE=python:3.12-slim
+
+FROM ${NODE_IMAGE} AS frontend-builder
 WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.12-slim AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend
@@ -16,6 +19,7 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
+COPY scripts/ ./scripts/
 COPY alembic.ini ./
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 RUN mkdir -p /app/data

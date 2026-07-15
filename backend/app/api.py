@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -17,7 +17,7 @@ from .models import (
     ConnectionConfig,
     EngineState,
     EventLog,
-    OrderRecord,
+    ExecutionIncident,
     RiskSettings,
     Signal,
     Strategy,
@@ -44,8 +44,14 @@ from .services.alpaca_service import AlpacaService
 from .services.auth import AuthenticatedSession
 from .services.backtest import run_backtest
 from .services.credentials import encrypt_credential
-from .services.engine import TradingEngine
+from .services.engine import (
+    ConnectionReconfigurationBlockedError,
+    ExecutionQuarantineError,
+    StrategyExecutionActiveError,
+    TradingEngine,
+)
 from .services.runtime import UserRuntime, UserRuntimeManager
+from .services.strategy_safety import strategy_has_unresolved_execution
 from .services.websocket import websocket_manager
 
 router = APIRouter(prefix="/api")
@@ -73,12 +79,107 @@ def get_engine(runtime: UserRuntime = Depends(get_runtime)) -> TradingEngine:
 
 
 def service_error(exc: Exception) -> HTTPException:
-    return HTTPException(status_code=503, detail=str(exc))
+    user_message = getattr(exc, "user_message", None)
+    return HTTPException(
+        status_code=503,
+        detail=user_message or "Alpaca Paper 暂时不可用，系统将自动重试",
+    )
+
+
+ENGINE_CRITICAL_OPERATIONS = {
+    ("trading", "clock"),
+    ("trading", "account"),
+    ("trading", "positions"),
+    ("trading", "orders:open"),
+    ("trading", "calendar"),
+    ("trading", "asset"),
+    ("trading", "submit_order"),
+    ("data", "stock_bars"),
+    ("data", "latest_quotes"),
+}
+
+def ensure_strategy_definition_is_mutable(
+    db: Session, user_id: int, strategy_id: str
+) -> None:
+    if strategy_has_unresolved_execution(db, user_id, strategy_id):
+        raise HTTPException(
+            status_code=409,
+            detail="该策略仍有持仓、待对账信号或未结订单，暂不能修改或删除",
+        )
+
+
+def engine_connection_state(connection: dict[str, Any]) -> str:
+    """Return the connection state that actually gates automatic orders.
+
+    Only failures that can invalidate the account snapshot, tradability check,
+    execution price, or submit result block automatic orders. Other UI/research
+    requests remain visible in global health without contradicting the engine.
+    """
+    state = str(connection.get("state", "unknown"))
+    if state != "degraded":
+        return state
+    health = connection.get("health")
+    if not isinstance(health, dict) or "failed_operations" not in health:
+        return "degraded"
+    failures = health.get("failed_operations", [])
+    for failure in failures:
+        key = (str(failure.get("channel", "")), str(failure.get("operation", "")))
+        if key in ENGINE_CRITICAL_OPERATIONS:
+            return "degraded"
+    return "connected"
+
+
+def operational_engine_status(
+    desired_status: str, connection: dict[str, Any]
+) -> tuple[str, bool, str]:
+    if desired_status != "running":
+        return "paused", False, "交易引擎已暂停"
+    connection_state = engine_connection_state(connection)
+    if connection_state == "connected":
+        return "active", True, "交易链路正常"
+    if connection_state == "circuit_open":
+        return "circuit_open", False, "Alpaca 连接保护已开启，等待自动恢复"
+    return "degraded", False, "Alpaca 连接不稳定，暂缓策略评估与新订单"
+
+
+def collect_dashboard_snapshot(alpaca: AlpacaService) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "account": {},
+        "positions": [],
+        "orders": [],
+        "clock": {},
+    }
+    availability = {key: "unavailable" for key in values}
+    errors: dict[str, str] = {}
+    if not alpaca.configured:
+        return {**values, "availability": availability, "data_errors": errors}
+    operations = (
+        ("account", alpaca.get_account, "账户数据暂时不可用"),
+        ("positions", alpaca.get_positions, "暂时无法确认当前持仓"),
+        ("orders", lambda: alpaca.get_orders("open"), "暂时无法确认开放订单"),
+        ("clock", alpaca.get_clock, "市场开闭状态暂时不可用"),
+    )
+    for index, (key, operation, message) in enumerate(operations):
+        try:
+            values[key] = operation()
+            availability[key] = "fresh"
+        except Exception:
+            errors[key] = message
+            # All dashboard reads use the same Alpaca Trading channel. Once one
+            # read fails, continuing with the remaining calls can multiply a
+            # bounded retry window into a minute-long HTTP request. Preserve
+            # the fields that already succeeded and fail the rest closed.
+            for remaining_key, _remaining_operation, remaining_message in operations[
+                index + 1 :
+            ]:
+                errors.setdefault(remaining_key, remaining_message)
+            break
+    return {**values, "availability": availability, "data_errors": errors}
 
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.3.4"}
+    return {"status": "ok", "paper": True, "version": "1.4.0"}
 
 
 @router.get("/metadata")
@@ -105,8 +206,10 @@ def metadata() -> dict[str, Any]:
 
 
 @router.get("/connection")
-async def connection(alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
-    return await asyncio.to_thread(alpaca.connection_status)
+def connection(alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
+    # This endpoint is polled by the UI. It must only read the in-memory health
+    # snapshot and must never generate another Alpaca request by itself.
+    return alpaca.connection_status()
 
 
 @router.get("/connection/config", response_model=ConnectionConfigRead)
@@ -141,33 +244,37 @@ async def update_connection_config(
     except Exception as exc:
         raise HTTPException(status_code=500, detail="无法安全保存本机 Alpaca 配置") from exc
 
-    saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
-    if saved is None:
-        saved = ConnectionConfig(
-            user_id=user_id,
-            api_key_cipher=api_key_cipher,
-            api_secret_cipher=api_secret_cipher,
-            data_feed="iex",
-        )
-        db.add(saved)
-    else:
-        saved.api_key_cipher = api_key_cipher
-        saved.api_secret_cipher = api_secret_cipher
-        saved.data_feed = "iex"
-    db.commit()
-    db.refresh(saved)
-
-    # No orders are cancelled here: credentials may be changing accounts, and
-    # cancellation must never be sent with an account that the user did not choose.
-    await engine.pause("Alpaca 连接配置已更新，请检查后重新启动引擎", cancel_orders=False)
-    alpaca.configure(
-        api_key_id,
-        api_secret_key,
-        feed="iex",
-        source="web",
-        updated_at=saved.updated_at,
-    )
-    engine.reset_connection()
+    reason = "Alpaca 连接配置已更新，请检查后重新启动引擎"
+    try:
+        async with engine.connection_reconfiguration(reason):
+            saved = db.scalar(
+                select(ConnectionConfig).where(ConnectionConfig.user_id == user_id)
+            )
+            if saved is None:
+                saved = ConnectionConfig(
+                    user_id=user_id,
+                    api_key_cipher=api_key_cipher,
+                    api_secret_cipher=api_secret_cipher,
+                    data_feed="iex",
+                )
+                db.add(saved)
+            else:
+                saved.api_key_cipher = api_key_cipher
+                saved.api_secret_cipher = api_secret_cipher
+                saved.data_feed = "iex"
+            db.commit()
+            db.refresh(saved)
+            await asyncio.to_thread(
+                alpaca.configure,
+                api_key_id,
+                api_secret_key,
+                feed="iex",
+                source="web",
+                updated_at=saved.updated_at,
+            )
+            engine.reset_connection()
+    except ConnectionReconfigurationBlockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return alpaca.connection_config()
 
 
@@ -178,16 +285,22 @@ async def delete_connection_config(
     engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
-    saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
-    if saved is not None:
-        db.delete(saved)
-        db.commit()
-    await engine.pause("已移除网页 Alpaca 配置，请检查后重新启动引擎", cancel_orders=False)
-    if user_id == 1:
-        alpaca.configure_from_env()
-    else:
-        alpaca.clear_configuration()
-    engine.reset_connection()
+    reason = "已移除网页 Alpaca 配置，请检查后重新启动引擎"
+    try:
+        async with engine.connection_reconfiguration(reason):
+            saved = db.scalar(
+                select(ConnectionConfig).where(ConnectionConfig.user_id == user_id)
+            )
+            if saved is not None:
+                db.delete(saved)
+                db.commit()
+            if user_id == 1:
+                await asyncio.to_thread(alpaca.configure_from_env)
+            else:
+                await asyncio.to_thread(alpaca.clear_configuration)
+            engine.reset_connection()
+    except ConnectionReconfigurationBlockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return alpaca.connection_config()
 
 
@@ -282,6 +395,19 @@ def update_watchlist(
     db: Session = Depends(get_db),
     user_id: int = Depends(current_user_id),
 ) -> list[str]:
+    enabled = db.scalars(
+        select(Strategy).where(
+            Strategy.enabled.is_(True), Strategy.owner_user_id == user_id
+        )
+    ).all()
+    subscribed_symbols = set(payload.symbols)
+    for strategy in enabled:
+        subscribed_symbols.update(strategy.definition.get("symbols", []))
+    if len(subscribed_symbols) > 30:
+        raise HTTPException(
+            status_code=409,
+            detail="自选股与已启用策略合计最多订阅30个股票代码",
+        )
     db.execute(delete(WatchlistItem).where(WatchlistItem.user_id == user_id))
     for symbol in payload.symbols:
         db.add(WatchlistItem(user_id=user_id, symbol=symbol))
@@ -360,7 +486,29 @@ def update_strategy(
         raise HTTPException(status_code=404, detail="策略不存在")
     if strategy.is_template:
         raise HTTPException(status_code=409, detail="模板不可直接修改，请先复制")
+    ensure_strategy_definition_is_mutable(db, user_id, strategy_id)
     definition = payload.definition.model_dump(mode="json")
+    if strategy.enabled:
+        subscribed_symbols = set(definition["symbols"])
+        subscribed_symbols.update(
+            db.scalars(
+                select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)
+            ).all()
+        )
+        other_enabled = db.scalars(
+            select(Strategy).where(
+                Strategy.enabled.is_(True),
+                Strategy.owner_user_id == user_id,
+                Strategy.id != strategy.id,
+            )
+        ).all()
+        for item in other_enabled:
+            subscribed_symbols.update(item.definition.get("symbols", []))
+        if len(subscribed_symbols) > 30:
+            raise HTTPException(
+                status_code=409,
+                detail="自选股与已启用策略合计最多订阅30个股票代码",
+            )
     strategy.version += 1
     strategy.name = payload.definition.name
     strategy.description = payload.definition.description
@@ -418,6 +566,7 @@ def delete_strategy(
         raise HTTPException(status_code=404, detail="策略不存在")
     if strategy.is_template:
         raise HTTPException(status_code=409, detail="内置模板不能删除")
+    ensure_strategy_definition_is_mutable(db, user_id, strategy_id)
     db.delete(strategy)
     db.commit()
 
@@ -447,8 +596,16 @@ def enable_strategy(
     symbols = set(strategy.definition["symbols"])
     for item in enabled:
         symbols.update(item.definition.get("symbols", []))
+    symbols.update(
+        db.scalars(
+            select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)
+        ).all()
+    )
     if len(symbols) > 30:
-        raise HTTPException(status_code=409, detail="免费 IEX 实时订阅最多支持30个股票代码")
+        raise HTTPException(
+            status_code=409,
+            detail="自选股与已启用策略合计最多订阅30个股票代码",
+        )
     strategy.enabled = True
     db.commit()
     db.refresh(strategy)
@@ -456,19 +613,26 @@ def enable_strategy(
 
 
 @router.post("/strategies/{strategy_id}/disable", response_model=StrategyRead)
-def disable_strategy(
+async def disable_strategy(
     strategy_id: str,
     db: Session = Depends(get_db),
+    engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> Strategy:
-    strategy = db.scalar(
-        select(Strategy).where(Strategy.id == strategy_id, Strategy.owner_user_id == user_id)
-    )
-    if strategy is None:
+    try:
+        await engine.disable_strategy(strategy_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="策略不存在")
-    strategy.enabled = False
-    db.commit()
-    db.refresh(strategy)
+    except StrategyExecutionActiveError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.expire_all()
+    strategy = db.scalar(
+        select(Strategy).where(
+            Strategy.id == strategy_id, Strategy.owner_user_id == user_id
+        )
+    )
+    if strategy is None:  # pragma: no cover - protected by the engine gate
+        raise HTTPException(status_code=404, detail="策略不存在")
     return strategy
 
 
@@ -513,7 +677,29 @@ def restore_strategy(
         raise HTTPException(status_code=404, detail="策略版本不存在")
     if strategy.is_template:
         raise HTTPException(status_code=409, detail="模板不能恢复版本")
+    ensure_strategy_definition_is_mutable(db, user_id, strategy_id)
     definition = RuleDefinition.model_validate(saved.definition).model_dump(mode="json")
+    if strategy.enabled:
+        subscribed_symbols = set(definition["symbols"])
+        subscribed_symbols.update(
+            db.scalars(
+                select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)
+            ).all()
+        )
+        other_enabled = db.scalars(
+            select(Strategy).where(
+                Strategy.enabled.is_(True),
+                Strategy.owner_user_id == user_id,
+                Strategy.id != strategy.id,
+            )
+        ).all()
+        for item in other_enabled:
+            subscribed_symbols.update(item.definition.get("symbols", []))
+        if len(subscribed_symbols) > 30:
+            raise HTTPException(
+                status_code=409,
+                detail="自选股与已启用策略合计最多订阅30个股票代码",
+            )
     strategy.version += 1
     strategy.definition = definition
     strategy.name = definition["name"]
@@ -693,7 +879,9 @@ async def create_backtest(
 
 @router.get("/engine")
 def engine_status(
-    db: Session = Depends(get_db), user_id: int = Depends(current_user_id)
+    db: Session = Depends(get_db),
+    alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
     state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
     enabled_count = db.scalar(
@@ -701,12 +889,30 @@ def engine_status(
         .select_from(Strategy)
         .where(Strategy.enabled.is_(True), Strategy.owner_user_id == user_id)
     )
+    active_incidents = db.scalars(
+        select(ExecutionIncident.symbol).where(
+            ExecutionIncident.user_id == user_id,
+            ExecutionIncident.status == "active",
+        )
+    ).all()
+    connection = alpaca.connection_status()
+    operational_status, accepting_new_orders, operational_reason = operational_engine_status(
+        state.status, connection
+    )
     return {
         "status": state.status,
         "reason": state.reason,
         "last_heartbeat": state.last_heartbeat,
         "enabled_strategies": enabled_count,
         "paper": True,
+        "operational_status": operational_status,
+        "operational_reason": operational_reason,
+        "accepting_new_orders": accepting_new_orders,
+        "connection_state": engine_connection_state(connection),
+        "last_alpaca_success_at": connection.get("last_success_at"),
+        "next_retry_at": connection.get("retry_at"),
+        "consecutive_failures": connection.get("consecutive_failures", 0),
+        "active_incidents": list(active_incidents),
     }
 
 
@@ -715,6 +921,8 @@ async def resume_engine(payload: EngineAction, engine: TradingEngine = Depends(g
     try:
         await engine.resume(payload.reason)
         return {"status": "running"}
+    except ExecutionQuarantineError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise service_error(exc) from exc
 
@@ -726,9 +934,9 @@ async def pause_engine(payload: EngineAction, engine: TradingEngine = Depends(ge
 
 
 @router.post("/engine/cancel-orders")
-async def cancel_orders(alpaca: AlpacaService = Depends(get_alpaca)) -> Any:
+async def cancel_orders(engine: TradingEngine = Depends(get_engine)) -> Any:
     try:
-        return await asyncio.to_thread(alpaca.cancel_all_orders)
+        return await engine.cancel_all_orders()
     except Exception as exc:
         raise service_error(exc) from exc
 
@@ -752,16 +960,17 @@ def get_risk_settings(
 
 
 @router.put("/risk-settings", response_model=RiskSettingsRead)
-def update_risk_settings(
+async def update_risk_settings(
     payload: RiskSettingsUpdate,
     db: Session = Depends(get_db),
+    engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> RiskSettings:
+    await engine.update_risk_settings(payload.model_dump())
+    db.expire_all()
     settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
-    for key, value in payload.model_dump().items():
-        setattr(settings, key, value)
-    db.commit()
-    db.refresh(settings)
+    if settings is None:  # pragma: no cover - runtime bootstrap guarantees it
+        raise HTTPException(status_code=404, detail="风险设置不存在")
     return settings
 
 
@@ -824,22 +1033,12 @@ async def dashboard(
     alpaca: AlpacaService = Depends(get_alpaca),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
-    connection_status = await asyncio.to_thread(alpaca.connection_status)
-    account_data: dict[str, Any] = {}
-    positions_data: list[dict[str, Any]] = []
-    orders_data: list[dict[str, Any]] = []
-    clock_data: dict[str, Any] = {}
-    if connection_status["connected"]:
-        try:
-            account_data, positions_data, orders_data, clock_data = await asyncio.gather(
-                asyncio.to_thread(alpaca.get_account),
-                asyncio.to_thread(alpaca.get_positions),
-                asyncio.to_thread(alpaca.get_orders, "open"),
-                asyncio.to_thread(alpaca.get_clock),
-            )
-        except Exception:
-            pass
+    snapshot = await asyncio.to_thread(collect_dashboard_snapshot, alpaca)
+    connection_status = alpaca.connection_status()
     state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
+    operational_status, accepting_new_orders, operational_reason = operational_engine_status(
+        state.status, connection_status
+    )
     recent_events = db.scalars(
         select(EventLog)
         .where(EventLog.user_id == user_id)
@@ -854,14 +1053,20 @@ async def dashboard(
     ).all()
     return {
         "connection": connection_status,
-        "account": account_data,
-        "positions": positions_data,
-        "orders": orders_data,
-        "clock": clock_data,
+        "account": snapshot["account"],
+        "positions": snapshot["positions"],
+        "orders": snapshot["orders"],
+        "clock": snapshot["clock"],
+        "availability": snapshot["availability"],
+        "data_errors": snapshot["data_errors"],
+        "snapshot_at": datetime.now(timezone.utc),
         "engine": {
             "status": state.status,
             "reason": state.reason,
             "last_heartbeat": state.last_heartbeat,
+            "operational_status": operational_status,
+            "operational_reason": operational_reason,
+            "accepting_new_orders": accepting_new_orders,
         },
         "events": [
             {

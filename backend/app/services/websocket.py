@@ -6,6 +6,9 @@ from typing import Any
 from fastapi import WebSocket
 
 
+WEBSOCKET_SEND_TIMEOUT_SECONDS = 1.0
+
+
 class WebSocketManager:
     def __init__(self) -> None:
         self.connections: dict[WebSocket, int] = {}
@@ -29,11 +32,24 @@ class WebSocketManager:
                 for websocket, connection_user_id in self.connections.items()
                 if connection_user_id == user_id
             ]
-        for websocket in connections:
+        async def send(websocket: WebSocket) -> WebSocket | None:
             try:
-                await websocket.send_json(payload)
+                await asyncio.wait_for(
+                    websocket.send_json(payload),
+                    timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                )
             except Exception:
-                stale.append(websocket)
+                return websocket
+            return None
+
+        if connections:
+            stale = [
+                websocket
+                for websocket in await asyncio.gather(
+                    *(send(websocket) for websocket in connections)
+                )
+                if websocket is not None
+            ]
         if stale:
             async with self._lock:
                 for websocket in stale:

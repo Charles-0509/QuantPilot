@@ -82,13 +82,52 @@ export type BacktestRun = {
 
 export type BacktestSummary = Omit<BacktestRun, 'equity_curve' | 'benchmark_curve' | 'trades'>
 
+export type ConnectionState = 'unconfigured' | 'connected' | 'degraded' | 'circuit_open' | 'unknown'
+
+export type ConnectionStatus = {
+  configured: boolean
+  connected: boolean
+  state?: ConnectionState
+  paper: boolean
+  feed: string
+  source?: 'web' | 'env' | 'none'
+  message: string
+  consecutive_failures?: number
+  last_success_at?: string | null
+  last_failure_at?: string | null
+  retry_at?: string | null
+  last_error_category?: string | null
+}
+
+export type EngineOperationalStatus = 'active' | 'degraded' | 'circuit_open' | 'paused'
+
+export type EngineStatus = {
+  status: string
+  operational_status?: EngineOperationalStatus
+  operational_reason?: string
+  accepting_new_orders?: boolean
+  reason: string
+  last_heartbeat: string | null
+  enabled_strategies?: number
+  paper?: boolean
+  connection_state?: ConnectionState
+  last_alpaca_success_at?: string | null
+  next_retry_at?: string | null
+  active_incidents?: string[]
+}
+
+export type DataAvailability = 'fresh' | 'stale' | 'unavailable' | boolean
+
 export type DashboardData = {
-  connection: { configured: boolean; connected: boolean; paper: boolean; feed: string; message: string }
-  account: Record<string, string | number | boolean>
-  positions: Array<Record<string, string | number>>
-  orders: Array<Record<string, string | number>>
-  clock: Record<string, string | boolean>
-  engine: { status: string; reason: string; last_heartbeat: string | null }
+  connection: ConnectionStatus
+  account: Record<string, string | number | boolean> | null
+  positions: Array<Record<string, string | number>> | null
+  orders: Array<Record<string, string | number>> | null
+  clock: Record<string, string | boolean> | null
+  availability?: Partial<Record<'account' | 'positions' | 'orders' | 'clock', DataAvailability>>
+  data_errors?: Partial<Record<'account' | 'positions' | 'orders' | 'clock', string>>
+  snapshot_at?: string
+  engine: EngineStatus
   events: Array<{ level: string; category: string; message: string; created_at: string }>
   signals: Array<{ symbol: string; action: string; price: number; reason: string; status: string; created_at: string }>
 }

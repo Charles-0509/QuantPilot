@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Activity, CircleDollarSign, Landmark, Power, Radio, WalletCards } from 'lucide-react'
 import { api, formatTime, money, number } from '../api'
+import { connectionPresentation, dataAvailable, dataStale, enginePresentation } from '../status'
 import type { DashboardData } from '../types'
 import { Badge, Card, Empty, ErrorPanel, Loading, PageHeader, StatCard } from '../components/UI'
 
@@ -14,9 +15,27 @@ export default function Dashboard() {
   if (query.error) return <ErrorPanel message={(query.error as Error).message} />
   const data = query.data!
   const account = data.account || {}
-  const equity = Number(account.equity || 0)
-  const lastEquity = Number(account.last_equity || equity || 0)
-  const dayChange = lastEquity ? (equity / lastEquity - 1) * 100 : 0
+  const positions = data.positions || []
+  const orders = data.orders || []
+  const clock = data.clock || {}
+  const connectionView = connectionPresentation(data.connection)
+  const engineView = enginePresentation(data.engine)
+  const accountAvailable = dataAvailable(data.availability?.account, Boolean(data.account && ('equity' in account || 'buying_power' in account)))
+  const positionsAvailable = dataAvailable(data.availability?.positions, Boolean(data.positions && (data.connection.connected || positions.length > 0)))
+  const ordersAvailable = dataAvailable(data.availability?.orders, Boolean(data.orders && (data.connection.connected || orders.length > 0)))
+  const clockAvailable = dataAvailable(data.availability?.clock, Boolean(data.clock && 'is_open' in clock))
+  const equity = accountAvailable && account.equity !== undefined ? Number(account.equity) : null
+  const lastEquity = accountAvailable && account.last_equity !== undefined ? Number(account.last_equity) : equity
+  const dayChange = equity !== null && lastEquity ? (equity / lastEquity - 1) * 100 : undefined
+  const marketOpen = clockAvailable && Boolean(clock.is_open)
+  const connectionDetail = connectionView.state === 'unconfigured'
+    ? '应用和策略模板已经可以浏览；配置模拟盘密钥后即可获取行情、回测并自动交易。'
+    : data.connection.retry_at
+      ? `系统会自动恢复连接，下次重试：${formatTime(data.connection.retry_at)}。`
+      : '系统会在后台自动重试，恢复后无需重新启动交易引擎。'
+  const engineReason = engineView.operationalStatus === 'paused'
+    ? data.engine.reason
+    : data.engine.operational_reason || data.engine.reason
 
   return (
     <>
@@ -24,18 +43,18 @@ export default function Dashboard() {
         eyebrow="MISSION CONTROL / PAPER ENVIRONMENT"
         title="量化交易控制台"
         description="集中查看 Alpaca 模拟账户、策略引擎、持仓、信号与系统健康状态。所有订单均被永久锁定在 Paper Trading。"
-        actions={<Badge tone={data.clock?.is_open ? 'success' : 'neutral'}>{data.clock?.is_open ? '美股交易中' : '美股已休市'}</Badge>}
+        actions={<Badge tone={marketOpen ? 'success' : 'neutral'}>{clockAvailable ? (marketOpen ? '美股交易中' : '美股已休市') : '市场状态未知'}</Badge>}
       />
-      {!data.connection.connected && (
-        <div className="warning-callout" style={{ marginBottom: 16 }}>
-          {data.connection.message}。应用和策略模板已经可以浏览；配置模拟盘密钥后即可获取行情、回测并自动交易。
+      {connectionView.state !== 'connected' && (
+        <div className={connectionView.tone === 'danger' ? 'danger-callout' : 'warning-callout'} style={{ marginBottom: 16 }}>
+          <strong>{connectionView.label}</strong>：{data.connection.message || '暂时无法确认 Alpaca 连接状态'}。{connectionDetail}
         </div>
       )}
       <div className="stat-grid">
-        <StatCard label="账户净值" value={money(account.equity)} trend={dayChange} detail="相对上一交易日" icon={<Landmark size={18} />} />
-        <StatCard label="可用购买力" value={money(account.buying_power)} detail="Alpaca Paper" icon={<CircleDollarSign size={18} />} />
-        <StatCard label="当前持仓" value={`${data.positions.length} 只`} detail={`未成交订单 ${data.orders.length} 笔`} icon={<WalletCards size={18} />} />
-        <StatCard label="交易引擎" value={data.engine.status === 'running' ? '运行中' : '已暂停'} detail={data.engine.reason || '等待操作'} icon={<Power size={18} />} />
+        <StatCard label="账户净值" value={equity === null ? '—' : money(equity)} trend={dayChange} detail={accountAvailable ? (dataStale(data.availability?.account) ? '缓存数据，等待刷新' : '相对上一交易日') : '账户数据暂不可用'} icon={<Landmark size={18} />} />
+        <StatCard label="可用购买力" value={accountAvailable && account.buying_power !== undefined ? money(account.buying_power) : '—'} detail={accountAvailable ? 'Alpaca Paper' : '账户数据暂不可用'} icon={<CircleDollarSign size={18} />} />
+        <StatCard label="当前持仓" value={positionsAvailable ? `${positions.length} 只` : '—'} detail={ordersAvailable ? `未成交订单 ${orders.length} 笔` : data.data_errors?.orders || '开放订单状态未知'} icon={<WalletCards size={18} />} />
+        <StatCard label="交易引擎" value={engineView.label} detail={engineReason || '等待操作'} icon={<Power size={18} />} />
       </div>
       <div className="dashboard-grid">
         <div className="stack">
@@ -44,11 +63,11 @@ export default function Dashboard() {
               <div><h2>实时持仓矩阵</h2><p>模拟盘资产、成本、浮动盈亏和当前市值</p></div>
               <Radio size={17} color="#3df6de" />
             </div>
-            {data.positions.length ? (
+            {!positionsAvailable ? <Empty title="持仓数据暂不可用" detail={data.data_errors?.positions || '系统无法确认当前持仓，不会将连接错误显示为零持仓。'} /> : positions.length ? (
               <div className="table-scroll" style={{ paddingTop: 12 }}>
                 <table className="data-table">
                   <thead><tr><th>代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>未实现盈亏</th></tr></thead>
-                  <tbody>{data.positions.map((position) => {
+                  <tbody>{positions.map((position) => {
                     const pnl = Number(position.unrealized_pl || 0)
                     return <tr key={String(position.symbol)}>
                       <td className="symbol-cell">{position.symbol}</td>

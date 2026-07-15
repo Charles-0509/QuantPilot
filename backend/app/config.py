@@ -19,6 +19,20 @@ class Settings(BaseSettings):
     apca_api_key_id: str = ""
     apca_api_secret_key: str = ""
     alpaca_data_feed: str = "iex"
+    alpaca_connect_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+    alpaca_trading_read_timeout_seconds: float = Field(default=6.0, ge=2.0, le=60.0)
+    alpaca_data_read_timeout_seconds: float = Field(default=45.0, ge=5.0, le=300.0)
+    alpaca_retry_attempts: int = Field(default=3, ge=1, le=6)
+    alpaca_retry_base_seconds: float = Field(default=0.5, ge=0.0, le=10.0)
+    alpaca_retry_max_seconds: float = Field(default=4.0, ge=0.1, le=30.0)
+    alpaca_circuit_failure_threshold: int = Field(default=3, ge=1, le=20)
+    alpaca_circuit_recovery_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
+    alpaca_read_cache_seconds: float = Field(default=5.0, ge=0.0, le=30.0)
+    alpaca_asset_cache_seconds: float = Field(default=300.0, ge=5.0, le=3600.0)
+    alpaca_recent_bars_cache_seconds: float = Field(default=10.0, ge=0.0, le=60.0)
+    alpaca_daily_bars_cache_seconds: float = Field(default=900.0, ge=900.0, le=86400.0)
+    alpaca_stream_retry_base_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    alpaca_stream_retry_max_seconds: float = Field(default=300.0, ge=5.0, le=1800.0)
     investor_db_path: str = "data/investor.db"
     quantpilot_host: str = "0.0.0.0"
     quantpilot_port: int = 10000

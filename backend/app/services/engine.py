@@ -3536,8 +3536,6 @@ class TradingEngine:
                     self.alpaca.submit_exit_order,
                     sweep_symbol,
                     sell_qty,
-                    "market",
-                    "day",
                     client_order_id,
                 )
                 await self.log(
@@ -3579,12 +3577,12 @@ class TradingEngine:
                 client_order_id = f"qp-sweep-buy-{uuid.uuid4().hex[:16]}"
                 await asyncio.to_thread(
                     self.alpaca.submit_entry_order,
-                    sweep_symbol,
-                    buy_qty,
-                    None,
-                    "market",
-                    "day",
-                    client_order_id,
+                    symbol=sweep_symbol,
+                    qty=buy_qty,
+                    notional=None,
+                    order_type="market",
+                    time_in_force="day",
+                    client_order_id=client_order_id,
                 )
                 await self.log(
                     "info",

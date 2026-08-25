@@ -83,6 +83,7 @@ export default function Shell() {
     refetchInterval: 15000,
   })
   const me = useQuery({ queryKey: ['auth-me'], queryFn: () => api<AuthUser>('/api/auth/me') })
+  const health = useQuery({ queryKey: ['health'], queryFn: () => api<{ version?: string }>('/api/health') })
   const logout = useMutation({
     mutationFn: () => api<void>('/api/auth/logout', { method: 'POST' }),
     onSuccess: () => {
@@ -115,7 +116,7 @@ export default function Shell() {
         </nav>
         <div className="sidebar-footer">
           <div className="system-pulse"><span /> QuantPilot 服务在线</div>
-          <p>交易接口被永久锁定为模拟盘</p>
+          <p>Version {health.data?.version || '1.5.0'}</p>
         </div>
       </aside>
       <main className="main-panel">

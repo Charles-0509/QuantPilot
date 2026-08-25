@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import websockets
+
 import asyncio
 import copy
 import inspect

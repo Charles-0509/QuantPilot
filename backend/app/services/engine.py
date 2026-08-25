@@ -538,8 +538,18 @@ class TradingEngine:
             return max(0.0, position.qty if position else 0.0)
 
     @staticmethod
-    def _order_is_terminal(order: dict[str, Any]) -> bool:
-        return str(order.get("status") or "").lower() in TERMINAL_ORDER_STATUSES
+    def _order_status_str(order: dict[str, Any]) -> str:
+        raw = order.get("status")
+        if hasattr(raw, "value"):
+            raw = raw.value
+        val = str(raw or "").lower()
+        if "." in val:
+            val = val.split(".")[-1]
+        return val
+
+    @classmethod
+    def _order_is_terminal(cls, order: dict[str, Any]) -> bool:
+        return cls._order_status_str(order) in TERMINAL_ORDER_STATUSES
 
     @staticmethod
     def _position_qty(positions: list[dict[str, Any]], symbol: str) -> float:

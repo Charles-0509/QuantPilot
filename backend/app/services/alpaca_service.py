@@ -174,6 +174,8 @@ class _CircuitBreaker:
 def serialize_model(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if hasattr(value, "value") and isinstance(value.value, (str, int, float, bool)):
+        return value.value
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, (list, tuple)):

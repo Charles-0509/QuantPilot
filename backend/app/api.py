@@ -179,7 +179,7 @@ def collect_dashboard_snapshot(alpaca: AlpacaService) -> dict[str, Any]:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.4.0"}
+    return {"status": "ok", "paper": True, "version": "1.4.1"}
 
 
 @router.get("/metadata")

@@ -3555,15 +3555,18 @@ class TradingEngine:
             return
         sweep_symbol = (risk_settings.cash_sweep_symbol or "SGOV").upper()
         try:
+            clock = await asyncio.to_thread(self.alpaca.get_clock)
+            if not bool(clock.get("is_open")):
+                return
             account = await asyncio.to_thread(self.alpaca.get_account)
             cash = as_float(account.get("cash") or account.get("buying_power"))
             # Keep at least  buffer or min trade threshold
             if cash < 150.0:
                 return
             open_orders = await self._fresh_open_orders()
-            # Do not buy SGOV if there are active buy orders
+            # Do not submit SGOV buy order if there are active buy orders
             has_pending_buys = any(
-                str(o.get("side", "")).lower() == "buy" and not self._order_is_terminal(o)
+                self._order_side(o) == "buy" and not self._order_is_terminal(o)
                 for o in open_orders
             )
             if has_pending_buys:
@@ -3571,7 +3574,7 @@ class TradingEngine:
             quotes = await asyncio.to_thread(self.alpaca.get_latest_quotes, [sweep_symbol])
             quote = quotes.get(sweep_symbol) or {}
             ask_price = as_float(quote.get("ask_price") or quote.get("price")) or 100.0
-            invest_cash = cash - 50.0 # leave  cash buffer
+            invest_cash = cash - 50.0 # leave  buffer
             buy_qty = int(invest_cash // max(ask_price, 0.01))
             if buy_qty >= 1:
                 client_order_id = f"qp-sweep-buy-{uuid.uuid4().hex[:16]}"

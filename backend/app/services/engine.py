@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
+import uuid
 import logging
 import time
 from collections import defaultdict
@@ -156,6 +158,9 @@ class TradingEngine:
             "max_daily_loss_pct": settings.max_daily_loss_pct,
             "max_intraday_drawdown_pct": settings.max_intraday_drawdown_pct,
             "stale_data_seconds": settings.stale_data_seconds,
+            "cash_sweep_enabled": bool(getattr(settings, "cash_sweep_enabled", False)),
+            "cash_sweep_symbol": str(getattr(settings, "cash_sweep_symbol", "SGOV")),
+            "cash_sweep_buffer_pct": float(getattr(settings, "cash_sweep_buffer_pct", 2.0)),
         }
 
     async def start(self) -> None:
@@ -217,6 +222,10 @@ class TradingEngine:
                     ):
                         await self.reconcile_orders()
                         self._last_reconcile = datetime.now(timezone.utc)
+                        with SessionLocal() as db:
+                            current_risk = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
+                        if running and current_risk and getattr(current_risk, "cash_sweep_enabled", False):
+                            await self._execute_cash_sweep_investment(current_risk)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - safety boundary
@@ -2828,6 +2837,12 @@ class TradingEngine:
                 ):
                     return False
                 if signal.action == "buy":
+                    if current_risk_settings and getattr(current_risk_settings, "cash_sweep_enabled", False):
+                        await self._execute_cash_sweep_liquidation_if_needed(
+                            current_risk_settings,
+                            signal.symbol,
+                            as_float(payload.get("qty")) * as_float(signal.price),
+                        )
                     order = await asyncio.to_thread(
                         self.alpaca.submit_entry_order,
                         symbol=signal.symbol,
@@ -3488,3 +3503,94 @@ class TradingEngine:
             },
         )
         return True
+
+    async def _execute_cash_sweep_liquidation_if_needed(
+        self,
+        risk_settings: RiskSettings,
+        target_symbol: str,
+        estimated_cost: float,
+    ) -> None:
+        sweep_symbol = (risk_settings.cash_sweep_symbol or "SGOV").upper()
+        if target_symbol.upper() == sweep_symbol or estimated_cost <= 0:
+            return
+        try:
+            positions = await self._fresh_positions()
+            sweep_qty = self._position_qty(positions, sweep_symbol)
+            if sweep_qty <= 0:
+                return
+            sweep_pos = next(
+                (p for p in positions if str(p.get("symbol", "")).upper() == sweep_symbol),
+                None,
+            )
+            sweep_price = as_float((sweep_pos or {}).get("current_price")) or 100.0
+            buffer_pct = getattr(risk_settings, "cash_sweep_buffer_pct", 2.0)
+            required_dollar = estimated_cost * (1.0 + max(0.0, buffer_pct) / 100.0)
+            needed_qty = int(math.ceil(required_dollar / max(sweep_price, 0.01)))
+            sell_qty = min(sweep_qty, float(needed_qty))
+            if sell_qty > 0:
+                client_order_id = f"qp-sweep-sell-{uuid.uuid4().hex[:16]}"
+                await self._verify_long_only_sell_capacity(
+                    sweep_symbol, sell_qty, client_order_id
+                )
+                await asyncio.to_thread(
+                    self.alpaca.submit_exit_order,
+                    sweep_symbol,
+                    sell_qty,
+                    "market",
+                    "day",
+                    client_order_id,
+                )
+                await self.log(
+                    "info",
+                    "order",
+                    f"[现金管理] 买入 {target_symbol} 自动市价卖出 {sell_qty} 股 {sweep_symbol} 释放资金",
+                    {"target_symbol": target_symbol, "sweep_symbol": sweep_symbol, "qty": sell_qty},
+                )
+        except Exception as exc:
+            await self.log("warning", "risk", f"[现金管理] 自动赎回 {sweep_symbol} 失败: {exc}")
+
+    async def _execute_cash_sweep_investment(
+        self,
+        risk_settings: RiskSettings,
+    ) -> None:
+        if not getattr(risk_settings, "cash_sweep_enabled", False):
+            return
+        sweep_symbol = (risk_settings.cash_sweep_symbol or "SGOV").upper()
+        try:
+            account = await asyncio.to_thread(self.alpaca.get_account)
+            cash = as_float(account.get("cash") or account.get("buying_power"))
+            # Keep at least  buffer or min trade threshold
+            if cash < 150.0:
+                return
+            open_orders = await self._fresh_open_orders()
+            # Do not buy SGOV if there are active buy orders
+            has_pending_buys = any(
+                str(o.get("side", "")).lower() == "buy" and not self._order_is_terminal(o)
+                for o in open_orders
+            )
+            if has_pending_buys:
+                return
+            quotes = await asyncio.to_thread(self.alpaca.get_latest_quotes, [sweep_symbol])
+            quote = quotes.get(sweep_symbol) or {}
+            ask_price = as_float(quote.get("ask_price") or quote.get("price")) or 100.0
+            invest_cash = cash - 50.0 # leave  cash buffer
+            buy_qty = int(invest_cash // max(ask_price, 0.01))
+            if buy_qty >= 1:
+                client_order_id = f"qp-sweep-buy-{uuid.uuid4().hex[:16]}"
+                await asyncio.to_thread(
+                    self.alpaca.submit_entry_order,
+                    sweep_symbol,
+                    buy_qty,
+                    None,
+                    "market",
+                    "day",
+                    client_order_id,
+                )
+                await self.log(
+                    "info",
+                    "order",
+                    f"[现金管理] 闲置资金自动买入 {buy_qty} 股 {sweep_symbol}",
+                    {"sweep_symbol": sweep_symbol, "qty": buy_qty, "cash": cash},
+                )
+        except Exception as exc:
+            await self.log("warning", "risk", f"[现金管理] 自动买入 {sweep_symbol} 失败: {exc}")

@@ -205,6 +205,9 @@ class RiskSettings(Base):
     max_daily_loss_pct: Mapped[float] = mapped_column(Float, default=3.0)
     max_intraday_drawdown_pct: Mapped[float] = mapped_column(Float, default=5.0)
     stale_data_seconds: Mapped[int] = mapped_column(Integer, default=900)
+    cash_sweep_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    cash_sweep_symbol: Mapped[str] = mapped_column(String(16), default="SGOV")
+    cash_sweep_buffer_pct: Mapped[float] = mapped_column(Float, default=2.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

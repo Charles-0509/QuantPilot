@@ -172,7 +172,7 @@ class CountingAlpaca:
             self.bars_failures -= 1
             raise ConnectionError("simulated data connection reset")
         index = pd.date_range(
-            end=datetime.now(timezone.utc), periods=max(40, bars), freq="15min"
+            end=datetime(2026, 7, 15, 14, 45, tzinfo=timezone.utc), periods=max(40, bars), freq="15min"
         )
         frame = pd.DataFrame(
             {

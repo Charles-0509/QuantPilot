@@ -76,7 +76,7 @@ ALPACA_DATA_FEED=iex
 
 Docker 默认将 `10000` 端口发布到 `0.0.0.0`，可通过 `HTTP + IP` 直接访问，也可由 Nginx/Caddy 提供 `HTTPS + 域名/IP`。默认 `QUANTPILOT_COOKIE_SECURE=false` 兼容两种入口；公网 HTTP 会明文传输密码和会话，不应在不可信网络使用。仅允许 HTTPS 访问时可设置 `QUANTPILOT_COOKIE_SECURE=true`。网页只会在该用户没有策略归属持仓、未结 QuantPilot 订单、待对账订单意图和活动执行隔离时允许更换 Alpaca 凭据；更新成功后引擎进入安全暂停状态，需在“自动交易”页面确认后重新启动。管理员网页配置优先于 `.env`；普通用户没有共享的 `.env` 后备凭据。
 
-也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.4.0` 或 `ghcr.io/charles-0509/quantpilot:latest`。
+也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.4.1` 或 `ghcr.io/charles-0509/quantpilot:latest`。
 
 已有部署在线升级（Alembic 会自动保留数据并把原有记录归到管理员）：
 
@@ -85,7 +85,7 @@ quan update
 quan upgrade
 ```
 
-`quan upgrade` 会拉取最新稳定镜像、等待 `/api/health` 验证成功、更新 `quan` 命令并清理旧的 QuantPilot 镜像；不会删除数据库、用户配置、策略或交易记录。升级到 1.4.0 时 Alembic 自动迁移到 `0006_execution_incidents`。Alpaca 短时 TLS 断流、连接超时、HTTP 429 与 5xx 会自动重试，连续失败时进入断路保护并在冷却后自动恢复。
+`quan upgrade` 会拉取最新稳定镜像、等待 `/api/health` 验证成功、更新 `quan` 命令并清理旧的 QuantPilot 镜像；不会删除数据库、用户配置、策略或交易记录。升级到 1.4.1 时 Alembic 自动迁移到 `0006_execution_incidents`。Alpaca 短时 TLS 断流、连接超时、HTTP 429 与 5xx 会自动重试，连续失败时进入断路保护并在冷却后自动恢复。
 
 ## Alpaca 连接状态
 

@@ -140,6 +140,9 @@ export type RiskSettings = {
   max_daily_loss_pct: number
   max_intraday_drawdown_pct: number
   stale_data_seconds: number
+  cash_sweep_enabled: boolean
+  cash_sweep_symbol: string
+  cash_sweep_buffer_pct: number
 }
 
 export type ConnectionConfig = {

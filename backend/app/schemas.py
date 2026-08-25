@@ -244,6 +244,9 @@ class RiskSettingsUpdate(BaseModel):
     max_daily_loss_pct: float = Field(gt=0, le=100)
     max_intraday_drawdown_pct: float = Field(gt=0, le=100)
     stale_data_seconds: int = Field(ge=60, le=86400)
+    cash_sweep_enabled: bool = Field(default=False)
+    cash_sweep_symbol: str = Field(default="SGOV", max_length=16)
+    cash_sweep_buffer_pct: float = Field(default=2.0, ge=0.0, le=20.0)
 
 
 class RiskSettingsRead(RiskSettingsUpdate):

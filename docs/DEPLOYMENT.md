@@ -45,7 +45,7 @@ QUANTPILOT_SESSION_HOURS=12
 
 ## Alpaca 连接可靠性参数
 
-1.4.1 起，Alpaca 交易接口与行情接口使用独立的锁、超时和断路器。可安全重试的读取请求在 TLS 断流、连接超时、HTTP 429 或 5xx 时进行最多3次指数退避重试；普通4xx不会重试。连续失败达到阈值后只暂停故障通道，冷却期结束后自动进行半开探测，成功即恢复。订单提交不会直接重复 POST，而是通过确定性的 `client_order_id` 查询并恢复可能已经被 Alpaca 接受的订单。
+1.5.0 起，Alpaca 交易接口与行情接口使用独立的锁、超时和断路器。可安全重试的读取请求在 TLS 断流、连接超时、HTTP 429 或 5xx 时进行最多3次指数退避重试；普通4xx不会重试。连续失败达到阈值后只暂停故障通道，冷却期结束后自动进行半开探测，成功即恢复。订单提交不会直接重复 POST，而是通过确定性的 `client_order_id` 查询并恢复可能已经被 Alpaca 接受的订单。
 
 以下变量均为可选项，示例值也是程序默认值：
 
@@ -91,7 +91,7 @@ Web UI 中的连接状态含义：
 
 ## 执行安全隔离与升级约束
 
-1.4.1 的数据库迁移头为 `0006_execution_incidents`。容器启动时会自动执行 Alembic 升级并新增持久化执行事件表，原有管理员、用户、凭据、策略、订单和回测记录不会被删除。
+1.5.0 的数据库迁移头为 `0006_execution_incidents`。容器启动时会自动执行 Alembic 升级并新增持久化执行事件表，原有管理员、用户、凭据、策略、订单和回测记录不会被删除。
 
 QuantPilot 会持续核对 Alpaca 实际持仓、开放卖单与本地策略持仓归属。出现下列任一情况时，系统会暂停该用户的引擎、阻止新订单、取消 QuantPilot 自有相关订单并进入执行安全隔离：
 
@@ -107,7 +107,7 @@ QuantPilot 会持续核对 Alpaca 实际持仓、开放卖单与本地策略持�
 公开镜像支持 AMD64 与 ARM64：
 
 ```bash
-docker pull ghcr.io/charles-0509/quantpilot:1.4.1
+docker pull ghcr.io/charles-0509/quantpilot:1.5.0
 ```
 
 使用仓库中的 `docker-compose.yml` 时，执行 `docker compose pull && docker compose up -d` 即可拉取并运行 `latest`。需要从源码构建时执行 `docker build -t quantpilot:local .`。

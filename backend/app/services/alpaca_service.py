@@ -189,6 +189,100 @@ def serialize_model(value: Any) -> Any:
     return str(value)
 
 
+
+def _patch_alpaca_streams() -> None:
+    if getattr(StockDataStream, "_quantpilot_patched", False):
+        return
+
+    orig_data_run_forever = StockDataStream._run_forever
+
+    async def safe_data_run_forever(self):
+        self._loop = asyncio.get_running_loop()
+        while not any(
+            v for k, v in self._handlers.items() if k not in ("cancelErrors", "corrections")
+        ):
+            if not self._stop_stream_queue.empty():
+                self._stop_stream_queue.get(timeout=1)
+                return
+            await asyncio.sleep(0.1)
+        self._should_run = True
+        self._running = False
+        consecutive_failures = 0
+        while self._should_run:
+            try:
+                if not self._running:
+                    await self._start_ws()
+                    await self._send_subscribe_msg()
+                    self._running = True
+                    consecutive_failures = 0
+                await self._consume()
+            except websockets.WebSocketException as wse:
+                await self.close()
+                self._running = False
+                consecutive_failures += 1
+                delay = min(60.0, 1.5 ** min(consecutive_failures, 8))
+                await asyncio.sleep(delay)
+            except ValueError as ve:
+                await self.close()
+                self._running = False
+                if "insufficient subscription" in str(ve).lower():
+                    return
+                consecutive_failures += 1
+                delay = min(60.0, 2.0 ** min(consecutive_failures, 6))
+                await asyncio.sleep(delay)
+            except Exception:
+                await self.close()
+                self._running = False
+                consecutive_failures += 1
+                delay = min(60.0, 2.0 ** min(consecutive_failures, 6))
+                await asyncio.sleep(delay)
+            finally:
+                await asyncio.sleep(0.05)
+
+    StockDataStream._run_forever = safe_data_run_forever
+    StockDataStream._quantpilot_patched = True
+
+    if getattr(TradingStream, "_quantpilot_patched", False):
+        return
+
+    async def safe_trading_run_forever(self):
+        self._loop = asyncio.get_running_loop()
+        while not self._trade_updates_handler:
+            if not self._stop_stream_queue.empty():
+                self._stop_stream_queue.get(timeout=1)
+                return
+            await asyncio.sleep(0.1)
+        self._should_run = True
+        self._running = False
+        consecutive_failures = 0
+        while self._should_run:
+            try:
+                if not self._running:
+                    await self._start_ws()
+                    self._running = True
+                    consecutive_failures = 0
+                await self._consume()
+            except websockets.WebSocketException:
+                await self.close()
+                self._running = False
+                consecutive_failures += 1
+                delay = min(60.0, 1.5 ** min(consecutive_failures, 8))
+                await asyncio.sleep(delay)
+            except Exception:
+                await self.close()
+                self._running = False
+                consecutive_failures += 1
+                delay = min(60.0, 2.0 ** min(consecutive_failures, 6))
+                await asyncio.sleep(delay)
+            finally:
+                await asyncio.sleep(0.05)
+
+    TradingStream._run_forever = safe_trading_run_forever
+    TradingStream._quantpilot_patched = True
+
+_patch_alpaca_streams()
+
+
 class AlpacaService:
     """Thin adapter that is permanently locked to Alpaca paper trading."""
 

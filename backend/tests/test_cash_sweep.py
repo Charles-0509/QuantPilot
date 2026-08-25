@@ -80,6 +80,9 @@ async def test_cash_sweep_investment_called_when_enabled(tmp_path, monkeypatch):
         configured = True
         submitted_entries = []
 
+        def get_clock(self):
+            return {"is_open": True}
+
         def get_account(self):
             return {"cash": "1000.0", "buying_power": "1000.0"}
 

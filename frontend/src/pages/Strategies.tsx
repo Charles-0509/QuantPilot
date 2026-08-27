@@ -33,7 +33,7 @@ function StrategyCard({ strategy, onAction }: { strategy: Strategy; onAction: (a
     <div className="strategy-card-top"><div className="strategy-orb">{strategy.is_template ? <Sparkles size={19} /> : <Settings2 size={19} />}</div>
       <Badge tone={strategy.is_template ? 'info' : strategy.enabled ? 'success' : 'neutral'}>{strategy.is_template ? '内置模板' : strategy.enabled ? '运行中' : '未启用'}</Badge></div>
     <h3>{strategy.name}</h3><p>{strategy.description}</p>
-    <div className="strategy-meta"><Badge>{strategy.definition.timeframe}</Badge><Badge>{strategy.definition.symbols.join(' · ')}</Badge><Badge>v{strategy.version}</Badge></div>
+    <div className="strategy-meta"><Badge>{strategy.definition.timeframe}</Badge><Badge>{strategy.definition.symbols.join(' · ')}</Badge></div>
     <div className="strategy-actions">
       {strategy.is_template ? <Button variant="secondary" onClick={() => onAction('clone')}><Copy size={14} />复制并编辑</Button> : <>
         <Link to={`/strategies/${strategy.id}`}><Button variant="ghost"><Settings2 size={14} />编辑</Button></Link>

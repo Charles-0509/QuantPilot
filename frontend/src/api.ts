@@ -8,6 +8,36 @@ export class ApiError extends Error {
   }
 }
 
+export function formatApiErrorDetail(payload: any, fallback: string): string {
+  if (!payload) return fallback
+  const detail = payload.detail ?? payload.message ?? payload.error
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object') {
+          const loc = Array.isArray(item.loc)
+            ? item.loc.filter((l: any) => l !== 'body').join('.')
+            : ''
+          const msg = item.msg || item.message || JSON.stringify(item)
+          return loc ? `${loc}: ${msg}` : msg
+        }
+        return String(item)
+      })
+      .filter(Boolean)
+    if (messages.length) return messages.join('；')
+  }
+  if (detail && typeof detail === 'object') {
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return fallback
+    }
+  }
+  return fallback
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method || 'GET').toUpperCase()
   const csrf = readCookie('quantpilot_csrf')
@@ -24,7 +54,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `请求失败 (${response.status})`
     try {
       const payload = await response.json()
-      message = payload.detail || message
+      message = formatApiErrorDetail(payload, message)
     } catch {
       // Keep the fallback message.
     }
@@ -48,7 +78,7 @@ export async function apiForm<T>(path: string, values: Record<string, string>): 
     let message = `请求失败 (${response.status})`
     try {
       const payload = await response.json()
-      message = payload.detail || message
+      message = formatApiErrorDetail(payload, message)
     } catch {
       // Keep the fallback message.
     }

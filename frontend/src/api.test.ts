@@ -35,3 +35,38 @@ describe('api client authentication transport', () => {
     expect(headers['X-CSRF-Token']).toBeUndefined()
   })
 })
+
+describe('api client error formatting', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('formats FastAPI validation error array with field location', async () => {
+    vi.spyOn(window, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: async () => ({
+        detail: [
+          { loc: ['body', 'definition', 'symbols'], msg: 'Field required', type: 'missing' },
+          { loc: ['body', 'definition', 'timeframe'], msg: 'Invalid timeframe', type: 'value_error' },
+        ],
+      }),
+    } as Response)
+
+    await expect(api('/api/strategies', { method: 'POST', body: '{}' })).rejects.toThrow(
+      'definition.symbols: Field required；definition.timeframe: Invalid timeframe'
+    )
+  })
+
+  it('formats string detail correctly', async () => {
+    vi.spyOn(window, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ detail: '该策略仍有持仓，暂不能修改' }),
+    } as Response)
+
+    await expect(api('/api/strategies/test', { method: 'PUT', body: '{}' })).rejects.toThrow(
+      '该策略仍有持仓，暂不能修改'
+    )
+  })
+})

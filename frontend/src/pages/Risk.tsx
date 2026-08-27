@@ -28,7 +28,7 @@ export default function Risk() {
           <div className="form-grid">
             <RiskField label="单只股票最大仓位 %" keyName="max_symbol_pct" form={form} setForm={setForm} />
             <RiskField label="总持仓最大暴露 %" keyName="max_total_exposure_pct" form={form} setForm={setForm} />
-            <RiskField label="最大同时持仓数" keyName="max_positions" form={form} setForm={setForm} />
+            <RiskField label="最大同时持仓只数" keyName="max_positions" form={form} setForm={setForm} />
             <RiskField label="单日最大亏损 %" keyName="max_daily_loss_pct" form={form} setForm={setForm} />
             <RiskField label="日内高点最大回撤 %" keyName="max_intraday_drawdown_pct" form={form} setForm={setForm} />
             <RiskField label="行情过期阈值（秒）" keyName="stale_data_seconds" form={form} setForm={setForm} />

@@ -41,20 +41,20 @@ describe('api client error formatting', () => {
     vi.restoreAllMocks()
   })
 
-  it('formats FastAPI validation error array with field location', async () => {
+  it('formats FastAPI validation error array with field location and translated message', async () => {
     vi.spyOn(window, 'fetch').mockResolvedValue({
       ok: false,
       status: 422,
       json: async () => ({
         detail: [
           { loc: ['body', 'definition', 'symbols'], msg: 'Field required', type: 'missing' },
-          { loc: ['body', 'definition', 'timeframe'], msg: 'Invalid timeframe', type: 'value_error' },
+          { loc: ['body', 'definition', 'risk', 'max_positions'], msg: 'Input should be less than or equal to 30', type: 'less_than_equal' },
         ],
       }),
     } as Response)
 
     await expect(api('/api/strategies', { method: 'POST', body: '{}' })).rejects.toThrow(
-      'definition.symbols: Field required；definition.timeframe: Invalid timeframe'
+      '股票池: 不能为空；最大持仓只数: 数值必须小于或等于 30'
     )
   })
 

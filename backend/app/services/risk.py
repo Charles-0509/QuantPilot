@@ -126,8 +126,22 @@ class RiskManager:
                 f"上限 ${symbol_limit_value:,.2f}）",
             )
 
-        total_exposure = sum(abs(as_float(position.get("market_value"))) for position in positions)
-        pending_total_exposure = sum(pending_by_symbol.values())
+        sweep_symbol = (
+            (getattr(settings, "cash_sweep_symbol", None) or "SGOV").upper()
+            if getattr(settings, "cash_sweep_enabled", False)
+            else None
+        )
+
+        total_exposure = sum(
+            abs(as_float(position.get("market_value")))
+            for position in positions
+            if sweep_symbol is None or str(position.get("symbol")).upper() != sweep_symbol
+        )
+        pending_total_exposure = sum(
+            value
+            for pending_symbol, value in pending_by_symbol.items()
+            if sweep_symbol is None or pending_symbol.upper() != sweep_symbol
+        )
         max_total_exposure_pct = settings.max_total_exposure_pct or 80.0
         if (
             total_exposure + pending_total_exposure + desired_notional
@@ -136,9 +150,15 @@ class RiskManager:
             return RiskDecision(False, f"总持仓将超过 {max_total_exposure_pct:.1f}%")
 
         max_positions = min(settings.max_positions or 8, strategy_max_positions)
-        projected_symbols = set(position_map).union(
-            pending_symbol for pending_symbol, value in pending_by_symbol.items() if value > 0
-        )
+        active_position_symbols = {
+            sym for sym in position_map
+            if sweep_symbol is None or sym.upper() != sweep_symbol
+        }
+        active_pending_symbols = {
+            pending_symbol for pending_symbol, value in pending_by_symbol.items()
+            if value > 0 and (sweep_symbol is None or pending_symbol.upper() != sweep_symbol)
+        }
+        projected_symbols = active_position_symbols.union(active_pending_symbols)
         if symbol not in projected_symbols and len(projected_symbols) >= max_positions:
             return RiskDecision(False, f"持仓数量已达到 {max_positions} 只")
         if desired_notional > buying_power:

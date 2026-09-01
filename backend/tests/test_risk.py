@@ -74,3 +74,35 @@ def test_open_buy_orders_are_included_in_projected_exposure() -> None:
     )
     assert decision.allowed is False
     assert "待成交 $2,000.00" in decision.reason
+
+def test_risk_excludes_cash_sweep_symbol_from_total_exposure_and_count() -> None:
+    settings = RiskSettings(
+        id=1,
+        max_symbol_pct=50,
+        max_total_exposure_pct=80,
+        max_positions=2,
+        cash_sweep_enabled=True,
+        cash_sweep_symbol="SGOV",
+    )
+    positions = [
+        {"symbol": "SGOV", "market_value": "95000", "qty": "950"},
+        {"symbol": "AAPL", "market_value": "10000", "qty": "50"},
+    ]
+    # SGOV should not count towards max_total_exposure or max_positions count.
+    # Total equity = 100k. AAPL = 10k. SPY desired = 15k. Total active exposure = 25k (25% < 80%).
+    # Active positions = AAPL (1) + SPY (1) = 2 <= 2.
+    decision = RiskManager().check_entry(
+        symbol="SPY",
+        desired_notional=15000,
+        account={"equity": "100000", "buying_power": "200000", "trading_blocked": False},
+        positions=positions,
+        asset={"tradable": True, "status": "active"},
+        clock={"is_open": True},
+        bar_timestamp=datetime.now(timezone.utc),
+        max_data_age_seconds=900,
+        settings=settings,
+        state=EngineState(id=1),
+        strategy_max_symbol_pct=50,
+        strategy_max_positions=5,
+    )
+    assert decision.allowed is True

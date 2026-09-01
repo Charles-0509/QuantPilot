@@ -48,7 +48,30 @@ export default function StrategyEditor() {
           <div className="form-section">
             <div className="form-section-title"><div><h3>策略身份与市场</h3><p>定义策略名称、股票池、时间周期和指标预热长度。</p></div><Badge tone="info">PAPER ONLY</Badge></div>
             <div className="form-grid"><Field label="策略名称"><input value={definition.name} disabled={readOnly} onChange={(e) => setDefinition({ ...definition, name: e.target.value })} /></Field>
-              <Field label="股票池" hint="英文逗号分隔，启用策略合计最多30个代码"><input value={symbolsText} disabled={readOnly} onChange={(e) => setSymbolsText(e.target.value.toUpperCase())} /></Field></div>
+              <Field label="股票池" hint="英文逗号分隔，启用策略合计最多30个代码">
+                <input value={symbolsText} disabled={readOnly} onChange={(e) => setSymbolsText(e.target.value.toUpperCase())} />
+                <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 11, color: '#657891', alignSelf: 'center' }}>常用组合:</span>
+                  {[
+                    { label: '标普ETF (SPY)', symbols: 'SPY' },
+                    { label: '纳指ETF (QQQ)', symbols: 'QQQ' },
+                    { label: '科技巨头 (AAPL,GOOGL,NVDA,MSFT)', symbols: 'AAPL, GOOGL, NVDA, MSFT' },
+                    { label: '三大指数 (SPY,QQQ,DIA)', symbols: 'SPY, QQQ, DIA' },
+                    { label: '高息红利 (SCHD,VYM)', symbols: 'SCHD, VYM' },
+                  ].map((preset) => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      disabled={readOnly}
+                      className="badge badge-neutral"
+                      style={{ cursor: 'pointer', fontSize: 11, padding: '2px 8px', border: 'none' }}
+                      onClick={() => setSymbolsText(preset.symbols)}
+                    >
+                      +{preset.label}
+                    </button>
+                  ))}
+                </div>
+              </Field></div>
             <Field label="策略说明"><textarea value={definition.description} disabled={readOnly} onChange={(e) => setDefinition({ ...definition, description: e.target.value })} /></Field>
             <div className="form-grid-3"><Field label="K线周期"><select value={definition.timeframe} disabled={readOnly} onChange={(e) => setDefinition({ ...definition, timeframe: e.target.value as RuleDefinition['timeframe'] })}><option value="5Min">5分钟</option><option value="15Min">15分钟</option><option value="30Min">30分钟</option><option value="1Hour">1小时</option><option value="1Day">日线</option></select></Field>
               <Field label="预热K线"><input type="number" value={definition.warmup_bars} disabled={readOnly} onChange={(e) => setDefinition({ ...definition, warmup_bars: Number(e.target.value) })} /></Field>

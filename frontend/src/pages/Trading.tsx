@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertOctagon, Bot, Pause, Play, RefreshCw, XCircle } from 'lucide-react'
+import { AlertOctagon, Bot, CheckCircle, Pause, Play, RefreshCw, ShieldAlert, XCircle } from 'lucide-react'
 import { api, formatTime, money } from '../api'
 import { enginePresentation } from '../status'
 import type { EngineStatus, Strategy } from '../types'
@@ -15,6 +15,11 @@ export default function Trading() {
     mutationFn: ({ path, reason }: { path: string; reason: string }) => api<any>(`/api/engine/${path}`, { method: 'POST', body: JSON.stringify({ reason }) }),
     onSuccess: () => { client.invalidateQueries({ queryKey: ['engine'] }); client.invalidateQueries({ queryKey: ['orders'] }) },
   })
+  const clearIncident = useMutation({
+    mutationFn: (symbol?: string) => api<any>('/api/engine/clear-incidents', { method: 'POST', body: JSON.stringify({ symbol }) }),
+    onSuccess: () => { client.invalidateQueries({ queryKey: ['engine'] }); client.invalidateQueries({ queryKey: ['orders'] }) },
+  })
+
   if (engine.isLoading) return <Loading label="正在读取交易引擎" />
   if (engine.error) return <ErrorPanel message={(engine.error as Error).message} />
   const running = engine.data?.status === 'running'
@@ -39,10 +44,17 @@ export default function Trading() {
     {running && !engineView.active && <div className={engineView.tone === 'danger' ? 'danger-callout' : 'warning-callout'} style={{ marginTop: 16 }}>
       当前策略仍保持启用，但系统不会把连接异常误报为正常执行。连接恢复后将自动继续评估，无需重复启动引擎。
     </div>}
-    {activeIncidents.length > 0 && <div className="danger-callout" style={{ marginTop: 16 }}>
-      <strong>执行安全隔离：</strong>{activeIncidents.join('、')} 检测到持仓或开放卖单不满足只做多约束。系统正在自动取消 QuantPilot 自有订单并用 REST 复核；确认安全前不能恢复引擎。
+    {activeIncidents.length > 0 && <div className="danger-callout" style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div>
+        <strong><ShieldAlert size={16} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 6 }} />执行安全隔离：</strong>
+        {activeIncidents.join('、')} 检测到持仓或开放卖单不满足只做多约束。
+      </div>
+      <Button variant="secondary" disabled={clearIncident.isPending} onClick={() => clearIncident.mutate(undefined)}>
+        <CheckCircle size={14} />确认安全并解除隔离
+      </Button>
     </div>}
     {action.error && <div style={{ marginTop: 16 }}><ErrorPanel message={(action.error as Error).message} /></div>}
+    {clearIncident.error && <div style={{ marginTop: 16 }}><ErrorPanel message={(clearIncident.error as Error).message} /></div>}
     <div className="two-column" style={{ marginTop: 16 }}>
       <Card><div className="card-header"><div><h2>已启用策略</h2><p>只有自定义策略可进入执行队列</p></div><Badge tone="info">{enabled.length}</Badge></div>
         {enabled.length ? <div className="card-pad stack">{enabled.map((strategy) => <div className="toggle-row" key={strategy.id}><div><strong>{strategy.name}</strong><p className="field-hint">{strategy.definition.symbols.join(' · ')} / {strategy.definition.timeframe}</p></div><Badge tone={engineView.strategyTone}>{engineView.strategyLabel}</Badge></div>)}</div> : <Empty title="没有启用策略" detail="请在策略库复制模板、完成回测并启用。" />}

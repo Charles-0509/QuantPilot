@@ -434,8 +434,10 @@ class TradingEngine:
                 record.raw = payload
                 self._apply_fill_delta(db, record, order)
                 db.commit()
+                is_sweep = bool(record.client_order_id and str(record.client_order_id).startswith("qp-sweep-"))
                 if (
                     record.strategy_id is None
+                    and not is_sweep
                     and record.side == "sell"
                     and record.filled_qty > previous_filled_qty
                 ):
@@ -3227,8 +3229,10 @@ class TradingEngine:
                         record.filled_avg_price = as_float(order.get("filled_avg_price")) or None
                         record.raw = order
                         self._apply_fill_delta(db, record, order)
+                        is_sweep = bool(record.client_order_id and str(record.client_order_id).startswith("qp-sweep-"))
                         if (
                             record.strategy_id is None
+                            and not is_sweep
                             and record.side == "sell"
                             and record.filled_qty > previous_filled_qty
                         ):
@@ -3371,6 +3375,29 @@ class TradingEngine:
                 "engine",
                 {"status": "paused", "reason": reason},
             )
+
+    async def clear_execution_incidents(self, symbol: str | None = None) -> list[str]:
+        """Manually resolve and clear active execution quarantines after verification."""
+        cleared: list[str] = []
+        async with self._order_submission_lock:
+            with SessionLocal() as db:
+                stmt = select(ExecutionIncident).where(
+                    ExecutionIncident.user_id == self.user_id,
+                    ExecutionIncident.status == "active",
+                )
+                if symbol:
+                    stmt = stmt.where(ExecutionIncident.symbol == symbol.upper())
+                incidents = db.scalars(stmt).all()
+                now = datetime.now(timezone.utc)
+                for inc in incidents:
+                    inc.status = "contained"
+                    inc.resolved_at = now
+                    inc.details = {**(inc.details or {}), "resolution": "manual_admin_override"}
+                    cleared.append(inc.symbol)
+                db.commit()
+        for sym in cleared:
+            await self.log("info", "risk", f"{sym} 执行安全隔离已由用户手动解除")
+        return cleared
 
     async def resume(self, reason: str = "用户开启") -> None:
         if not self.alpaca.configured:

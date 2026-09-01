@@ -916,6 +916,15 @@ def engine_status(
     }
 
 
+@router.post("/engine/clear-incidents")
+async def clear_engine_incidents(
+    payload: dict[str, Any] | None = None, engine: TradingEngine = Depends(get_engine)
+) -> dict[str, Any]:
+    symbol = (payload or {}).get("symbol")
+    cleared = await engine.clear_execution_incidents(symbol)
+    return {"status": "ok", "cleared": cleared}
+
+
 @router.post("/engine/resume")
 async def resume_engine(payload: EngineAction, engine: TradingEngine = Depends(get_engine)) -> dict[str, str]:
     try:

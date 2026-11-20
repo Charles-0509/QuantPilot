@@ -5,6 +5,8 @@ import { api, ApiError, formatTime } from '../api'
 import { Badge, Button, Card, Field, Loading, PageHeader } from '../components/UI'
 import { connectionPresentation, errorCategoryLabel } from '../status'
 import type { AuthUser, ConnectionConfig, ConnectionStatus } from '../types'
+import BrokerSettingsPanel from '../components/BrokerSettingsPanel'
+import AiSettingsPanel from '../components/AiSettingsPanel'
 
 export default function SettingsPage() {
   const client = useQueryClient()
@@ -53,7 +55,7 @@ export default function SettingsPage() {
   const saved = config.data
   const connectionView = connectionPresentation(status, Boolean(connection.error))
   const statusIconColor = connectionView.tone === 'success' ? '#42e6a4' : connectionView.tone === 'danger' ? '#ff647c' : '#f2bd5c'
-  const sourceLabel = saved?.source === 'web' ? '网页加密配置' : saved?.source === 'env' ? '.env 后备配置' : '尚未配置'
+  const sourceLabel = status?.broker === 'ibkr' ? 'IBKR 本机网关' : saved?.source === 'web' ? '网页加密配置' : saved?.source === 'env' ? '.env 后备配置' : '尚未配置'
   const submit = (event: FormEvent) => {
     event.preventDefault()
     setNotice('')
@@ -75,11 +77,13 @@ export default function SettingsPage() {
     <PageHeader
       eyebrow="SECURE SYSTEM CONFIG"
       title="设置"
-      description="直接在此验证并更新 Alpaca Paper 密钥。程序没有实盘开关，也不会将密钥返回到浏览器。"
+      description="选择Alpaca或IBKR。IBKR默认模拟盘，真实账户每次启用需要风险确认。密钥不会返回到浏览器。"
       actions={<Badge tone={connectionView.tone}>{connectionView.label}</Badge>}
     />
+    <BrokerSettingsPanel />
+    <AiSettingsPanel />
     <div className="two-column">
-      <Card>
+      {status?.broker !== 'ibkr' && <Card>
         <div className="card-header"><div><h2>Alpaca Paper 连接</h2><p>保存前会连接 Alpaca Paper 验证账户</p></div><ShieldCheck size={19} color="#3df6de" /></div>
         <form className="form-section" onSubmit={submit}>
           <Field label="API Key ID" hint="填入 Alpaca Paper Account 生成的 Key ID；保存后只显示末四位。">
@@ -91,7 +95,7 @@ export default function SettingsPage() {
               <button type="button" className="icon-button input-action" onClick={() => setShowSecret((value) => !value)} title={showSecret ? '隐藏 Secret' : '显示 Secret'} aria-label={showSecret ? '隐藏 Secret' : '显示 Secret'}>{showSecret ? <EyeOff size={16} /> : <Eye size={16} />}</button>
             </div>
           </Field>
-          <Field label="行情数据源" hint="免费 IEX 数据源固定启用，当前版本不提供 SIP 或实盘选择。">
+          <Field label="行情数据源" hint="Alpaca 接入固定使用免费 IEX 和 Paper，不提供 SIP 或 Alpaca 实盘选择。">
             <select aria-label="行情数据源" value="iex" disabled><option value="iex">IEX 免费实时行情</option></select>
           </Field>
           {formError && <div className="form-error" role="alert">{formError}</div>}
@@ -101,15 +105,15 @@ export default function SettingsPage() {
             {saved?.source === 'web' && <Button type="button" variant="danger" disabled={save.isPending || remove.isPending} onClick={removeWebConfig}><Trash2 size={15} />{remove.isPending ? '正在移除...' : '移除网页配置'}</Button>}
           </div>
         </form>
-      </Card>
+      </Card>}
       <Card>
-        <div className="card-header"><div><h2>当前连接状态</h2><p>固定为 Alpaca Paper Trading</p></div>{connectionView.state === 'connected' ? <CheckCircle2 size={19} color={statusIconColor} /> : <WifiOff size={19} color={statusIconColor} />}</div>
+        <div className="card-header"><div><h2>当前连接状态</h2><p>当前券商与交易环境</p></div>{connectionView.state === 'connected' ? <CheckCircle2 size={19} color={statusIconColor} /> : <WifiOff size={19} color={statusIconColor} />}</div>
         <div className="card-pad stack">
           <StatusRow icon={<ShieldCheck size={16} />} label="运行状态" value={connectionView.label} />
           <StatusRow icon={<KeyRound size={16} />} label="配置来源" value={sourceLabel} />
-          <StatusRow icon={<KeyRound size={16} />} label="API 密钥" value={saved?.configured ? (saved.api_key_hint || '已保存') : '尚未配置'} />
-          <StatusRow icon={<LockKeyhole size={16} />} label="交易环境" value="Paper Trading（硬编码）" />
-          <StatusRow icon={<Server size={16} />} label="行情数据源" value="IEX 免费实时数据" />
+          <StatusRow icon={<KeyRound size={16} />} label={status?.broker === 'ibkr' ? '账户ID' : 'API 密钥'} value={status?.broker === 'ibkr' ? (status.account_id || '尚未选择') : saved?.configured ? (saved.api_key_hint || '已保存') : '尚未配置'} />
+          <StatusRow icon={<LockKeyhole size={16} />} label="交易环境" value={status?.paper === false ? 'IBKR 真实账户' : 'Paper Trading'} />
+          <StatusRow icon={<Server size={16} />} label="行情数据源" value={status?.broker === 'ibkr' ? 'IBKR 行情订阅' : 'IEX 免费实时数据'} />
           <StatusRow icon={<Database size={16} />} label="最后更新" value={saved?.updated_at ? formatTime(saved.updated_at) : '—'} />
           <StatusRow icon={<CheckCircle2 size={16} />} label="最近连接成功" value={formatTime(status?.last_success_at)} />
           <StatusRow icon={<WifiOff size={16} />} label="最近连接失败" value={formatTime(status?.last_failure_at)} />
@@ -117,7 +121,7 @@ export default function SettingsPage() {
           <StatusRow icon={<WifiOff size={16} />} label="连续失败" value={status?.consecutive_failures === undefined ? '—' : `${status.consecutive_failures} 次`} />
           <StatusRow icon={<WifiOff size={16} />} label="最近错误类型" value={errorCategoryLabel(status?.last_error_category)} />
           <div className={connectionView.tone === 'danger' ? 'danger-callout' : 'warning-callout'}>
-            {connection.error ? '无法读取 Alpaca 连接状态，请稍后重试。' : status?.message || connectionView.label}
+            {connection.error ? '无法读取券商连接状态，请稍后重试。' : status?.message || connectionView.label}
           </div>
         </div>
       </Card>
@@ -126,7 +130,7 @@ export default function SettingsPage() {
       <div className="card-header"><div><h2>服务器存储与系统边界</h2><p>连接凭据只在当前 QuantPilot 实例的 Docker 数据卷内使用</p></div></div>
       <div className="settings-security-grid">
         <SecurityItem label="加密保存" value="密文存入 SQLite，解密密钥保存在服务器 data/.credentials.key" />
-        <SecurityItem label="账户隔离" value="每个 QuantPilot 用户单独保存并使用自己的 Alpaca Paper 凭据" />
+        <SecurityItem label="账户隔离" value="每位用户独立使用自己的 Alpaca Paper 凭据或 IBKR 网关和账户" />
         <SecurityItem label="变更保护" value="保存或移除配置后，引擎会暂停且不会自动恢复" />
         <SecurityItem label="资产范围" value="美股 / ETF，只做多；常规交易时段" />
         <SecurityItem label="实时订阅" value="IEX 最多 30 个股票代码" />

@@ -12,3 +12,7 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 quantpilot-*.tar.gz
 .DS_Store
+
+# Operational audit records contain account and network details; keep them local.
+docs/research/
+docs/strategies/

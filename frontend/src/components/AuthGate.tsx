@@ -83,7 +83,7 @@ function AuthPage({ setup, onSuccess }: { setup: boolean; onSuccess: () => void 
     <div className="auth-ambient auth-ambient-two" />
     <section className="auth-panel">
       <div className="auth-brand"><div className="brand-mark"><Orbit size={28} /></div><div><strong>QUANTPILOT</strong><span>SECURE QUANT CONTROL</span></div></div>
-      <div className="auth-status"><ShieldCheck size={15} /> OPAQUE OAUTH2 SESSION · PAPER ONLY</div>
+      <div className="auth-status"><ShieldCheck size={15} /> OPAQUE OAUTH2 SESSION · ACCOUNT ISOLATION</div>
       <p className="eyebrow">{setup ? 'FIRST RUN INITIALIZATION' : 'AUTHORIZED ACCESS'}</p>
       <h1>{setup ? '创建管理员' : '欢迎回来'}</h1>
       <p className="auth-description">{setup ? '这是首次启动。创建初始管理员后，公开初始化入口将永久关闭。' : '登录后进入你自己的策略、账户、行情和自动交易空间。'}</p>
@@ -101,7 +101,7 @@ function AuthPage({ setup, onSuccess }: { setup: boolean; onSuccess: () => void 
         {error && <div className="form-error" role="alert">{error}</div>}
         <Button type="submit" disabled={submitting}><LockKeyhole size={15} />{submitting ? '正在建立安全会话...' : setup ? '创建管理员并进入系统' : '登录 QuantPilot'}</Button>
       </form>
-      <p className="auth-footnote">访问令牌不会写入浏览器存储；交易接口始终锁定为 Alpaca Paper。</p>
+      <p className="auth-footnote">访问令牌不会写入浏览器存储；默认使用模拟环境；IBKR 真实账户须单独阅读风险并输入确认。</p>
     </section>
   </div>
 }

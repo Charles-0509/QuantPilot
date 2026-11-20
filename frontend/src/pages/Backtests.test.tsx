@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Backtests from './Backtests'
+import { MemoryRouter } from 'react-router-dom'
 
 const { api } = vi.hoisted(() => ({ api: vi.fn() }))
 vi.mock('../api', () => ({
@@ -38,9 +39,9 @@ const strategy = {
   },
 }
 
-function renderPage() {
+function renderPage(url = '/backtests') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={client}><Backtests /></QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={[url]}><QueryClientProvider client={client}><Backtests /></QueryClientProvider></MemoryRouter>)
 }
 
 describe('Backtests', () => {
@@ -80,5 +81,20 @@ describe('Backtests', () => {
     const payload = JSON.parse(call?.[1]?.body as string)
     expect(payload.symbols).toEqual(['GOOGL'])
     expect(payload.benchmark).toBe('QQQ')
+  })
+
+  it('quick backtest selects the linked strategy instead of the first strategy', async () => {
+    const original = api.getMockImplementation()!
+    api.mockImplementation((path: string, init?: RequestInit) => path === '/api/strategies'
+      ? Promise.resolve([strategy, { ...strategy, id: 'strategy-2', name: '第二策略', definition: { ...strategy.definition, symbols: ['AAPL', 'MSFT'] } }])
+      : original(path, init))
+    renderPage('/backtests?strategy=strategy-2')
+    await waitFor(() => expect(screen.getByLabelText('选择策略')).toHaveValue('strategy-2'))
+    expect(screen.getByLabelText('回测标的')).toHaveValue('AAPL, MSFT')
+  })
+
+  it('accepts an explicit quick-backtest symbol override', async () => {
+    renderPage('/backtests?strategy=strategy-1&symbol=QQQ')
+    await waitFor(() => expect(screen.getByLabelText('回测标的')).toHaveValue('QQQ'))
   })
 })

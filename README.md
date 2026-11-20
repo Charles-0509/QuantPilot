@@ -1,8 +1,9 @@
-# QuantPilot — Alpaca 模拟盘量化交易平台
+# QuantPilot — Alpaca / IBKR 量化交易平台
 
-QuantPilot 是一个完全本地运行的美股/ETF量化交易程序。它提供中文 Web UI、条件卡片规则编辑器、历史回测、用户级风险控制和 Alpaca Paper Trading 自动执行。
+QuantPilot 是一个完全本地运行的美股/ETF量化交易程序。它提供中文 Web UI、条件卡片规则编辑器、历史回测、用户级风险控制和 Alpaca Paper / IBKR 自动执行。
 
-> 安全边界：程序中的 `TradingClient` 和 `TradingStream` 永久使用 `paper=True`，前端、API 和配置均不存在实盘切换入口。
+> 默认模拟环境。Alpaca 始终为 Paper；IBKR 默认 Paper。启用 IBKR 真实账户必须阅读风险声明并准确输入“我同意并确认”，后端强制验证一次性、用户和账户配置绑定的确认。切回模拟账户或其他券商后需重新确认。
+> IBKR 使用 Client Portal Gateway，需人工登录/双重认证；[安装与接入说明](docs/IBKR.md)。当前无已登录网关，真实账户连接与 IBKR Paper 成交尚未实联验证。
 
 ## 功能
 
@@ -15,7 +16,8 @@ QuantPilot 是一个完全本地运行的美股/ETF量化交易程序。它提�
 - 下一根K线成交的事件式回测，支持滑点、限价、止损止盈和保守的同K线成交顺序。
 - 回测时可覆盖策略股票池，快速测试 GOOGL、AAPL、NVDA 等不同标的，并与 SPY、QQQ、IWM、DIA、VTI 等常用ETF比较。
 - 回测任务后台异步运行，历史列表只加载摘要；高频净值曲线自动保留极值并降采样，减少页面卡顿。
-- Alpaca IEX 行情、Paper 账户、持仓、订单和成交状态同步。
+- Alpaca IEX / Paper 与 IBKR Gateway 双券商账户、行情、持仓和订单同步；每位用户选择一个当前券商。
+- IBKR 第一版支持 USD 美股/ETF、市价/限价与 Bracket，订单以 REST 轮询同步；移动止损、现金归集暂不支持。
 - Alpaca 读取请求具备明确超时、指数退避重试、交易/行情独立断路器与自动半开恢复；短时网络故障不再要求手动重启引擎。
 - 连接状态区分未配置、待探测、已连接、降级和断路保护；上游不可用时暂停新订单，并把无法确认的数据标为“未知”而不是误报为零余额、空仓或休市。
 - 订单提交使用确定性的 `client_order_id` 对账；响应丢失时先恢复远端订单，不盲目重复提交。
@@ -74,9 +76,9 @@ APCA_API_SECRET_KEY=你的模拟盘Secret
 ALPACA_DATA_FEED=iex
 ```
 
-Docker 默认将 `10000` 端口发布到 `0.0.0.0`，可通过 `HTTP + IP` 直接访问，也可由 Nginx/Caddy 提供 `HTTPS + 域名/IP`。默认 `QUANTPILOT_COOKIE_SECURE=false` 兼容两种入口；公网 HTTP 会明文传输密码和会话，不应在不可信网络使用。仅允许 HTTPS 访问时可设置 `QUANTPILOT_COOKIE_SECURE=true`。网页只会在该用户没有策略归属持仓、未结 QuantPilot 订单、待对账订单意图和活动执行隔离时允许更换 Alpaca 凭据；更新成功后引擎进入安全暂停状态，需在“自动交易”页面确认后重新启动。管理员网页配置优先于 `.env`；普通用户没有共享的 `.env` 后备凭据。
+Docker 默认将 `10000` 端口发布到 `0.0.0.0`，可通过 `HTTP + IP` 直接访问，也可由 Nginx/Caddy 提供 `HTTPS + 域名/IP`。默认 `QUANTPILOT_COOKIE_SECURE=false` 兼容两种入口；公网 HTTP 会明文传输密码和会话，不应在不可信网络使用。仅允许 HTTPS 访问时可设置 `QUANTPILOT_COOKIE_SECURE=true`。网页只会在该用户没有策略归属持仓、未结 QuantPilot 订单、待对账订单意图和活动执行隔离时允许更换券商、账户或 Alpaca 凭据；更新成功后引擎进入安全暂停状态，需在“自动交易”页面确认后重新启动。管理员网页配置优先于 `.env`；普通用户没有共享的 `.env` 后备凭据。
 
-也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.5.0` 或 `ghcr.io/charles-0509/quantpilot:latest`。
+当前 IBKR 功能需使用本源码构建或经过验证的本地部署镜像；尚未发布对应公共版本。旧版本也可以直接拉取 AMD64/ARM64 公共镜像：`ghcr.io/charles-0509/quantpilot:1.5.0` 或 `ghcr.io/charles-0509/quantpilot:latest`。
 
 已有部署在线升级（Alembic 会自动保留数据并把原有记录归到管理员）：
 

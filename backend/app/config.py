@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     alpaca_daily_bars_cache_seconds: float = Field(default=900.0, ge=900.0, le=86400.0)
     alpaca_stream_retry_base_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
     alpaca_stream_retry_max_seconds: float = Field(default=300.0, ge=5.0, le=1800.0)
+    ibkr_gateway_url: str = "https://127.0.0.1:5000/v1/api"
     investor_db_path: str = "data/investor.db"
     quantpilot_host: str = "0.0.0.0"
     quantpilot_port: int = 10000

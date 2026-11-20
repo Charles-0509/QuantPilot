@@ -744,6 +744,15 @@ async def test_exit_waits_until_every_strategy_order_is_cancelled(
         {"id": "open-a", "symbol": "SPY", "side": "sell", "status": "new"},
         {"id": "open-b", "symbol": "SPY", "side": "sell", "status": "new"},
     ]
+    broker_open_orders = list(open_orders)
+    original_cancel = alpaca.cancel_order
+
+    def cancel(order_id):
+        original_cancel(order_id)
+        broker_open_orders[:] = [order for order in broker_open_orders if order['id'] != order_id]
+
+    alpaca.cancel_order = cancel
+    alpaca.get_open_orders_fresh = lambda: list(broker_open_orders)
 
     await engine._submit_pending_signal(
         signal.id,
@@ -1362,3 +1371,90 @@ async def test_rest_reconciliation_backfills_missing_trailing_stop(
     assert len(trailing_records) == 1
     assert alpaca.trailing_submit_calls == 1
     database_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bracket_revalidation_keeps_whole_shares_after_quote_rises(tmp_path, monkeypatch):
+    db_engine, sessions, _ = _sessions(tmp_path, monkeypatch)
+    with sessions() as db:
+        strategy = db.get(Strategy, 'strategy-1')
+        definition = dict(strategy.definition)
+        definition['position'] = {**definition['position'], 'mode': 'fixed_qty', 'value': 20}
+        definition['order'] = {**definition['order'],
+            'stop_loss': {'mode': 'percent', 'value': 2},
+            'take_profit': {'mode': 'percent', 'value': 4}}
+        strategy.definition = definition
+        db.commit()
+    alpaca = OutboxAlpaca()
+    alpaca.quote_price = 100.025
+    engine = _engine(tmp_path, alpaca)
+    signal = await _entry_intent(engine, sessions, qty=20)
+    await engine._resume_pending_submissions([], account={'equity': '100000', 'buying_power': '200000'},
+        positions=[], clock={'is_open': True}, reference_bars=_reference_bars(signal))
+    assert alpaca.last_entry_kwargs is not None
+    assert alpaca.last_entry_kwargs['qty'] == 20
+    assert alpaca.last_entry_kwargs['qty'] * alpaca.quote_price < 10000
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_quote_created_during_http_request_is_not_rejected_as_future(tmp_path, monkeypatch):
+    db_engine, sessions, now_ref = _sessions(tmp_path, monkeypatch)
+    alpaca = OutboxAlpaca()
+    started = now_ref['value']
+    def get_quotes(symbols):
+        now_ref['value'] = started + timedelta(seconds=2)
+        return {s: {'ask_price': '100', 'timestamp': (started + timedelta(seconds=1)).isoformat()} for s in symbols}
+    alpaca.get_latest_quotes = get_quotes
+    engine = _engine(tmp_path, alpaca)
+    signal = await _entry_intent(engine, sessions)
+    await engine._resume_pending_submissions([], account={'equity': '100000', 'buying_power': '200000'},
+        positions=[], clock={'is_open': True}, reference_bars=_reference_bars(signal))
+    assert alpaca.submit_calls == 1
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['expired','quantity','notional','max_entries'])
+async def test_validation_limits_block_submission(tmp_path, monkeypatch, case):
+    db_engine, sessions, now_ref = _sessions(tmp_path, monkeypatch)
+    with sessions() as db:
+        strategy = db.get(Strategy, 'strategy-1')
+        data = dict(strategy.definition)
+        data['paper_validation'] = {'expires_at': (now_ref['value'] + timedelta(minutes=-1 if case=='expired' else 30)).isoformat(),
+            'max_entries': 1, 'max_quantity': 0.5 if case=='quantity' else 1,
+            'max_notional': 50 if case=='notional' else 1000}
+        strategy.definition = data
+        if case == 'max_entries':
+            db.add(Signal(user_id=7, strategy_id='strategy-1', unique_key='previous', symbol='SPY',
+                action='buy', price=100, bar_timestamp=now_ref['value']-timedelta(minutes=20), status='submitted'))
+        db.commit()
+    alpaca = OutboxAlpaca()
+    engine = _engine(tmp_path, alpaca)
+    signal = await _entry_intent(engine, sessions)
+    await engine._resume_pending_submissions([],account={'equity':'100000','buying_power':'200000'},positions=[],
+        clock={'is_open':True},reference_bars=_reference_bars(signal))
+    assert alpaca.submit_calls == 0
+    with sessions() as db:
+        assert db.get(Signal, signal.id).status == 'rejected'
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ibkr_attempt_marker_survives_crash_before_local_order_save(tmp_path, monkeypatch):
+    db_engine, sessions, _ = _sessions(tmp_path, monkeypatch)
+    alpaca = OutboxAlpaca()
+    alpaca.broker_name = 'ibkr'
+    alpaca.crash_after_accept = True
+    engine = _engine(tmp_path, alpaca)
+    signal = await _entry_intent(engine, sessions)
+    with pytest.raises(SimulatedProcessCrash):
+        await engine._resume_pending_submissions([], account={'equity':'100000','buying_power':'200000'},
+            positions=[], clock={'is_open':True}, reference_bars=_reference_bars(signal))
+    with sessions() as db:
+        saved = db.get(Signal, signal.id)
+        assert saved.status == 'pending_reconciliation'
+        assert saved.payload['ibkr_submission_started_at']
+        assert saved.payload['broker'] == 'ibkr'
+    assert alpaca.submit_calls == 1
+    db_engine.dispose()

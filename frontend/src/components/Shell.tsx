@@ -12,6 +12,7 @@ import {
   Orbit,
   Settings,
   ShieldCheck,
+  Trophy,
   Users,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -26,6 +27,7 @@ const navigation = [
   { to: '/strategies', label: '策略库', icon: BookOpenCheck },
   { to: '/backtests', label: '回测实验室', icon: FlaskConical },
   { to: '/trading', label: '自动交易', icon: Bot },
+  { to: '/performance', label: '策略绩效', icon: Trophy },
   { to: '/risk', label: '风险中心', icon: ShieldCheck },
   { to: '/settings', label: '设置', icon: Settings },
 ]
@@ -105,7 +107,7 @@ export default function Shell() {
             <span>QUANT CONTROL</span>
           </div>
         </div>
-        <div className="paper-seal"><Activity size={14} /> ALPACA PAPER ONLY</div>
+        <div className={connection.data?.paper === false ? 'paper-seal danger-callout' : 'paper-seal'}><Activity size={14} />{connection.data?.broker === 'ibkr' ? (connection.data.paper === false ? 'IBKR LIVE · 真实账户' : 'IBKR PAPER') : connection.data?.broker === 'alpaca' ? 'ALPACA PAPER ONLY' : '账户状态待确认'}</div>
         <nav>
           {[...navigation, ...(me.data?.role === 'admin' ? [{ to: '/users', label: '用户管理', icon: Users }] : [])].map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>

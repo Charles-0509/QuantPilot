@@ -43,6 +43,7 @@ class SafetyAlpaca(FakeAlpaca):
                 "status": "new",
             }
         ]
+
         self.all_orders = list(self.open_orders)
         self.cancel_fails = cancel_fails
         self.cancel_calls: list[str] = []
@@ -456,3 +457,169 @@ async def test_emergency_liquidation_holds_gate_until_close_request_finishes(
         state = db.scalar(select(EngineState).where(EngineState.user_id == 7))
     assert state is not None and state.status == "running"
     database_engine.dispose()
+
+
+def test_inactive_bracket_children_do_not_reserve_unfilled_entry_quantity():
+    parent = {
+        'id': 'entry', 'symbol': 'SPY', 'side': 'buy', 'status': 'partially_filled',
+        'order_class': 'bracket', 'qty': '20', 'filled_qty': '12',
+        'legs': [
+            {'id': 'take', 'symbol': 'SPY', 'side': 'sell', 'status': 'held', 'qty': '20'},
+            {'id': 'stop', 'symbol': 'SPY', 'side': 'sell', 'status': 'held', 'qty': '20'},
+        ],
+    }
+    assert TradingEngine._reserved_sell_qty([parent], 'SPY') == 0
+    parent['status'] = 'filled'
+    parent['filled_qty'] = '20'
+    for leg in parent['legs']:
+        leg['status'] = 'new'
+    assert TradingEngine._reserved_sell_qty([parent], 'SPY') == 20
+    # Unidentified held sells remain conservatively reserved.
+    assert TradingEngine._reserved_sell_qty([parent['legs'][0] | {'status': 'held'}], 'SPY') == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unsafe', ['open_sell', 'short', 'ownership', 'pending', 'pending_trailing', 'unavailable', 'safe'])
+async def test_manual_incident_clear_requires_fresh_safe_snapshot(tmp_path, monkeypatch, unsafe):
+    from app.models import Signal
+    db_engine = create_engine(f"sqlite:///{tmp_path / 'clear.db'}")
+    Base.metadata.create_all(db_engine)
+    sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+    monkeypatch.setattr(engine_module, 'SessionLocal', sessions)
+    alpaca = SafetyAlpaca()
+    alpaca.positions = [{'symbol': 'SPY', 'qty': '-1' if unsafe == 'short' else '4'}]
+    alpaca.open_orders = [] if unsafe != 'open_sell' else alpaca.open_orders
+    if unsafe == 'unavailable':
+        def fail():
+            raise ConnectionError('snapshot unavailable')
+        alpaca.get_positions_fresh = fail
+    with sessions() as db:
+        db.add(ExecutionIncident(user_id=7, symbol='SPY', status='active', reason='audit'))
+        db.add(ExecutionIncident(user_id=8, symbol='SPY', status='active', reason='other user'))
+        db.add(EngineState(user_id=7, status='paused', reason='audit'))
+        if unsafe == 'ownership':
+            db.add(StrategyPosition(user_id=7, strategy_id='s', symbol='SPY', qty=5))
+        if unsafe in {'pending', 'pending_trailing'}:
+            db.add(Signal(user_id=7, strategy_id='s', symbol='SPY', unique_key='pending',
+                          bar_timestamp=engine_module.datetime.now(engine_module.timezone.utc),
+                          action='buy', price=100,
+                          status='pending_submission' if unsafe == 'pending' else 'submitted',
+                          payload={'trailing_stop_intent': {'status': 'pending_submission'}} if unsafe == 'pending_trailing' else {}))
+        db.commit()
+    engine = TradingEngine(Settings(_env_file=None), alpaca, user_id=7)
+    if unsafe == 'safe':
+        assert await engine.clear_execution_incidents() == ['SPY']
+    else:
+        with pytest.raises((ExecutionQuarantineError, ConnectionError)):
+            await engine.clear_execution_incidents()
+    with sessions() as db:
+        assert db.scalar(select(ExecutionIncident).where(ExecutionIncident.user_id == 7)).status == ('contained' if unsafe == 'safe' else 'active')
+        assert db.scalar(select(ExecutionIncident).where(ExecutionIncident.user_id == 8)).status == 'active'
+        assert db.scalar(select(EngineState)).status == 'paused'
+    db_engine.dispose()
+
+
+def test_oco_top_level_take_profit_and_child_stop_share_one_reservation():
+    orders = [{'id': 'take', 'symbol': 'SPY', 'side': 'sell', 'status': 'new',
+               'order_class': 'oco', 'qty': '12', 'filled_qty': '0',
+               'legs': [{'id': 'stop', 'symbol': 'SPY', 'side': 'sell', 'status': 'new',
+                         'order_class': 'oco', 'qty': '12', 'filled_qty': '0'}]}]
+    assert TradingEngine._reserved_sell_qty(orders, 'SPY') == 12
+    orders.append({'id': 'independent', 'symbol': 'SPY', 'side': 'sell', 'status': 'new', 'qty': '2'})
+    assert TradingEngine._reserved_sell_qty(orders, 'SPY') == 14
+
+
+@pytest.mark.asyncio
+async def test_bracket_leg_stream_without_parent_id_preserves_strategy_ownership(tmp_path, monkeypatch):
+    db_engine = create_engine(f"sqlite:///{tmp_path / 'leg-stream.db'}")
+    Base.metadata.create_all(db_engine)
+    sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+    monkeypatch.setattr(engine_module, 'SessionLocal', sessions)
+    with sessions() as db:
+        db.add(EngineState(user_id=7, status='running'))
+        db.add(StrategyPosition(user_id=7, strategy_id='s', symbol='SPY', qty=2))
+        db.add(OrderRecord(id='parent', user_id=7, strategy_id='s', signal_id='signal',
+            client_order_id='qp-buy-test', symbol='SPY', side='buy', order_type='market',
+            qty=2, filled_qty=2, status='filled', raw={'id':'parent','legs':[{'id':'child'}]}))
+        db.commit()
+    engine = TradingEngine(Settings(_env_file=None), FakeAlpaca(), user_id=7)
+    await engine.handle_trade_update({'event':'fill','order':{'id':'child','client_order_id':'broker-generated',
+        'symbol':'SPY','side':'sell','qty':'2','filled_qty':'2','status':'filled','type':'limit','order_class':'bracket'}})
+    with sessions() as db:
+        child = db.get(OrderRecord, 'child')
+        assert child.strategy_id == 's'
+        assert db.scalar(select(StrategyPosition)).qty == 0
+        assert db.scalar(select(EngineState)).status == 'running'
+        assert db.scalar(select(ExecutionIncident)) is None
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_leg_arrives_before_parent_is_bound_by_exact_leg_id(tmp_path, monkeypatch):
+    db_engine = create_engine(f"sqlite:///{tmp_path / 'early-leg.db'}")
+    Base.metadata.create_all(db_engine)
+    sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+    monkeypatch.setattr(engine_module, 'SessionLocal', sessions)
+    client = FakeAlpaca()
+    engine = TradingEngine(Settings(_env_file=None, investor_db_path=str(tmp_path / 'unused.db')), client, user_id=7)
+    leg = {'id': 'early-child', 'client_order_id': 'broker-random', 'symbol': 'SPY', 'side': 'sell', 'qty': '1', 'filled_qty': '0', 'status': 'new', 'order_class': 'bracket', 'type': 'limit'}
+    await engine.handle_trade_update({'event': 'new', 'order': leg})
+    with sessions() as db:
+        orphan = db.get(OrderRecord, 'early-child')
+        assert orphan.strategy_id is None
+        parent = OrderRecord(id='parent', user_id=7, client_order_id='qp-entry', strategy_id='own', signal_id='buy', symbol='SPY', side='buy', order_type='market', qty=1, filled_qty=0, status='filled', raw={'legs': [leg]})
+        db.add(parent)
+        db.flush()
+        engine._apply_fill_delta(db, parent, {'filled_qty': '1'})
+        engine._register_order_legs(db, parent, {'legs': [leg]})
+        db.commit()
+        assert orphan.strategy_id == 'own' and orphan.signal_id == 'buy'
+    await engine.handle_trade_update({'event': 'fill', 'order': {**leg, 'filled_qty': '1', 'status': 'filled'}})
+    assert engine._owned_qty('own', 'SPY') == 0
+    with sessions() as db:
+        assert db.scalar(select(ExecutionIncident)) is None
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ack_with_order_still_open_defers_exit_without_quarantine(tmp_path, monkeypatch):
+    db_engine = create_engine(f"sqlite:///{tmp_path / 'cancel-ack.db'}")
+    Base.metadata.create_all(db_engine)
+    sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+    monkeypatch.setattr(engine_module, 'SessionLocal', sessions)
+    client = SafetyAlpaca()
+    client.cancel_order = lambda oid: None  # Acknowledged, not yet terminal.
+    engine = TradingEngine(Settings(_env_file=None, investor_db_path=str(tmp_path / 'unused.db')), client, user_id=7)
+    with sessions() as db:
+        db.add(OrderRecord(id='qp-trailing', user_id=7, client_order_id='qp-t-safety', strategy_id='own', symbol='SPY', side='sell', order_type='trailing_stop', qty=4, filled_qty=0, status='new'))
+        db.commit()
+    with pytest.raises(engine_module.StrategyOrderCancellationError):
+        await engine._cancel_strategy_symbol_orders('own', 'SPY', client.get_open_orders_fresh())
+    with sessions() as db:
+        assert db.scalar(select(ExecutionIncident)) is None
+    db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_existing_manual_bracket_leg_is_not_inserted_again(tmp_path, monkeypatch):
+    db_engine = create_engine(f"sqlite:///{tmp_path / 'manual-parent.db'}")
+    Base.metadata.create_all(db_engine)
+    sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+    monkeypatch.setattr(engine_module, 'SessionLocal', sessions)
+    client = SafetyAlpaca()
+    child = {'id': 'manual-child', 'parent_order_id': 'manual-parent', 'client_order_id': 'random-child', 'symbol': 'SPY', 'side': 'sell', 'type': 'stop', 'qty': 1, 'filled_qty': 0, 'status': 'held', 'order_class': 'bracket'}
+    parent = {'id': 'manual-parent', 'client_order_id': 'random-parent', 'symbol': 'SPY', 'side': 'buy', 'type': 'market', 'qty': 1, 'filled_qty': 1, 'status': 'filled'}
+    client.all_orders = [child, parent]
+    client.open_orders = [child]
+    with sessions() as db:
+        for order in [parent, child]:
+            db.add(OrderRecord(id=order['id'], user_id=7, client_order_id=order['client_order_id'], symbol='SPY', side=order['side'], order_type=order['type'], qty=1, filled_qty=order['filled_qty'], status=order['status'], raw=order))
+        db.commit()
+    engine = TradingEngine(Settings(_env_file=None, investor_db_path=str(tmp_path / 'unused.db')), client, user_id=7)
+    await engine.handle_trade_update({'event': 'update', 'order': child})
+    await engine.reconcile_orders()
+    with sessions() as db:
+        assert len(db.scalars(select(OrderRecord)).all()) == 2
+        assert db.get(OrderRecord, 'manual-child').strategy_id is None
+        assert db.scalar(select(engine_module.EventLog).where(engine_module.EventLog.message.like('订单对账失败:%'))) is None
+    db_engine.dispose()

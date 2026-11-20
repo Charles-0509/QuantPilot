@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api'
 import type { RuleDefinition, Strategy } from '../types'
 import RuleBuilder from '../components/RuleBuilder'
+import StrategyAssistant from '../components/StrategyAssistant'
 import { Badge, Button, Card, ErrorPanel, Field, Loading, PageHeader } from '../components/UI'
 
 const defaultDefinition: RuleDefinition = {
@@ -42,11 +43,13 @@ export default function StrategyEditor() {
     </>} />
     {readOnly && <div className="warning-callout" style={{ marginBottom: 16 }}>内置模板保持只读。请从策略库点击“复制并编辑”。</div>}
     {save.error && <div style={{ marginBottom: 16 }}><ErrorPanel message={(save.error as Error).message} /></div>}
+    <StrategyAssistant current={id ? { ...definition, symbols: symbolsText.split(',').map((item) => item.trim().toUpperCase()).filter(Boolean) } : null} disabled={readOnly}
+      onDraft={(draft) => { setDefinition(draft); setSymbolsText(draft.symbols.join(', ')) }} />
     <div className="editor-layout">
       <div className="stack">
         <Card>
           <div className="form-section">
-            <div className="form-section-title"><div><h3>策略身份与市场</h3><p>定义策略名称、股票池、时间周期和指标预热长度。</p></div><Badge tone="info">PAPER ONLY</Badge></div>
+            <div className="form-section-title"><div><h3>策略身份与市场</h3><p>定义策略名称、股票池、时间周期和指标预热长度。</p></div><Badge tone="info">STRATEGY</Badge></div>
             <div className="form-grid"><Field label="策略名称"><input value={definition.name} disabled={readOnly} onChange={(e) => setDefinition({ ...definition, name: e.target.value })} /></Field>
               <Field label="股票池" hint="英文逗号分隔，启用策略合计最多30个代码">
                 <input value={symbolsText} disabled={readOnly} onChange={(e) => setSymbolsText(e.target.value.toUpperCase())} />
@@ -82,7 +85,7 @@ export default function StrategyEditor() {
         <Card><div className="form-section"><RuleBuilder title="离场条件" value={definition.exit} onChange={(exit) => setDefinition({ ...definition, exit })} /></div></Card>
         <Card>
           <div className="form-section">
-            <div className="form-section-title"><div><h3>仓位与订单</h3><p>模拟盘只做多；信号生成后在下一次执行阶段提交订单。</p></div></div>
+            <div className="form-section-title"><div><h3>仓位与订单</h3><p>策略只做多；信号生成后在下一次执行阶段提交订单。</p></div></div>
             <div className="form-grid-3"><Field label="仓位模式"><select value={definition.position.mode} onChange={(e) => setDefinition({ ...definition, position: { ...definition.position, mode: e.target.value as any } })}><option value="percent_equity">账户净值百分比</option><option value="fixed_notional">固定金额</option><option value="fixed_qty">固定股数</option><option value="risk_based">按止损风险百分比</option></select></Field>
               <Field label="仓位数值"><input type="number" step="0.1" value={definition.position.value} onChange={(e) => setDefinition({ ...definition, position: { ...definition.position, value: Number(e.target.value) } })} /></Field>
               <Field label="订单类型"><select value={definition.order.type} onChange={(e) => setDefinition({ ...definition, order: { ...definition.order, type: e.target.value as 'market' | 'limit' } })}><option value="market">市价单</option><option value="limit">限价单</option></select></Field></div>
@@ -91,9 +94,9 @@ export default function StrategyEditor() {
           </div>
           <div className="form-section">
             <div className="form-section-title"><div><h3>保护性订单</h3><p>Bracket 与移动止损互斥；前后端都会进行校验。</p></div><ShieldCheck size={18} color="#3df6de" /></div>
-            <div className="toggle-row"><div><strong>Bracket 止损止盈</strong><p className="field-hint">买单成交后由 Alpaca 同时管理止损和止盈。</p></div><button className={`toggle ${bracket ? 'on' : ''}`} onClick={() => setDefinition({ ...definition, order: { ...definition.order, stop_loss: bracket ? null : { mode: 'percent', value: 2, atr_period: 14 }, take_profit: bracket ? null : { mode: 'percent', value: 4, atr_period: 14 }, trailing_stop: null } })}><span /></button></div>
+            <div className="toggle-row"><div><strong>Bracket 止损止盈</strong><p className="field-hint">买单成交后由当前券商管理止损和止盈。</p></div><button className={`toggle ${bracket ? 'on' : ''}`} onClick={() => setDefinition({ ...definition, order: { ...definition.order, stop_loss: bracket ? null : { mode: 'percent', value: 2, atr_period: 14 }, take_profit: bracket ? null : { mode: 'percent', value: 4, atr_period: 14 }, trailing_stop: null } })}><span /></button></div>
             {bracket && <div className="form-grid"><Guard label="止损" value={definition.order.stop_loss!} onChange={(stop_loss) => setDefinition({ ...definition, order: { ...definition.order, stop_loss } })} /><Guard label="止盈" value={definition.order.take_profit!} onChange={(take_profit) => setDefinition({ ...definition, order: { ...definition.order, take_profit } })} /></div>}
-            <div className="toggle-row"><div><strong>独立移动止损</strong><p className="field-hint">买单成交后提交模拟盘 trailing stop。</p></div><button className={`toggle ${trailing ? 'on' : ''}`} onClick={() => setDefinition({ ...definition, order: { ...definition.order, trailing_stop: trailing ? null : { mode: 'percent', value: 3 }, stop_loss: null, take_profit: null } })}><span /></button></div>
+            <div className="toggle-row"><div><strong>独立移动止损</strong><p className="field-hint">Alpaca 支持移动止损；当前 IBKR 接入暂不支持，启用时会拦截。</p></div><button className={`toggle ${trailing ? 'on' : ''}`} onClick={() => setDefinition({ ...definition, order: { ...definition.order, trailing_stop: trailing ? null : { mode: 'percent', value: 3 }, stop_loss: null, take_profit: null } })}><span /></button></div>
             {trailing && <div className="form-grid"><Field label="移动方式"><select value={definition.order.trailing_stop!.mode} onChange={(e) => setDefinition({ ...definition, order: { ...definition.order, trailing_stop: { ...definition.order.trailing_stop!, mode: e.target.value as 'percent' | 'price' } } })}><option value="percent">百分比</option><option value="price">固定美元距离</option></select></Field><Field label="移动距离"><input type="number" step="0.1" value={definition.order.trailing_stop!.value} onChange={(e) => setDefinition({ ...definition, order: { ...definition.order, trailing_stop: { ...definition.order.trailing_stop!, value: Number(e.target.value) } } })} /></Field></div>}
           </div>
           <div className="form-section"><div className="form-section-title"><div><h3>策略级风控</h3><p>全局风险中心仍会应用更严格的限制。</p></div></div>

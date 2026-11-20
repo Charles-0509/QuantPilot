@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, defer
 
@@ -14,10 +15,13 @@ from .auth_api import require_session
 from .database import SessionLocal, get_db
 from .models import (
     BacktestRun,
+    BacktestArtifact,
     ConnectionConfig,
     EngineState,
     EventLog,
     ExecutionIncident,
+    LlmSettings,
+    OrderRecord,
     RiskSettings,
     Signal,
     Strategy,
@@ -32,10 +36,12 @@ from .schemas import (
     ConnectionConfigRead,
     ConnectionConfigUpdate,
     EngineAction,
+    LlmSettingsUpdate,
     RiskSettingsRead,
     RiskSettingsUpdate,
     RuleDefinition,
     StrategyCreate,
+    StrategyDraftRequest,
     StrategyRead,
     StrategyVersionRead,
     WatchlistUpdate,
@@ -43,7 +49,11 @@ from .schemas import (
 from .services.alpaca_service import AlpacaService
 from .services.auth import AuthenticatedSession
 from .services.backtest import run_backtest
-from .services.credentials import encrypt_credential
+from .services.backtest_artifacts import pack_experiment
+from .services.rules import required_history
+from .services.credentials import CredentialDecryptionError, decrypt_credential, encrypt_credential
+from .services.performance import strategy_performance
+from .services.strategy_ai import StrategyAIError, draft_strategy, test_connection
 from .services.engine import (
     ConnectionReconfigurationBlockedError,
     ExecutionQuarantineError,
@@ -51,6 +61,7 @@ from .services.engine import (
     TradingEngine,
 )
 from .services.runtime import UserRuntime, UserRuntimeManager
+from .services.portfolio import build_portfolio, enabled_strategy_count
 from .services.strategy_safety import strategy_has_unresolved_execution
 from .services.websocket import websocket_manager
 
@@ -82,7 +93,7 @@ def service_error(exc: Exception) -> HTTPException:
     user_message = getattr(exc, "user_message", None)
     return HTTPException(
         status_code=503,
-        detail=user_message or "Alpaca Paper 暂时不可用，系统将自动重试",
+        detail=user_message or "券商连接暂时不可用，系统将自动重试",
     )
 
 
@@ -138,8 +149,8 @@ def operational_engine_status(
     if connection_state == "connected":
         return "active", True, "交易链路正常"
     if connection_state == "circuit_open":
-        return "circuit_open", False, "Alpaca 连接保护已开启，等待自动恢复"
-    return "degraded", False, "Alpaca 连接不稳定，暂缓策略评估与新订单"
+        return "circuit_open", False, "券商连接保护已开启，等待自动恢复"
+    return "degraded", False, "券商连接不稳定，暂缓策略评估与新订单"
 
 
 def collect_dashboard_snapshot(alpaca: AlpacaService) -> dict[str, Any]:
@@ -179,7 +190,7 @@ def collect_dashboard_snapshot(alpaca: AlpacaService) -> dict[str, Any]:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "paper": True, "version": "1.5.0"}
+    return {"status": "ok", "default_mode": "paper", "brokers": ['alpaca','ibkr'], "version": "1.6.0"}
 
 
 @router.get("/metadata")
@@ -200,7 +211,9 @@ def metadata() -> dict[str, Any]:
             "VOLUME_SMA": {"period": 20, "multiplier": 1.5},
             "DEVIATION": {"period": 20},
         },
-        "paper_only": True,
+        "paper_only": False,
+        "default_mode": "paper",
+        "alpaca_paper_only": True,
         "max_iex_symbols": 30,
     }
 
@@ -226,6 +239,8 @@ async def update_connection_config(
     engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
+    if getattr(alpaca,'broker_name','alpaca') != 'alpaca':
+        raise HTTPException(status_code=409, detail='请先切换至Alpaca，再更新Alpaca密钥')
     api_key_id = payload.api_key_id.strip()
     api_secret_key = payload.api_secret_key.strip()
     if not AlpacaService._credentials_valid(api_key_id, api_secret_key):
@@ -285,6 +300,8 @@ async def delete_connection_config(
     engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
+    if getattr(alpaca,'broker_name','alpaca') != 'alpaca':
+        raise HTTPException(status_code=409, detail='请先切换至Alpaca，再移除Alpaca配置')
     reason = "已移除网页 Alpaca 配置，请检查后重新启动引擎"
     try:
         async with engine.connection_reconfiguration(reason):
@@ -586,8 +603,12 @@ def enable_strategy(
     if strategy.is_template:
         raise HTTPException(status_code=409, detail="请复制模板后再启用")
     if not alpaca.configured:
-        raise HTTPException(status_code=503, detail="请先配置 Alpaca Paper API 密钥")
-    RuleDefinition.model_validate(strategy.definition)
+        raise HTTPException(status_code=503, detail="请先配置当前券商账户")
+    definition = RuleDefinition.model_validate(strategy.definition)
+    if definition.order.trailing_stop and not getattr(alpaca,'supports_trailing_stop',True):
+        raise HTTPException(status_code=422,detail='当前券商接入尚不支持移动止损，请改用规则离场或Bracket')
+    if definition.paper_validation and not getattr(alpaca,'paper',True):
+        raise HTTPException(status_code=422,detail='Paper验证策略不能在真实账户启用')
     enabled = db.scalars(
         select(Strategy).where(
             Strategy.enabled.is_(True), Strategy.owner_user_id == user_id
@@ -758,33 +779,49 @@ async def execute_backtest_job(
             if run is None:
                 return
             run.status = "running"
+            frozen_parameters = deepcopy(run.parameters)
+            frozen_risk = frozen_parameters.get('risk_settings', {})
             db.commit()
         await websocket_manager.broadcast(user_id, "backtest", {"id": run_id, "status": "running"})
 
         definition = RuleDefinition.model_validate(definition_data)
         payload = BacktestRequest.model_validate(payload_data)
 
-        def execute() -> tuple[dict, list, list, list]:
+        def execute():
             requested = list(dict.fromkeys([*definition.symbols, payload.benchmark]))
+            history_bars = max(definition.warmup_bars, required_history(definition))
+            history_start = payload.start - timedelta(days=AlpacaService._recent_window_days(definition.timeframe, history_bars))
             frames = alpaca.get_bars(
                 requested,
                 definition.timeframe,
-                payload.start,
+                history_start,
                 payload.end,
                 use_cache=True,
             )
+            for symbol in requested:
+                if symbol not in frames or frames[symbol].empty:
+                    raise ValueError(f'{symbol} 缺少回测行情，无法生成可信结果')
+            artifact, metadata = pack_experiment(definition_data, payload_data, frames, frozen_risk,
+                data_feed=getattr(alpaca,'feed','iex'), adjustment=getattr(alpaca,'history_adjustment','all'))
+            metadata['warnings'] = [
+                f'{symbol} 在区间开始时预热不足（需要 {history_bars} 根）；数据满足前不会生成信号'
+                for symbol in definition.symbols
+                if frames[symbol].index.searchsorted(pd.Timestamp(payload.start), side='right') < history_bars
+            ]
             result = run_backtest(
                 definition,
                 {symbol: frames.get(symbol, pd.DataFrame()) for symbol in definition.symbols},
                 initial_cash=payload.initial_cash,
                 slippage_bps=payload.slippage_bps,
                 commission=payload.commission,
-                benchmark=frames.get(payload.benchmark),
+                benchmark=frames[payload.benchmark].loc[frames[payload.benchmark].index >= payload.start],
+                start=payload.start,
+                risk_settings=frozen_risk,
             )
-            return result.metrics, result.equity_curve, result.benchmark_curve, result.trades
+            return result.metrics, result.equity_curve, result.benchmark_curve, result.trades, artifact, metadata
 
         try:
-            metrics, equity, benchmark, trades = await asyncio.to_thread(execute)
+            metrics, equity, benchmark, trades, artifact, metadata = await asyncio.to_thread(execute)
             with SessionLocal() as db:
                 run = db.scalar(
                     select(BacktestRun).where(
@@ -794,6 +831,8 @@ async def execute_backtest_job(
                 if run is None:
                     return
                 run.status = "completed"
+                run.parameters = {**frozen_parameters, **metadata, 'strategy_definition': definition_data}
+                db.add(BacktestArtifact(run_id=run.id, content=artifact))
                 run.metrics = metrics
                 run.equity_curve = equity
                 run.benchmark_curve = benchmark
@@ -841,7 +880,7 @@ async def create_backtest(
     if strategy is None:
         raise HTTPException(status_code=404, detail="策略不存在")
     if not alpaca.configured:
-        raise HTTPException(status_code=503, detail="回测需要配置 Alpaca Paper API 密钥以获取历史行情")
+        raise HTTPException(status_code=503, detail="回测需要配置当前券商账户以获取历史行情")
     definition_data = deepcopy(strategy.definition)
     if payload.symbols:
         definition_data["symbols"] = payload.symbols
@@ -860,12 +899,19 @@ async def create_backtest(
         )
     parameters = payload.model_dump(mode="json")
     parameters["symbols"] = definition.symbols
+    parameters['strategy_definition'] = definition.model_dump(mode='json')
+    parameters['strategy_version'] = strategy.version
+    risk = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
+    parameters['risk_settings'] = TradingEngine._risk_settings_snapshot(risk) if risk is not None else {}
     run = BacktestRun(
         user_id=user_id, strategy_id=strategy.id, status="queued", parameters=parameters
     )
     db.add(run)
     db.commit()
     db.refresh(run)
+    # Request dependency cleanup happens after BackgroundTasks finish. Queued
+    # jobs must not retain these connections while waiting for worker capacity.
+    db.close()
     background_tasks.add_task(
         execute_backtest_job,
         user_id,
@@ -877,18 +923,34 @@ async def create_backtest(
     return run
 
 
+@router.get('/backtests/{run_id}/artifact')
+def export_backtest_artifact(run_id: str, db: Session = Depends(get_db), user_id: int = Depends(current_user_id)):
+    artifact = db.scalar(select(BacktestArtifact).join(BacktestRun).where(
+        BacktestArtifact.run_id == run_id, BacktestRun.user_id == user_id))
+    if artifact is None:
+        raise HTTPException(status_code=404, detail='此回测没有实验快照（旧记录不支持补造）')
+    return Response(content=artifact.content, media_type='application/gzip',
+                    headers={'Content-Disposition': f'attachment; filename="backtest-{run_id}.json.gz"'})
+
+
+def execution_incident_summaries(db: Session, user_id: int) -> list[dict[str, Any]]:
+    rows = db.scalars(select(ExecutionIncident).where(
+        ExecutionIncident.user_id == user_id,
+    ).order_by(ExecutionIncident.updated_at.desc()).limit(10)).all()
+    return [{'id': row.id, 'symbol': row.symbol, 'status': row.status,
+             'reason': row.reason, 'updated_at': row.updated_at,
+             'details': row.details or {}} for row in rows]
+
+
 @router.get("/engine")
 def engine_status(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
+    engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
     state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
-    enabled_count = db.scalar(
-        select(func.count())
-        .select_from(Strategy)
-        .where(Strategy.enabled.is_(True), Strategy.owner_user_id == user_id)
-    )
+    enabled_count = enabled_strategy_count(db, user_id)
     active_incidents = db.scalars(
         select(ExecutionIncident.symbol).where(
             ExecutionIncident.user_id == user_id,
@@ -904,7 +966,8 @@ def engine_status(
         "reason": state.reason,
         "last_heartbeat": state.last_heartbeat,
         "enabled_strategies": enabled_count,
-        "paper": True,
+        "paper": bool(getattr(alpaca,'paper',True)),
+        "broker": getattr(alpaca,'broker_name','alpaca'),
         "operational_status": operational_status,
         "operational_reason": operational_reason,
         "accepting_new_orders": accepting_new_orders,
@@ -913,7 +976,162 @@ def engine_status(
         "next_retry_at": connection.get("retry_at"),
         "consecutive_failures": connection.get("consecutive_failures", 0),
         "active_incidents": list(active_incidents),
+        "execution_incidents": execution_incident_summaries(db, user_id),
+        "evaluation_health": engine.evaluation_health(engine.market_open_observed),
     }
+
+
+@router.get("/portfolio")
+async def portfolio(
+    alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
+) -> dict[str, Any]:
+    def read() -> dict[str, Any]:
+        with SessionLocal() as db:
+            return build_portfolio(alpaca, db, user_id)
+    return await asyncio.to_thread(read)
+
+
+@router.get("/cash-sweep/status")
+def cash_sweep_status(
+    db: Session = Depends(get_db),
+    engine: TradingEngine = Depends(get_engine),
+    user_id: int = Depends(current_user_id),
+) -> dict[str, Any]:
+    settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
+    return engine.cash_sweep_status(settings)
+
+
+@router.get("/monitoring/summary")
+async def monitoring_summary(
+    include_portfolio: bool = Query(default=True),
+    alpaca: AlpacaService = Depends(get_alpaca),
+    engine: TradingEngine = Depends(get_engine),
+    user_id: int = Depends(current_user_id),
+) -> dict[str, Any]:
+    """One authenticated read for external monitors; no browser rendering required."""
+    def read() -> dict[str, Any]:
+        with SessionLocal() as db:
+            state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
+            settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
+            connection = alpaca.connection_status()
+            operational_status, accepting, operational_reason = operational_engine_status(state.status, connection)
+            day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            signals = db.execute(select(Signal.status, func.count()).where(
+                Signal.user_id == user_id, Signal.created_at >= day_start).group_by(Signal.status)).all()
+            last_signal = db.scalar(select(func.max(Signal.created_at)).where(Signal.user_id == user_id))
+            problems = db.scalars(select(EventLog).where(
+                EventLog.user_id == user_id, EventLog.created_at >= day_start,
+                EventLog.level.in_(["warning", "error", "critical"])).order_by(EventLog.created_at.desc()).limit(20)).all()
+            return {
+                "checked_at": datetime.now(timezone.utc),
+                "engine": {"status": state.status, "reason": state.reason, "last_heartbeat": state.last_heartbeat,
+                           "operational_status": operational_status, "operational_reason": operational_reason,
+                           "accepting_new_orders": accepting, "enabled_strategies": enabled_strategy_count(db, user_id)},
+                "connection": {key: connection.get(key) for key in (
+                    "state", "broker", "paper", "message", "last_success_at", "last_failure_at", "retry_at", "consecutive_failures")},
+                "incidents": [row for row in execution_incident_summaries(db, user_id) if row["status"] == "active"],
+                "evaluation_health": engine.evaluation_health(engine.market_open_observed),
+                "cash_sweep": engine.cash_sweep_status(settings) if settings else None,
+                "signals_today": dict(signals), "last_signal_at": last_signal,
+                "recent_problems": [{"level": row.level, "category": row.category, "message": row.message,
+                                     "created_at": row.created_at} for row in problems],
+                "portfolio": build_portfolio(alpaca, db, user_id) if include_portfolio else None,
+            }
+    return await asyncio.to_thread(read)
+
+
+@router.get("/performance/strategies")
+async def performance_strategies(
+    alpaca: AlpacaService = Depends(get_alpaca),
+    user_id: int = Depends(current_user_id),
+) -> dict[str, Any]:
+    def read() -> dict[str, Any]:
+        with SessionLocal() as db:
+            portfolio_snapshot = build_portfolio(alpaca, db, user_id)
+            prices = {row["symbol"]: row["current_price"] for row in portfolio_snapshot.get("positions") or []}
+            return {"as_of": portfolio_snapshot["as_of"], "prices_status": portfolio_snapshot["status"],
+                    "strategies": strategy_performance(db, user_id, prices)}
+    return await asyncio.to_thread(read)
+
+
+@router.get("/ai/settings")
+def ai_settings(db: Session = Depends(get_db), user_id: int = Depends(current_user_id)) -> dict[str, Any]:
+    row = db.get(LlmSettings, user_id)
+    return {"configured": row is not None, "provider": row.provider if row else "openai",
+            "base_url": row.base_url if row else "",
+            "model": row.model if row else "", "updated_at": row.updated_at if row else None}
+
+
+@router.put("/ai/settings")
+def update_ai_settings(payload: LlmSettingsUpdate, db: Session = Depends(get_db),
+                       alpaca: AlpacaService = Depends(get_alpaca),
+                       user_id: int = Depends(current_user_id)) -> dict[str, Any]:
+    row = db.get(LlmSettings, user_id)
+    if row is None and not payload.api_key.strip():
+        raise HTTPException(status_code=422, detail="首次配置需要填写 API Key")
+    if row is None:
+        row = LlmSettings(user_id=user_id, base_url="", model="", api_key_cipher="")
+        db.add(row)
+    row.provider = payload.provider
+    row.base_url = payload.base_url.strip().rstrip("/")
+    row.model = payload.model.strip()
+    if payload.api_key.strip():
+        row.api_key_cipher = encrypt_credential(payload.api_key.strip(), alpaca.settings)
+    db.commit()
+    return ai_settings(db, user_id)
+
+
+@router.delete("/ai/settings")
+def delete_ai_settings(db: Session = Depends(get_db), user_id: int = Depends(current_user_id)) -> dict[str, Any]:
+    row = db.get(LlmSettings, user_id)
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return {"configured": False, "provider": "openai", "base_url": "", "model": "", "updated_at": None}
+
+
+@router.post("/ai/strategy-draft")
+async def ai_strategy_draft(payload: StrategyDraftRequest, db: Session = Depends(get_db),
+                            alpaca: AlpacaService = Depends(get_alpaca),
+                            user_id: int = Depends(current_user_id)) -> dict[str, Any]:
+    row = db.get(LlmSettings, user_id)
+    if row is None:
+        raise HTTPException(status_code=409, detail="请先在设置页配置大模型服务")
+    try:
+        api_key = decrypt_credential(row.api_key_cipher, alpaca.settings)
+    except CredentialDecryptionError as exc:
+        raise HTTPException(status_code=409, detail="大模型 API Key 无法解密，请重新保存") from exc
+    provider, base_url, model = row.provider, row.base_url, row.model
+    db.close()
+    try:
+        return await draft_strategy(payload.text, provider=provider, base_url=base_url, model=model,
+                                    api_key=api_key, current=payload.current_definition)
+    except StrategyAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/ai/test")
+async def ai_test(payload: LlmSettingsUpdate, db: Session = Depends(get_db),
+                  alpaca: AlpacaService = Depends(get_alpaca),
+                  user_id: int = Depends(current_user_id)) -> dict[str, Any]:
+    """Test the form values; a blank key reuses the saved one without revealing it."""
+    api_key = payload.api_key.strip()
+    if not api_key:
+        row = db.get(LlmSettings, user_id)
+        if row is None:
+            raise HTTPException(status_code=422, detail="请填写 API Key")
+        try:
+            api_key = decrypt_credential(row.api_key_cipher, alpaca.settings)
+        except CredentialDecryptionError as exc:
+            raise HTTPException(status_code=409, detail="已保存的 API Key 无法解密，请重新填写") from exc
+    db.close()
+    try:
+        reply = await test_connection(provider=payload.provider, base_url=payload.base_url.strip(),
+                                      model=payload.model.strip(), api_key=api_key)
+    except StrategyAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "reply": reply}
 
 
 @router.post("/engine/clear-incidents")
@@ -921,7 +1139,14 @@ async def clear_engine_incidents(
     payload: dict[str, Any] | None = None, engine: TradingEngine = Depends(get_engine)
 ) -> dict[str, Any]:
     symbol = (payload or {}).get("symbol")
-    cleared = await engine.clear_execution_incidents(symbol)
+    if symbol is not None and not isinstance(symbol, str):
+        raise HTTPException(status_code=422, detail='股票代码必须是字符串')
+    try:
+        cleared = await engine.clear_execution_incidents(symbol)
+    except ExecutionQuarantineError as exc:
+        raise HTTPException(status_code=409, detail='无法解除隔离：请先核对持仓、开放订单和待对账订单') from exc
+    except Exception as exc:
+        raise service_error(exc) from exc
     return {"status": "ok", "cleared": cleared}
 
 
@@ -938,7 +1163,7 @@ async def resume_engine(payload: EngineAction, engine: TradingEngine = Depends(g
 
 @router.post("/engine/pause")
 async def pause_engine(payload: EngineAction, engine: TradingEngine = Depends(get_engine)) -> dict[str, str]:
-    await engine.pause(payload.reason, cancel_orders=True)
+    await engine.pause(payload.reason, cancel_orders=payload.cancel_orders)
     return {"status": "paused"}
 
 
@@ -975,6 +1200,8 @@ async def update_risk_settings(
     engine: TradingEngine = Depends(get_engine),
     user_id: int = Depends(current_user_id),
 ) -> RiskSettings:
+    if payload.cash_sweep_enabled and not getattr(getattr(engine,'alpaca',None),'supports_cash_sweep',True):
+        raise HTTPException(status_code=422,detail='当前IBKR适配不启用自动现金归集')
     await engine.update_risk_settings(payload.model_dump())
     db.expire_all()
     settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == user_id))
@@ -1020,6 +1247,20 @@ def signals(
         .order_by(Signal.created_at.desc())
         .limit(limit)
     ).all()
+    orders = db.scalars(select(OrderRecord).where(
+        OrderRecord.user_id == user_id, OrderRecord.signal_id.in_([row.id for row in rows])
+    )).all() if rows else []
+    by_signal = {(order.signal_id, order.side): order for order in orders}
+
+    def execution(row):
+        order = by_signal.get((row.id, row.action))
+        if order is None:
+            return {'execution_status': row.status, 'filled_qty': 0}
+        status = TradingEngine._order_status_str({'status': order.status})
+        if order.filled_qty > 0 and status in {'canceled', 'cancelled', 'expired'}:
+            status = 'partially_filled_canceled'
+        return {'execution_status': status, 'filled_qty': order.filled_qty}
+
     return [
         {
             "id": row.id,
@@ -1029,6 +1270,8 @@ def signals(
             "price": row.price,
             "reason": row.reason,
             "status": row.status,
+            **execution(row),
+            'execution_error': (row.payload or {}).get('error') if row.status in {'rejected', 'pending_submission', 'pending_reconciliation'} else None,
             "bar_timestamp": row.bar_timestamp,
             "created_at": row.created_at,
         }
@@ -1043,6 +1286,10 @@ async def dashboard(
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
     snapshot = await asyncio.to_thread(collect_dashboard_snapshot, alpaca)
+    def read_portfolio() -> dict[str, Any]:
+        with SessionLocal() as portfolio_db:
+            return build_portfolio(alpaca, portfolio_db, user_id)
+    portfolio_snapshot = await asyncio.to_thread(read_portfolio)
     connection_status = alpaca.connection_status()
     state = db.scalar(select(EngineState).where(EngineState.user_id == user_id))
     operational_status, accepting_new_orders, operational_reason = operational_engine_status(
@@ -1069,6 +1316,7 @@ async def dashboard(
         "availability": snapshot["availability"],
         "data_errors": snapshot["data_errors"],
         "snapshot_at": datetime.now(timezone.utc),
+        "portfolio": portfolio_snapshot,
         "engine": {
             "status": state.status,
             "reason": state.reason,
@@ -1076,6 +1324,8 @@ async def dashboard(
             "operational_status": operational_status,
             "operational_reason": operational_reason,
             "accepting_new_orders": accepting_new_orders,
+            "enabled_strategies": enabled_strategy_count(db, user_id),
+            "execution_incidents": execution_incident_summaries(db, user_id),
         },
         "events": [
             {
@@ -1103,7 +1353,9 @@ async def dashboard(
 async def websocket_endpoint(websocket: WebSocket, user_id: int) -> None:
     await websocket_manager.connect(websocket, user_id)
     try:
-        await websocket.send_json({"event": "connected", "data": {"paper": True}})
+        manager = getattr(websocket.app.state,'runtime_manager',None)
+        runtime = await manager.ensure(user_id) if manager else None
+        await websocket.send_json({"event": "connected", "data": {"paper": bool(getattr(runtime.alpaca,'paper',True)) if runtime else True}})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

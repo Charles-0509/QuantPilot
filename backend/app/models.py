@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, Index, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -70,6 +70,13 @@ class BacktestRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BacktestArtifact(Base):
+    __tablename__ = 'backtest_artifacts'
+
+    run_id: Mapped[str] = mapped_column(ForeignKey('backtest_runs.id', ondelete='CASCADE'), primary_key=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class Signal(Base):
@@ -208,6 +215,9 @@ class RiskSettings(Base):
     cash_sweep_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     cash_sweep_symbol: Mapped[str] = mapped_column(String(16), default="SGOV")
     cash_sweep_buffer_pct: Mapped[float] = mapped_column(Float, default=2.0)
+    cash_sweep_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cash_sweep_cooldown_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    cash_sweep_min_trade_usd: Mapped[float] = mapped_column(Float, default=1000.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -250,6 +260,51 @@ class ConnectionConfig(Base):
     api_secret_cipher: Mapped[str] = mapped_column(Text)
     data_feed: Mapped[str] = mapped_column(String(12), default="iex")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class LlmSettings(Base):
+    """Per-user OpenAI-compatible endpoint used only to draft strategies."""
+
+    __tablename__ = "llm_settings"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("auth_users.id", ondelete="CASCADE"), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), default="openai")
+    base_url: Mapped[str] = mapped_column(String(500))
+    model: Mapped[str] = mapped_column(String(120))
+    api_key_cipher: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BrokerSettings(Base):
+    __tablename__ = 'broker_settings'
+    __table_args__ = (
+        Index('uq_active_ibkr_gateway', 'ibkr_gateway_url', unique=True,
+              sqlite_where=text("broker = 'ibkr' AND ibkr_account_id != ''")),
+        Index('uq_active_ibkr_account', 'ibkr_account_id', unique=True,
+              sqlite_where=text("broker = 'ibkr' AND ibkr_account_id != ''")),
+    )
+
+    user_id: Mapped[int] = mapped_column(ForeignKey('auth_users.id', ondelete='CASCADE'), primary_key=True)
+    broker: Mapped[str] = mapped_column(String(16), default='alpaca')
+    trading_mode: Mapped[str] = mapped_column(String(8), default='paper')
+    ibkr_gateway_url: Mapped[str] = mapped_column(String(500), default='https://127.0.0.1:5000/v1/api')
+    ibkr_account_id: Mapped[str] = mapped_column(String(32), default='')
+    ibkr_verify_tls: Mapped[bool] = mapped_column(Boolean, default=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    live_consent_context: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    live_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BrokerLiveChallenge(Base):
+    __tablename__ = 'broker_live_challenges'
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('auth_users.id', ondelete='CASCADE'), index=True)
+    context_hash: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuthUser(Base):

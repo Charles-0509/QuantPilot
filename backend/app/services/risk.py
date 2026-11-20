@@ -75,6 +75,7 @@ class RiskManager:
         strategy_max_positions: int,
         open_orders: list[dict[str, Any]] | None = None,
         reference_price: float = 0,
+        data_fresh: bool | None = None,
     ) -> RiskDecision:
         if not bool(clock.get("is_open")):
             return RiskDecision(False, "当前不在美股常规交易时段")
@@ -89,7 +90,7 @@ class RiskManager:
         timestamp = bar_timestamp
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
-        if (now - timestamp).total_seconds() > max_data_age_seconds:
+        if data_fresh is False or (data_fresh is None and (now - timestamp).total_seconds() > max_data_age_seconds):
             return RiskDecision(False, "行情数据已过期，拒绝下单")
 
         equity = as_float(account.get("equity"))

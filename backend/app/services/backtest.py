@@ -10,7 +10,8 @@ import pandas as pd
 from app.schemas import PriceGuard, RuleDefinition
 
 from .indicators import atr, ensure_frame
-from .rules import evaluate_tree
+from .rules import evaluate_tree, required_history
+from .sizing import normalize_entry_qty
 
 
 @dataclass(slots=True)
@@ -34,6 +35,9 @@ class PendingAction:
     action: str
     created_at: pd.Timestamp
     limit_price: float | None = None
+    stop_atr: float | None = None
+    take_atr: float | None = None
+    session_date: Any = None
 
 
 @dataclass
@@ -82,9 +86,18 @@ def run_backtest(
     slippage_bps: float = 5,
     commission: float = 0,
     benchmark: pd.DataFrame | None = None,
+    *,
+    start: Any = None,
+    risk_settings: dict[str, Any] | None = None,
 ) -> BacktestResult:
     frames: dict[str, pd.DataFrame] = {}
-    signals: dict[str, tuple[pd.Series, pd.Series, pd.Series]] = {}
+    signals: dict[str, tuple[pd.Series, pd.Series]] = {}
+    protection_atr: dict[str, dict[str, pd.Series]] = {}
+    required_bars = max(definition.warmup_bars, required_history(definition))
+    limits = risk_settings or {}
+    max_positions = min(definition.risk.max_positions, limits.get('max_positions', 30))
+    max_symbol_pct = min(definition.risk.max_symbol_pct, limits.get('max_symbol_pct', 100))
+    max_exposure_pct = limits.get('max_total_exposure_pct', 100)
     for symbol, raw in bars_by_symbol.items():
         frame = ensure_frame(raw)
         if frame.empty:
@@ -92,8 +105,12 @@ def run_backtest(
         frames[symbol] = frame
         entry = evaluate_tree(frame, definition.entry)
         exit_ = evaluate_tree(frame, definition.exit)
-        atr_values = atr(frame, 14)
-        signals[symbol] = (entry, exit_, atr_values)
+        signals[symbol] = (entry, exit_)
+        protection_atr[symbol] = {
+            name: atr(frame, guard.atr_period)
+            for name, guard in [('stop', definition.order.stop_loss), ('take', definition.order.take_profit)]
+            if guard is not None and guard.mode == 'atr'
+        }
 
     if not frames:
         raise ValueError("没有可用于回测的K线数据")
@@ -102,6 +119,10 @@ def run_backtest(
     for frame in frames.values():
         timeline = timeline.union(frame.index)
     timeline = timeline.sort_values()
+    if start is not None:
+        timeline = timeline[timeline >= pd.Timestamp(start)]
+    if timeline.empty:
+        raise ValueError('回测区间没有K线数据')
     cash = float(initial_cash)
     positions: dict[str, Position] = {}
     pending: dict[str, PendingAction] = {}
@@ -111,6 +132,28 @@ def run_backtest(
     exposure_points: list[float] = []
     mark_prices: dict[str, float] = {}
     slippage = slippage_bps / 10_000
+    session_date = None
+    day_start_equity = initial_cash
+    day_high_equity = initial_cash
+    halted = False
+
+    def session(timestamp):
+        ts = pd.Timestamp(timestamp)
+        return (ts.tz_convert('America/New_York') if ts.tzinfo else ts).date()
+
+    def check_account_risk():
+        nonlocal day_high_equity, halted
+        equity = current_equity()
+        if equity <= 0:
+            halted = True
+            return True
+        day_high_equity = max(day_high_equity, equity)
+        loss_limit = limits.get('max_daily_loss_pct')
+        drawdown_limit = limits.get('max_intraday_drawdown_pct')
+        if ((loss_limit is not None and (1 - equity / day_start_equity) * 100 >= loss_limit)
+            or (drawdown_limit is not None and (1 - equity / day_high_equity) * 100 >= drawdown_limit)):
+            halted = True
+        return halted
 
     def current_equity() -> float:
         value = cash
@@ -149,6 +192,10 @@ def run_backtest(
         )
 
     for timeline_index, timestamp in enumerate(timeline):
+        if session(timestamp) != session_date:
+            session_date = session(timestamp)
+            day_start_equity = current_equity()
+            day_high_equity = day_start_equity
         rows = {
             symbol: frame.loc[timestamp]
             for symbol, frame in frames.items()
@@ -159,8 +206,9 @@ def run_backtest(
         # and accidental use of the current bar's future close.
         for symbol, row in rows.items():
             mark_prices[symbol] = float(row["open"])
+        check_account_risk()
 
-        # Orders created at the previous close execute at this bar's open. Limit entries expire after one bar.
+        # Market entries use the next open; DAY/GTC limits retain their expiry semantics.
         for symbol, action in list(pending.items()):
             row = rows.get(symbol)
             if row is None or timestamp <= action.created_at:
@@ -168,25 +216,43 @@ def run_backtest(
             if action.action == "exit" and symbol in positions:
                 close_position(symbol, timestamp, float(row["open"]), "规则离场")
             elif action.action == "entry":
+                if halted or session_date.weekday() not in definition.schedule.weekdays:
+                    pending.pop(symbol, None)
+                    continue
+                if symbol not in positions and len(positions) >= max_positions:
+                    pending.pop(symbol, None)
+                    continue
                 if symbol in positions and not definition.position.allow_pyramiding:
                     pending.pop(symbol, None)
                     continue
                 if action.limit_price is not None:
-                    if float(row["low"]) > action.limit_price:
+                    if (definition.order.time_in_force == 'day' and action.session_date is not None
+                        and session_date != action.session_date):
                         pending.pop(symbol, None)
+                        continue
+                    if action.session_date is None:
+                        action.session_date = session_date
+                    if float(row["low"]) > action.limit_price:
                         continue
                     raw_fill = min(float(row["open"]), action.limit_price)
                 else:
                     raw_fill = float(row["open"])
                 fill = raw_fill * (1 + slippage)
+                if action.limit_price is not None:
+                    fill = min(fill, action.limit_price)
                 equity = current_equity()
-                atr_value = float(signals[symbol][2].loc[timestamp]) if timestamp in signals[symbol][2].index else None
-                stop = _price_guard(fill, definition.order.stop_loss, atr_value, "stop")
-                take = _price_guard(fill, definition.order.take_profit, atr_value, "take")
-                qty = _position_size(definition, equity, cash, fill, stop)
-                max_notional = equity * min(definition.risk.max_symbol_pct, 100) / 100
+                stop = _price_guard(fill, definition.order.stop_loss, action.stop_atr, "stop")
+                take = _price_guard(fill, definition.order.take_profit, action.take_atr, "take")
+                if (definition.order.stop_loss and (stop is None or stop <= 0)) or (definition.order.take_profit and take is None):
+                    pending.pop(symbol, None)
+                    continue
+                qty = _position_size(definition, equity, max(0, cash - commission), fill, stop)
+                max_notional = equity * max_symbol_pct / 100
                 current_notional = positions[symbol].qty * fill if symbol in positions else 0
                 qty = min(qty, max(0, max_notional - current_notional) / fill)
+                invested = equity - cash
+                qty = min(qty, max(0, equity * max_exposure_pct / 100 - invested) / fill)
+                qty = normalize_entry_qty(qty, definition)
                 if qty * fill + commission <= cash and qty > 0:
                     cash -= qty * fill + commission
                     if symbol in positions:
@@ -212,7 +278,7 @@ def run_backtest(
                             high_water=fill,
                             entry_fees=commission,
                         )
-                    last_entry_index[symbol] = timeline_index
+                    last_entry_index[symbol] = frames[symbol].index.get_loc(timestamp)
             pending.pop(symbol, None)
 
         # Intrabar risk exits use conservative ordering: stop/trailing before take profit.
@@ -220,7 +286,8 @@ def run_backtest(
             row = rows.get(symbol)
             if row is None:
                 continue
-            position.high_water = max(position.high_water, float(row["high"]))
+            # Only the previous bar's high-water mark is known at this open.
+            # Raising the trailing stop with this bar's high applies to the next bar.
             trailing_price = None
             if position.trailing_value is not None:
                 if position.trailing_mode == "percent":
@@ -237,13 +304,22 @@ def run_backtest(
             if position.take_price is not None and float(row["high"]) >= position.take_price:
                 close_position(symbol, timestamp, max(float(row["open"]), position.take_price), "止盈")
                 pending.pop(symbol, None)
+                continue
+            position.high_water = max(position.high_water, float(row["high"]))
+
+        for symbol, row in rows.items():
+            mark_prices[symbol] = float(row['close'])
+        check_account_risk()
 
         # Signals are generated only after the completed bar and execute on the next bar.
         for symbol, frame in frames.items():
             row = rows.get(symbol)
-            if row is None or symbol in pending:
+            if row is None or symbol in pending or halted:
                 continue
-            entry_signal, exit_signal, _ = signals[symbol]
+            bar_index = frame.index.get_loc(timestamp)
+            if bar_index + 1 < required_bars or session_date.weekday() not in definition.schedule.weekdays:
+                continue
+            entry_signal, exit_signal = signals[symbol]
             if symbol in positions and bool(exit_signal.loc[timestamp]):
                 pending[symbol] = PendingAction(symbol, "exit", timestamp)
                 continue
@@ -251,14 +327,20 @@ def run_backtest(
                 definition.position.allow_pyramiding
                 and positions[symbol].additions < definition.position.max_additions
             )
-            cooldown_ok = timeline_index - last_entry_index.get(symbol, -10_000) >= definition.risk.cooldown_bars
+            cooldown_ok = bar_index - last_entry_index.get(symbol, -10_000) >= definition.risk.cooldown_bars
             if can_add and cooldown_ok and bool(entry_signal.loc[timestamp]):
                 limit = None
                 if definition.order.type == "limit":
                     limit = float(row["close"]) * (
                         1 - definition.order.limit_offset_bps / 10_000
                     )
-                pending[symbol] = PendingAction(symbol, "entry", timestamp, limit)
+                values = {name: float(series.loc[timestamp]) for name, series in protection_atr[symbol].items()}
+                if any(not math.isfinite(value) for value in values.values()):
+                    continue
+                pending[symbol] = PendingAction(
+                    symbol, 'entry', timestamp, limit, values.get('stop'), values.get('take'),
+                    session_date if definition.timeframe != '1Day' else None,
+                )
 
         for symbol, row in rows.items():
             mark_prices[symbol] = float(row["close"])
@@ -284,7 +366,7 @@ def run_backtest(
             initial_cash,
             [pd.Timestamp(point["timestamp"]) for point in equity_points],
         )
-        if benchmark is not None
+        if benchmark is not None and not benchmark.empty
         else []
     )
     sample_indices = curve_sample_indices(equity_points, MAX_CHART_POINTS)
@@ -316,37 +398,43 @@ def calculate_metrics(
     returns = equity.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     annual_periods = periods_per_year(timeframe)
     total_return = equity.iloc[-1] / initial_cash - 1
-    years = max(len(returns) / annual_periods, 1 / annual_periods)
-    cagr = (equity.iloc[-1] / initial_cash) ** (1 / years) - 1 if equity.iloc[-1] > 0 else -1
+    years = max((pd.Timestamp(equity_curve[-1]['timestamp']) - pd.Timestamp(equity_curve[0]['timestamp'])).total_seconds() / (365.25 * 86400), 1 / 365.25)
+    try:
+        cagr = math.expm1(math.log(equity.iloc[-1] / initial_cash) / years) if equity.iloc[-1] > 0 else -1
+    except OverflowError:
+        cagr = None
     volatility = returns.std(ddof=0) * math.sqrt(annual_periods) if len(returns) else 0
-    sharpe = returns.mean() / returns.std(ddof=0) * math.sqrt(annual_periods) if returns.std(ddof=0) else 0
-    downside = returns[returns < 0].std(ddof=0)
-    sortino = returns.mean() / downside * math.sqrt(annual_periods) if downside else 0
+    sharpe = returns.mean() / returns.std(ddof=0) * math.sqrt(annual_periods) if returns.std(ddof=0) > 0 else None
+    # Zero minimum acceptable return; include all periods in downside deviation.
+    downside = math.sqrt(float((returns.clip(upper=0) ** 2).mean()))
+    sortino = returns.mean() / downside * math.sqrt(annual_periods) if downside > 0 else None
     running_max = equity.cummax()
     drawdown = equity / running_max - 1
     pnls = [float(trade["pnl"]) for trade in trades]
     wins = [value for value in pnls if value > 0]
     losses = [value for value in pnls if value < 0]
-    profit_factor = sum(wins) / abs(sum(losses)) if losses else (999 if wins else 0)
+    profit_factor = sum(wins) / abs(sum(losses)) if losses else None
     avg_win = float(np.mean(wins)) if wins else 0
     avg_loss = abs(float(np.mean(losses))) if losses else 0
-    payoff = avg_win / avg_loss if avg_loss else (999 if avg_win else 0)
-    return {
+    payoff = avg_win / avg_loss if avg_loss else None
+    metrics = {
         "initial_cash": round(initial_cash, 2),
         "final_equity": round(float(equity.iloc[-1]), 2),
         "total_return_pct": round(total_return * 100, 3),
-        "cagr_pct": round(cagr * 100, 3),
+        "cagr_pct": cagr * 100 if cagr is not None else None,
         "annual_volatility_pct": round(volatility * 100, 3),
-        "sharpe": round(float(sharpe), 3),
-        "sortino": round(float(sortino), 3),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "max_drawdown_pct": round(float(drawdown.min()) * 100, 3),
         "win_rate_pct": round(len(wins) / len(pnls) * 100, 2) if pnls else 0,
-        "payoff_ratio": round(payoff, 3),
-        "profit_factor": round(profit_factor, 3),
+        "payoff_ratio": payoff,
+        "profit_factor": profit_factor,
         "trade_count": len(trades),
         "average_bars_held": round(float(np.mean([t["bars_held"] for t in trades])), 2) if trades else 0,
         "exposure_pct": round(float(np.mean(exposure)) * 100, 2) if exposure else 0,
     }
+    return {key: round(float(value), 3) if value is not None and math.isfinite(value) else None
+            for key, value in metrics.items()}
 
 
 def curve_sample_indices(
@@ -381,11 +469,13 @@ def build_benchmark_curve(
     frame = ensure_frame(frame)
     if frame.empty:
         return []
-    first = float(frame.iloc[0]["close"])
-    normalized = frame["close"].astype(float) / first * initial_cash
+    prices = frame['close'].astype(float)
     if timestamps is not None:
         target = pd.DatetimeIndex(timestamps)
-        normalized = normalized.reindex(target, method="ffill").bfill()
+        prices = prices.reindex(target, method='ffill')
+        if prices.isna().any():
+            raise ValueError('基准在回测起始时点缺少价格，不能用未来价格回填')
+    normalized = prices / float(prices.iloc[0]) * initial_cash
     return [
         {"timestamp": index.isoformat(), "equity": round(float(value), 2)}
         for index, value in normalized.items()

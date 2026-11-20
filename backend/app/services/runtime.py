@@ -8,10 +8,13 @@ from sqlalchemy import select
 
 from app.config import Settings
 from app.database import SessionLocal
-from app.models import AuthUser, ConnectionConfig
+from app.models import AuthUser, BrokerSettings, ConnectionConfig, Signal
+from app.services.broker_service import BrokerService
 from app.services.alpaca_service import AlpacaService
 from app.services.credentials import CredentialDecryptionError, decrypt_credential
 from app.services.engine import TradingEngine
+from app.services.ibkr_service import IBKRService
+from app.services.broker_config import live_context
 
 
 logger = logging.getLogger(__name__)
@@ -19,12 +22,51 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class UserRuntime:
-    alpaca: AlpacaService
+    alpaca: BrokerService  # Compatibility name for the active broker adapter.
     engine: TradingEngine
+
+    @property
+    def broker(self):
+        return self.alpaca
+
+    async def replace_broker(self, client):
+        was_started = self.engine._task is not None
+        try:
+            await self.engine.shutdown()
+        finally:
+            self.alpaca = client
+            self.engine.alpaca = client
+            self.engine.reset_connection()
+            if was_started:
+                await self.engine.start()
+
+
+def build_ibkr(settings, saved):
+    user_id = saved.user_id
+    revision = saved.revision
+    account_id = saved.ibkr_account_id
+    expected_mode = saved.trading_mode
+    def authorized():
+        with SessionLocal() as db:
+            current = db.get(BrokerSettings, user_id)
+            return bool(current and current.broker == 'ibkr' and current.revision == revision
+                and current.ibkr_account_id == account_id and current.trading_mode == expected_mode
+                and (expected_mode == 'paper' or (current.live_consent_at and current.live_consent_context == live_context(current))))
+    def resolve(reference):
+        with SessionLocal() as db:
+            payloads = db.scalars(select(Signal.payload).where(Signal.user_id == user_id)).all()
+        return next((p['client_order_id'] for p in payloads if p and p.get('client_order_id') == reference), reference)
+    def attempted(reference):
+        with SessionLocal() as db:
+            payloads = db.scalars(select(Signal.payload).where(Signal.user_id == user_id)).all()
+        return any(p and p.get('client_order_id') == reference and p.get('ibkr_submission_started_at') for p in payloads)
+    return IBKRService(settings, gateway_url=saved.ibkr_gateway_url, account_id=account_id,
+        trading_mode=expected_mode, verify_tls=saved.ibkr_verify_tls, authorization_guard=authorized,
+        client_id_resolver=resolve, submission_attempted=attempted)
 
 
 class UserRuntimeManager:
-    """Owns one Paper Trading client and engine per active QuantPilot user."""
+    """Owns one selected broker client and engine per active QuantPilot user."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -32,6 +74,11 @@ class UserRuntimeManager:
         self._lock = asyncio.Lock()
 
     def _build(self, user_id: int) -> UserRuntime:
+        with SessionLocal() as db:
+            broker_settings = db.get(BrokerSettings, user_id)
+        if broker_settings is not None and broker_settings.broker == 'ibkr':
+            client = build_ibkr(self.settings, broker_settings)
+            return UserRuntime(alpaca=client, engine=TradingEngine(self.settings, client, user_id=user_id))
         # Environment credentials are retained as a backwards-compatible fallback
         # for the original administrator only. Web credentials always take priority.
         alpaca = AlpacaService(self.settings, use_env=user_id == 1)

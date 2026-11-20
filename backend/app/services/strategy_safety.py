@@ -32,13 +32,13 @@ def strategy_has_unresolved_execution(
         in UNRESOLVED_SIGNAL_STATUSES
         for signal in signals
     )
-    active_order = db.scalar(
-        select(OrderRecord.id).where(
+    order_statuses = db.scalars(
+        select(OrderRecord.status).where(
             OrderRecord.user_id == user_id,
             OrderRecord.strategy_id == strategy_id,
-            ~OrderRecord.status.in_(TERMINAL_ORDER_STATUSES),
         )
-    )
+    ).all()
+    active_order = any(str(status).lower().split('.')[-1] not in TERMINAL_ORDER_STATUSES for status in order_statuses)
     owned_position = db.scalar(
         select(StrategyPosition.id).where(
             StrategyPosition.user_id == user_id,
@@ -46,7 +46,7 @@ def strategy_has_unresolved_execution(
             StrategyPosition.qty > 0,
         )
     )
-    return unresolved_signal or active_order is not None or owned_position is not None
+    return unresolved_signal or active_order or owned_position is not None
 
 
 def user_has_unresolved_execution(db: Session, user_id: int) -> bool:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pandas as pd
 
-from app.schemas import Condition, ConditionGroup, ConditionNode, Operand
+from app.schemas import Condition, ConditionGroup, ConditionNode, Operand, RuleDefinition
 
 from .indicators import ensure_frame, indicator_series
 
@@ -100,3 +101,55 @@ def _operand_text(operand: Operand) -> str:
 
 def _condition_text(condition: Condition) -> str:
     return f"{_operand_text(condition.left)} {condition.operator} {_operand_text(condition.right)}"
+
+
+def required_history(definition: RuleDefinition) -> int:
+    """Calculate the minimum history needed by every rule operand."""
+
+    def visit(node: Any) -> int:
+        if getattr(node, "type", None) == "condition":
+            required = max(
+                operand_required_history(node.left),
+                operand_required_history(node.right),
+            )
+            if node.operator in {"crosses_above", "crosses_below"}:
+                required += 1
+            return required
+        return max((visit(child) for child in node.children), default=1)
+
+    required = max(visit(definition.entry), visit(definition.exit))
+    for guard in (definition.order.stop_loss, definition.order.take_profit):
+        if guard is not None and guard.mode == "atr":
+            required = max(required, guard.atr_period)
+    return required
+
+def operand_required_history(operand: Any) -> int:
+    offset = max(0, int(operand.offset or 0))
+    if operand.kind != "indicator":
+        return 1 + offset
+    params = operand.params or {}
+    name = str(operand.indicator)
+
+    def positive_int(key: str, default: int) -> int:
+        try:
+            return max(1, int(params.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    if name in {"SMA", "EMA", "BOLLINGER", "ATR", "VOLUME_SMA", "DEVIATION"}:
+        required = positive_int("period", 20 if name != "ATR" else 14)
+    elif name == "RSI":
+        required = positive_int("period", 14) + 1
+    elif name == "MACD":
+        slow = positive_int("slow", 26)
+        signal = positive_int("signal", 9)
+        required = slow + signal
+    elif name == "ROC":
+        required = positive_int("period", 12) + 1
+    elif name in {"HIGHEST", "LOWEST"}:
+        required = positive_int("period", 20)
+        if bool(params.get("exclude_current", True)):
+            required += 1
+    else:
+        required = 1
+    return required + offset

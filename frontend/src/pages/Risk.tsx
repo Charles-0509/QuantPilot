@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Bomb, Coins, Save, ShieldAlert, ShieldCheck } from 'lucide-react'
-import { api } from '../api'
-import type { RiskSettings } from '../types'
+import { api, formatTime } from '../api'
+import type { CashSweepStatus, RiskSettings } from '../types'
 import { Button, Card, ErrorPanel, Field, Loading, PageHeader } from '../components/UI'
 
 export default function Risk() {
   const client = useQueryClient()
   const query = useQuery({ queryKey: ['risk-settings'], queryFn: () => api<RiskSettings>('/api/risk-settings') })
+  const sweepStatus = useQuery({ queryKey: ['cash-sweep-status'], queryFn: () => api<CashSweepStatus>('/api/cash-sweep/status'), refetchInterval: 30000 })
   const [form, setForm] = useState<RiskSettings | null>(null)
   useEffect(() => { if (query.data) setForm(query.data) }, [query.data])
-  const save = useMutation({ mutationFn: () => api<RiskSettings>('/api/risk-settings', { method: 'PUT', body: JSON.stringify(form) }), onSuccess: () => client.invalidateQueries({ queryKey: ['risk-settings'] }) })
+  const save = useMutation({ mutationFn: () => api<RiskSettings>('/api/risk-settings', { method: 'PUT', body: JSON.stringify(form) }), onSuccess: () => { client.invalidateQueries({ queryKey: ['risk-settings'] }); client.invalidateQueries({ queryKey: ['cash-sweep-status'] }) } })
   const emergency = useMutation({ mutationFn: () => api<any>('/api/engine/emergency-liquidate', { method: 'POST', body: JSON.stringify({ reason: '用户从风险中心触发紧急平仓' }) }) })
+  if (query.error) return <ErrorPanel message={(query.error as Error).message} />
   if (query.isLoading || !form) return <Loading label="正在加载风险闸门" />
 
   return <>
@@ -64,6 +66,20 @@ export default function Risk() {
                   disabled={!form.cash_sweep_enabled}
                 />
               </Field>
+              <Field label="暂停自动买入至（北京时间，留空为不暂停）">
+                <input
+                  type="datetime-local"
+                  value={toLocalInput(form.cash_sweep_paused_until)}
+                  onChange={(e) => setForm({ ...form, cash_sweep_paused_until: e.target.value ? new Date(e.target.value).toISOString() : null })}
+                  disabled={!form.cash_sweep_enabled}
+                />
+              </Field>
+              <Field label="买入/赎回后冷却（分钟）">
+                <input type="number" value={form.cash_sweep_cooldown_minutes} onChange={(e) => setForm({ ...form, cash_sweep_cooldown_minutes: Number(e.target.value) })} disabled={!form.cash_sweep_enabled} />
+              </Field>
+              <Field label="最小买入金额（USD）">
+                <input type="number" value={form.cash_sweep_min_trade_usd} onChange={(e) => setForm({ ...form, cash_sweep_min_trade_usd: Number(e.target.value) })} disabled={!form.cash_sweep_enabled} />
+              </Field>
               <Field label="赎回缓冲超额 % (默认 2%)">
                 <input
                   type="number"
@@ -73,8 +89,12 @@ export default function Risk() {
                 />
               </Field>
             </div>
+            {sweepStatus.data && <div className={sweepStatus.data.state === 'ready' ? 'warning-callout' : 'danger-callout'}>
+              <strong>当前执行状态：{({ disabled: '未启用', paused: '已暂停', cooldown: '冷却中', ready: '可执行' } as Record<string, string>)[sweepStatus.data.state]}</strong>
+              ：{sweepStatus.data.reason}{sweepStatus.data.until ? `，至 ${formatTime(sweepStatus.data.until)}` : ''}；最近一次资金轮动 {formatTime(sweepStatus.data.last_rotation_at)}
+            </div>}
             <div className="warning-callout" style={{ borderColor: 'rgba(245,158,11,.2)', color: '#cbd5e1' }}>
-              开启后，系统在无新开仓且有多余现金时自动买入 {form.cash_sweep_symbol || 'SGOV'}；当其他策略产生买入信号时，引擎自动先市价卖出（目标金额 × {1 + (form.cash_sweep_buffer_pct || 2) / 100}）的 {form.cash_sweep_symbol || 'SGOV'}，确保资金平滑轮动。
+              闲置现金达到最小金额、且距离最近一次策略买入或赎回超过冷却时间，才会买入 {form.cash_sweep_symbol || 'SGOV'}。策略买入需要资金时仍会先卖出（目标金额 × {1 + (form.cash_sweep_buffer_pct || 2) / 100}）的 {form.cash_sweep_symbol || 'SGOV'}；“暂停”只停止自动买入，不阻止为策略买单释放资金。取消上方勾选则完全停止现金管理。
             </div>
           </div>
         </div>
@@ -96,4 +116,10 @@ function RiskGauge({ title, value, icon }: { title: string; value: number; icon:
 }
 function RiskField({ label, keyName, form, setForm }: { label: string; keyName: keyof RiskSettings; form: RiskSettings; setForm: (value: RiskSettings) => void }) {
   return <Field label={label}><input type="number" value={form[keyName] as number} onChange={(e) => setForm({ ...form, [keyName]: Number(e.target.value) })} /></Field>
+}
+
+function toLocalInput(value: string | null) {
+  if (!value) return ''
+  const date = new Date(value)
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
 }

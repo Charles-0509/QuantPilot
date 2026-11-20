@@ -54,13 +54,19 @@ def definition(stop: float | None = None, take: float | None = None) -> RuleDefi
     )
 
 
+def with_warmup(frame):
+    history = pd.DataFrame([frame.iloc[0].to_dict()] * 30,
+        index=pd.date_range(end=frame.index[0] - pd.Timedelta(days=1), periods=30, freq='D'))
+    return pd.concat([history, frame])
+
+
 def test_signal_executes_on_next_bar_open() -> None:
     index = pd.date_range("2025-01-01", periods=4, freq="D", tz="UTC")
     bars = pd.DataFrame(
         {"open": [100, 101, 102, 103], "high": [101, 102, 103, 104], "low": [99, 100, 101, 102], "close": [100, 101, 102, 103], "volume": 1000},
         index=index,
     )
-    result = run_backtest(definition(), {"SPY": bars}, initial_cash=10_000, slippage_bps=0)
+    result = run_backtest(definition(), {"SPY": with_warmup(bars)}, initial_cash=10_000, slippage_bps=0, start=index[0])
     assert result.trades[0]["entry_time"] == index[1].isoformat()
     assert result.trades[0]["entry_price"] == 101
 
@@ -71,7 +77,7 @@ def test_stop_is_conservative_when_stop_and_target_hit_same_bar() -> None:
         {"open": [100, 100, 100], "high": [101, 110, 101], "low": [99, 90, 99], "close": [100, 100, 100], "volume": 1000},
         index=index,
     )
-    result = run_backtest(definition(stop=2, take=4), {"SPY": bars}, initial_cash=10_000, slippage_bps=0)
+    result = run_backtest(definition(stop=2, take=4), {"SPY": with_warmup(bars)}, initial_cash=10_000, slippage_bps=0, start=index[0])
     assert result.trades[0]["reason"] == "止损/移动止损"
     assert result.trades[0]["exit_price"] == 98
 

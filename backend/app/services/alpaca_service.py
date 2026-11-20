@@ -174,10 +174,10 @@ class _CircuitBreaker:
 
 
 def serialize_model(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
     if hasattr(value, "value") and isinstance(value.value, (str, int, float, bool)):
         return value.value
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, (list, tuple)):
@@ -196,7 +196,6 @@ def _patch_alpaca_streams() -> None:
     if getattr(StockDataStream, "_quantpilot_patched", False):
         return
 
-    orig_data_run_forever = StockDataStream._run_forever
 
     async def safe_data_run_forever(self):
         self._loop = asyncio.get_running_loop()
@@ -218,7 +217,7 @@ def _patch_alpaca_streams() -> None:
                     self._running = True
                     consecutive_failures = 0
                 await self._consume()
-            except websockets.WebSocketException as wse:
+            except websockets.WebSocketException:
                 await self.close()
                 self._running = False
                 consecutive_failures += 1
@@ -286,6 +285,9 @@ _patch_alpaca_streams()
 
 
 class AlpacaService:
+    broker_name = 'alpaca'
+    paper = True
+    supports_trailing_stop = True
     """Thin adapter that is permanently locked to Alpaca paper trading."""
 
     def __init__(
@@ -518,6 +520,7 @@ class AlpacaService:
     def connection_config(self) -> dict[str, Any]:
         hint = f"...{self.api_key_id[-4:]}" if self.configured else None
         return {
+            'broker': 'alpaca',
             "configured": self.configured,
             "paper": True,
             "source": self.source,
@@ -611,6 +614,20 @@ class AlpacaService:
             return AlpacaTransientError("Alpaca 安全连接意外中断")
         if status in {401, 403}:
             return AlpacaServiceError("Alpaca Paper API 认证失败，请检查密钥")
+        if status == 422:
+            # Only emit fixed diagnoses, never raw response text or headers.
+            message = str(exc).lower()
+            reasons = [
+                ('fractional', '订单碎股数量与订单类型或有效期不兼容'),
+                ('sub-penny', '订单价格精度不符合要求'),
+                ('insufficient buying power', '可用购买力不足'),
+                ('insufficient qty', '可卖持仓数量不足'),
+                ('stop_price', '止损价格不符合券商约束'),
+                ('take_profit', '止盈价格不符合券商约束'),
+            ]
+            for token, reason in reasons:
+                if token in message:
+                    return AlpacaServiceError(f'Alpaca API 拒绝请求（HTTP 422）：{reason}')
         if status is not None:
             return AlpacaServiceError(f"Alpaca API 拒绝请求（HTTP {status}）")
         return AlpacaServiceError("Alpaca 请求失败")
@@ -748,6 +765,7 @@ class AlpacaService:
     def connection_status(self) -> dict[str, Any]:
         if not self.configured:
             return {
+                'broker': 'alpaca',
                 "configured": False,
                 "connected": False,
                 "state": "unconfigured",
@@ -834,6 +852,7 @@ class AlpacaService:
         )
         return {
             "configured": True,
+            "broker": "alpaca",
             "connected": connected,
             "state": state,
             "paper": True,
@@ -867,6 +886,11 @@ class AlpacaService:
 
     def get_account(self) -> dict[str, Any]:
         return self._cached_trading_read("account", lambda: self.trading.get_account())
+
+    def get_account_fresh(self) -> dict[str, Any]:
+        return self._cached_trading_read(
+            "account", lambda: self.trading.get_account(), force_refresh=True
+        )
 
     def get_positions(self) -> list[dict[str, Any]]:
         return self._cached_trading_read(

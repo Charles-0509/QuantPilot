@@ -24,19 +24,20 @@ export function connectionPresentation(
     return { state: 'unknown', label: '状态读取失败', tone: 'danger', dotClass: 'unknown' }
   }
   const state = connectionState(status)
+  const broker = status?.broker === 'ibkr' ? 'IBKR' : 'Alpaca'
   if (state === 'connected') {
-    return { state, label: '模拟盘已连接', tone: 'success', dotClass: 'online' }
+    return { state, label: status?.paper === false ? '真实账户已连接' : '模拟盘已连接', tone: 'success', dotClass: 'online' }
   }
   if (state === 'degraded') {
-    return { state, label: 'Alpaca 连接不稳定', tone: 'warning', dotClass: 'degraded' }
+    return { state, label: `${broker} 连接不稳定`, tone: 'warning', dotClass: 'degraded' }
   }
   if (state === 'circuit_open') {
-    return { state, label: 'Alpaca 连接保护中', tone: 'danger', dotClass: 'circuit-open' }
+    return { state, label: `${broker} 连接保护中`, tone: 'danger', dotClass: 'circuit-open' }
   }
   if (state === 'unconfigured') {
-    return { state, label: '未配置 Alpaca', tone: 'warning', dotClass: 'unconfigured' }
+    return { state, label: `未配置 ${broker}`, tone: 'warning', dotClass: 'unconfigured' }
   }
-  return { state: 'unknown', label: 'Alpaca 状态未知', tone: 'neutral', dotClass: 'unknown' }
+  return { state: 'unknown', label: `${broker} 状态未知`, tone: 'neutral', dotClass: 'unknown' }
 }
 
 export type EnginePresentation = {

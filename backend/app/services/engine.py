@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
@@ -32,16 +32,17 @@ from app.models import (
     WatchlistItem,
 )
 from app.schemas import RuleDefinition
+from .broker_service import BrokerService
 
 from .alpaca_service import (
     AlpacaAmbiguousOrderError,
-    AlpacaService,
     AlpacaTransientError,
 )
 
 from .indicators import latest_atr
 from .risk import RiskManager, as_float
-from .rules import evaluate_latest
+from .rules import RuleResult, required_history, operand_required_history, evaluate_latest
+from .sizing import normalize_entry_qty
 from .strategy_safety import (
     TERMINAL_ORDER_STATUSES,
     strategy_has_unresolved_execution,
@@ -69,6 +70,12 @@ CONNECTION_ERROR_LOG_INTERVAL_SECONDS = 300
 INSUFFICIENT_DATA_LOG_INTERVAL_SECONDS = 300
 PENDING_RECONCILIATION_TIMEOUT_SECONDS = 300
 PENDING_RECONCILIATION_MIN_MISSES = 3
+INVARIANT_SNAPSHOT_RETRY_DELAYS = (0.5, 1.0, 2.0)
+INVARIANT_SNAPSHOT_ATTEMPTS = len(INVARIANT_SNAPSHOT_RETRY_DELAYS) + 1
+ENTRY_FILL_LAG_WINDOW_SECONDS = 180
+OWNERSHIP_LAG_ESCALATE_SECONDS = 600
+OWNERSHIP_LAG_REASON = "券商持仓尚未反映已成交买单，暂停新订单等待对账"
+HOLD_REASON_PREFIX = "执行安全核对中："
 UNRESOLVED_ORDER_STATUSES = ("pending_submission", "pending_reconciliation")
 
 
@@ -91,7 +98,7 @@ class ConnectionReconfigurationBlockedError(RuntimeError):
     """Paper credentials cannot change while the old account owns execution state."""
 
     def __init__(self):
-        super().__init__("仍有策略持仓、待对账信号或未结订单，暂不能更换或删除 Alpaca 配置")
+        super().__init__("仍有策略持仓、待对账信号或未结订单，暂不能更换券商、账户或连接配置")
 
 
 class ExecutionQuarantineError(RuntimeError):
@@ -125,7 +132,7 @@ class EvaluationSnapshot:
 
 
 class TradingEngine:
-    def __init__(self, settings: Settings, alpaca: AlpacaService, user_id: int = 1):
+    def __init__(self, settings: Settings, alpaca: BrokerService, user_id: int = 1):
         self.settings = settings
         self.alpaca = alpaca
         self.user_id = user_id
@@ -148,6 +155,69 @@ class TradingEngine:
         self._next_stream_retry_monotonic = 0.0
         self._stream_recovery_pending = False
         self._last_risk_snapshot = datetime.min.replace(tzinfo=timezone.utc)
+        self._evaluation_status: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_evaluation_stall_log = datetime.min.replace(tzinfo=timezone.utc)
+        self.market_open_observed = False
+        self._preopen_checked_for: str | None = None
+
+    async def _preopen_check(self, prepared: list[PreparedStrategy], clock: dict[str, Any]) -> None:
+        """Probe the broker and load strategy bars once, shortly before the open."""
+        next_open = self._payload_datetime(clock.get("next_open"))
+        now = datetime.now(timezone.utc)
+        if (next_open is None or self._preopen_checked_for == next_open.isoformat()
+                or not timedelta(0) < next_open - now <= timedelta(minutes=10)):
+            return
+        self._preopen_checked_for = next_open.isoformat()
+        try:
+            probe = getattr(self.alpaca, "probe_connection", None)
+            if probe is not None:
+                await asyncio.to_thread(probe)
+            bars = await self._fetch_grouped_bars(prepared)
+            missing = sorted({symbol for item in prepared for symbol in item.definition.symbols
+                              if (bars.get(item.definition.timeframe) or {}).get(symbol) is None
+                              or (bars.get(item.definition.timeframe) or {}).get(symbol).empty})
+        except Exception as exc:
+            self._preopen_checked_for = None
+            await self.log("warning", "connection", f"开盘前预检失败，将在下一轮重试：{type(exc).__name__}")
+            return
+        if missing:
+            await self.log("warning", "market_data", f"开盘前预检：缺少K线 {'、'.join(missing[:10])}")
+        else:
+            await self.log("info", "market_data", "开盘前预检通过：券商连接与策略K线可用")
+
+    async def _warn_evaluation_stalls(self) -> None:
+        health = self.evaluation_health(self.market_open_observed)
+        now = datetime.now(timezone.utc)
+        if health['stalled'] and now - self._last_evaluation_stall_log >= timedelta(minutes=30):
+            self._last_evaluation_stall_log = now
+            await self.log('warning', 'strategy', f"策略评估心跳滞后：{'、'.join(health['stalled'][:8])}",
+                           {'stalled': health['stalled']})
+
+    def _record_evaluation(self, strategy: Strategy, symbol: str, timeframe: str, outcome: str,
+                           bar: Any = None, **extra: Any) -> None:
+        self._evaluation_status[(strategy.id, symbol)] = {
+            'strategy_id': strategy.id, 'strategy_name': strategy.name, 'symbol': symbol,
+            'timeframe': timeframe, 'outcome': outcome,
+            'bar_timestamp': bar.isoformat() if hasattr(bar, 'isoformat') else bar,
+            'checked_at': datetime.now(timezone.utc).isoformat(), **extra,
+        }
+
+    def evaluation_health(self, market_open: bool, now: datetime | None = None) -> dict[str, Any]:
+        """Per strategy/symbol heartbeat: distinguishes no trigger from stalled evaluation."""
+        now = now or datetime.now(timezone.utc)
+        rows, stalled = [], []
+        for row in sorted(self._evaluation_status.values(), key=lambda item: (item['strategy_name'], item['symbol'])):
+            checked = self._payload_datetime(row['checked_at'])
+            bar = self._payload_datetime(row.get('bar_timestamp'))
+            limit = TIMEFRAME_SECONDS.get(row['timeframe'], 900) * 2 + 300
+            is_stalled = bool(market_open and row['timeframe'] != '1Day' and (
+                checked is None or (now - checked).total_seconds() > EVALUATION_INTERVAL_SECONDS * 8
+                or (bar is not None and (now - bar).total_seconds() > limit
+                    and row['outcome'] not in {'insufficient_bars'})))
+            rows.append({**row, 'stalled': is_stalled})
+            if is_stalled:
+                stalled.append(f"{row['strategy_name']}/{row['symbol']}")
+        return {'checked_at': now.isoformat(), 'tracked': len(rows), 'stalled': stalled, 'rows': rows}
 
     @staticmethod
     def _risk_settings_snapshot(settings: RiskSettings) -> dict[str, Any]:
@@ -212,6 +282,7 @@ class TradingEngine:
                     evaluation_due = running and now >= self._next_strategy_evaluation
                     if evaluation_due:
                         await self.evaluate_active_strategies()
+                        await self._warn_evaluation_stalls()
                     elif now - self._last_risk_snapshot >= timedelta(
                         seconds=RISK_SNAPSHOT_INTERVAL_SECONDS
                     ):
@@ -224,7 +295,8 @@ class TradingEngine:
                         self._last_reconcile = datetime.now(timezone.utc)
                         with SessionLocal() as db:
                             current_risk = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
-                        if running and current_risk and getattr(current_risk, "cash_sweep_enabled", False):
+                        if (running and current_risk and getattr(current_risk, "cash_sweep_enabled", False)
+                                and self._accepting_new_orders(self._alpaca_connection_status())):
                             await self._execute_cash_sweep_investment(current_risk)
             except asyncio.CancelledError:
                 raise
@@ -378,7 +450,7 @@ class TradingEngine:
                     OrderRecord.id == order_id, OrderRecord.user_id == self.user_id
                 )
             ) if order_id else None
-            if record is None and order_id:
+            if order_id and (record is None or record.strategy_id is None):
                 parent_id = str(order.get("parent_order_id") or "")
                 parent = db.scalar(
                     select(OrderRecord).where(
@@ -386,7 +458,13 @@ class TradingEngine:
                         OrderRecord.user_id == self.user_id,
                     )
                 ) if parent_id else None
-                if parent is not None:
+                if parent is None:
+                    parent = self._parent_record_for_leg(db, order)
+                if parent is not None and parent.strategy_id and record is not None:
+                    record.strategy_id = parent.strategy_id
+                    record.signal_id = parent.signal_id
+                    record.filled_qty = 0.0
+                elif parent is not None and record is None:
                     record = OrderRecord(
                         user_id=self.user_id,
                         id=order_id,
@@ -433,6 +511,7 @@ class TradingEngine:
                 record.filled_avg_price = as_float(filled) if filled is not None else None
                 record.raw = payload
                 self._apply_fill_delta(db, record, order)
+                self._register_order_legs(db, record, order)
                 db.commit()
                 is_sweep = bool(record.client_order_id and str(record.client_order_id).startswith("qp-sweep-"))
                 if (
@@ -440,6 +519,7 @@ class TradingEngine:
                     and not is_sweep
                     and record.side == "sell"
                     and record.filled_qty > previous_filled_qty
+                    and str(order.get('order_class', '')).lower().split('.')[-1] not in {'bracket', 'oco', 'oto'}
                 ):
                     manual_sell_fill = (record.symbol, record.id)
                 if event in {"fill", "filled"} and record.side == "buy" and record.strategy_id:
@@ -502,6 +582,51 @@ class TradingEngine:
     def _order_side(order: dict[str, Any]) -> str:
         value = str(order.get("side", "")).lower()
         return "sell" if "sell" in value else "buy"
+
+    def _parent_record_for_leg(self, db, order):
+        """Recover ownership from exact broker leg IDs, never from symbol alone."""
+        order_id = str(order.get('id') or '')
+        if not order_id:
+            return None
+        parents = db.scalars(select(OrderRecord).where(
+            OrderRecord.user_id == self.user_id,
+            OrderRecord.strategy_id.is_not(None),
+            OrderRecord.symbol == str(order.get('symbol') or '').upper(),
+        )).all()
+        for parent in parents:
+            raw = parent.raw or {}
+            raw = raw.get('order') or raw
+            if any(str(leg.get('id') or '') == order_id for leg in raw.get('legs') or []):
+                return parent
+        return None
+
+    def _register_order_legs(self, db, parent, order):
+        if not parent.strategy_id:
+            return
+        for leg in order.get('legs') or []:
+            leg_id = str(leg.get('id') or '')
+            if not leg_id or leg_id == parent.id:
+                continue
+            record = db.scalar(select(OrderRecord).where(OrderRecord.id == leg_id, OrderRecord.user_id == self.user_id))
+            if record is None:
+                record = OrderRecord(id=leg_id, user_id=self.user_id, strategy_id=parent.strategy_id,
+                    signal_id=parent.signal_id, client_order_id=str(leg.get('client_order_id') or f'leg-{leg_id}'),
+                    symbol=str(leg.get('symbol') or parent.symbol), side=self._order_side(leg),
+                    order_type=str(leg.get('type') or 'bracket_leg'), qty=as_float(leg.get('qty')) or None,
+                    status=self._order_status_str(leg), filled_qty=0,
+                    raw={**leg, 'parent_order_id': parent.id})
+                db.add(record)
+                db.flush()
+            elif record.strategy_id is None:
+                # A leg update can arrive before the parent POST is persisted.
+                # Exact nested broker IDs establish its owner when the parent arrives.
+                record.strategy_id = parent.strategy_id
+                record.signal_id = parent.signal_id
+                record.filled_qty = 0.0
+            if str(record.status).lower().split('.')[-1] not in TERMINAL_ORDER_STATUSES:
+                record.status = self._order_status_str(leg)
+                record.raw = {**leg, 'parent_order_id': parent.id}
+            self._apply_fill_delta(db, record, leg)
 
     @staticmethod
     def _is_ambiguous_order_error(exc: Exception) -> bool:
@@ -600,10 +725,21 @@ class TradingEngine:
     ) -> float:
         groups: dict[str, float] = {}
         normalized = symbol.upper()
-        for order in cls._flatten_orders(orders):
+        flattened = cls._flatten_orders(orders)
+        by_id = {str(order.get('id')): order for order in flattened}
+        for order in flattened:
             if cls._order_is_terminal(order) or cls._order_side(order) != "sell":
                 continue
             if str(order.get("symbol", "")).upper() != normalized:
+                continue
+            parent = by_id.get(str(order.get('parent_order_id') or ''))
+            if (cls._order_status_str(order) == 'held' and parent
+                and cls._order_side(parent) == 'buy'
+                and str(parent.get('order_class', '')).lower().split('.')[-1] in {'bracket', 'oto'}
+                and not cls._order_is_terminal(parent)
+                and as_float(parent.get('filled_qty')) < as_float(parent.get('qty'))):
+                # Conditional exits cannot activate before the parent entry fills.
+                # Unknown held orders are still reserved conservatively.
                 continue
             if exclude_client_order_id and str(order.get("client_order_id") or "") == exclude_client_order_id:
                 continue
@@ -617,6 +753,11 @@ class TradingEngine:
             order_identity = str(
                 order.get("id") or order.get("client_order_id") or id(order)
             )
+            if (not parent_id and order.get('legs')
+                and str(order.get('order_class', '')).lower().split('.')[-1] == 'oco'):
+                # OCO's top-level take-profit is itself a sell, unlike bracket's
+                # buy parent. It and the nested stop consume the same shares.
+                parent_id = order_identity
             group = f"parent:{parent_id}" if parent_id else f"single:{order_identity}"
             groups[group] = max(groups.get(group, 0.0), remaining)
         return sum(groups.values())
@@ -627,8 +768,10 @@ class TradingEngine:
         intended_qty: float,
         client_order_id: str,
     ) -> None:
+        started_at = datetime.now(timezone.utc).isoformat()
         try:
             positions = await self._fresh_positions()
+            positions_at = datetime.now(timezone.utc).isoformat()
             open_orders = await self._fresh_open_orders()
         except Exception as exc:
             raise AlpacaTransientError(
@@ -641,7 +784,7 @@ class TradingEngine:
             exclude_client_order_id=client_order_id,
         )
         if actual_qty < -1e-6:
-            reason = "Alpaca 账户已出现空头持仓，禁止继续卖出"
+            reason = "券商账户已出现空头持仓，禁止继续卖出"
         elif intended_qty <= 0:
             reason = "待提交卖单数量无效"
         elif reserved_qty + intended_qty > max(actual_qty, 0.0) + 1e-6:
@@ -652,6 +795,11 @@ class TradingEngine:
             symbol,
             reason,
             details={
+                **self._incident_snapshot_details(
+                    symbol, positions, open_orders, snapshot_started_at=started_at,
+                    positions_observed_at=positions_at,
+                    orders_observed_at=datetime.now(timezone.utc).isoformat(),
+                ),
                 "source": "pre_submit_sell_capacity",
                 "actual_qty": actual_qty,
                 "reserved_sell_qty": reserved_qty,
@@ -678,10 +826,20 @@ class TradingEngine:
         *,
         trigger_order_id: str | None = None,
         details: dict[str, Any] | None = None,
+        destructive: bool = True,
     ) -> bool:
         normalized = symbol.upper()
         now = datetime.now(timezone.utc)
+        details = {**(details or {}), 'triggered_at': now.isoformat()}
         with SessionLocal() as db:
+            owned_rows = db.scalars(select(StrategyPosition).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.symbol == normalized,
+                StrategyPosition.qty > 0,
+            )).all()
+            details['owned_qty'] = sum(row.qty for row in owned_rows)
+            details['owned_breakdown'] = {row.strategy_id: row.qty for row in owned_rows}
+            details['destructive'] = destructive
             incident = db.scalar(
                 select(ExecutionIncident).where(
                     ExecutionIncident.user_id == self.user_id,
@@ -703,19 +861,24 @@ class TradingEngine:
                 incident.status = "active"
                 incident.reason = reason
                 incident.trigger_order_id = trigger_order_id or incident.trigger_order_id
-                incident.details = {**(incident.details or {}), **(details or {})}
+                incident.details = details
                 incident.resolved_at = None
                 incident.updated_at = now
-            db.query(StrategyPosition).filter(
-                StrategyPosition.user_id == self.user_id,
-                StrategyPosition.symbol == normalized,
-            ).update({StrategyPosition.qty: 0.0})
+            if destructive and (details or {}).get('source') != 'pre_submit_sell_capacity':
+                db.query(StrategyPosition).filter(
+                    StrategyPosition.user_id == self.user_id,
+                    StrategyPosition.symbol == normalized,
+                ).update({StrategyPosition.qty: 0.0})
             state = db.scalar(
                 select(EngineState).where(EngineState.user_id == self.user_id)
             )
             if state is not None:
                 state.status = "paused"
-                state.reason = f"执行安全隔离：{normalized} {reason}"
+                state.reason = (f"执行安全隔离：{normalized} {reason}" if destructive
+                                else f"{HOLD_REASON_PREFIX}{normalized} {reason}")
+            if details.get('snapshot_completed_at'):
+                db.add(EventLog(user_id=self.user_id, level='critical', category='risk',
+                                message=f'{normalized} 执行安全隔离快照：{reason}', details=details))
             db.commit()
         self._abort_new_orders_for_cycle = True
         return newly_active
@@ -776,23 +939,273 @@ class TradingEngine:
             owned_qty = owned_by_symbol.get(symbol, 0.0)
             reserved_sell_qty = self._reserved_sell_qty(open_orders, symbol)
             if actual_qty < -1e-6:
-                violations[symbol] = "Alpaca 账户出现空头持仓"
+                violations[symbol] = "券商账户出现空头持仓"
             elif owned_qty > max(actual_qty, 0.0) + 1e-6:
-                violations[symbol] = "策略归属数量超过 Alpaca 实际多头持仓"
+                violations[symbol] = "策略归属数量超过 券商实际多头持仓"
             elif reserved_sell_qty > max(actual_qty, 0.0) + 1e-6:
-                violations[symbol] = "开放卖单数量超过 Alpaca 实际多头持仓"
+                violations[symbol] = "开放卖单数量超过 券商实际多头持仓"
         return violations
 
+    def _sync_audit_fills(self, orders: list[dict[str, Any]]) -> dict[str, str]:
+        # The all-orders response can precede executions seen by the fresh reads.
+        external_fills: dict[str, str] = {}
+        with SessionLocal() as db:
+            for order in self._flatten_orders(orders):
+                record = db.scalar(select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id,
+                    OrderRecord.id == str(order.get('id') or ''),
+                ))
+                if record is not None:
+                    if (not record.strategy_id and record.side == 'sell'
+                        and not str(record.client_order_id).startswith('qp-sweep-')
+                        and as_float(order.get('filled_qty')) > record.filled_qty
+                        and str(order.get('order_class', '')).lower().split('.')[-1] not in {'bracket', 'oco', 'oto'}):
+                        external_fills[record.symbol] = record.id
+                    self._apply_fill_delta(db, record, order)
+                    if not self._order_is_terminal({'status': record.status}):
+                        record.status = self._order_status_str(order)
+                        record.raw = order
+            db.commit()
+        return external_fills
+
+    def _possible_exit_snapshot_race(
+        self, symbol: str, positions: list[dict[str, Any]], orders: list[dict[str, Any]]
+    ) -> bool:
+        """Only a previously covered, tracked executing exit may justify a re-read."""
+        actual = self._position_qty(positions, symbol)
+        if actual < -1e-6:
+            return False
+        sells = [order for order in self._flatten_orders(orders)
+                 if str(order.get('symbol', '')).upper() == symbol
+                 and self._order_side(order) == 'sell'
+                 and not self._order_is_terminal(order)]
+        if not sells or not any(as_float(order.get('filled_qty')) > 0
+                                or str(order.get('type', '')).lower() == 'market' for order in sells):
+            return False
+        with SessionLocal() as db:
+            owned = sum(db.scalars(select(StrategyPosition.qty).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.symbol == symbol,
+                StrategyPosition.qty > 0,
+            )).all())
+            for order in sells:
+                record = db.scalar(select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id,
+                    OrderRecord.id == str(order.get('id') or ''),
+                ))
+                if (record is None or not record.strategy_id or record.qty is None
+                    or as_float(order.get('qty')) > record.qty + 1e-6):
+                    return False
+        reserved = self._reserved_sell_qty(sells, symbol)
+        # Reconstruct remaining ownership after observed fills. Never grant a
+        # grace period to an order that exceeds that ledger, or to a short.
+        return actual < owned and owned - actual <= reserved + 1e-6 and reserved <= owned + 1e-6
+
+    def _recent_owned_buy_fill_qty(self, symbol: str, orders: list[dict[str, Any]]) -> float:
+        now = datetime.now(timezone.utc)
+        total = 0.0
+        with SessionLocal() as db:
+            for order in self._flatten_orders(orders):
+                if (str(order.get('symbol', '')).upper() != symbol or self._order_side(order) != 'buy'
+                        or as_float(order.get('filled_qty')) <= 0):
+                    continue
+                seen = self._payload_datetime(order.get('filled_at') or order.get('updated_at'))
+                if seen is None or (now - seen).total_seconds() > ENTRY_FILL_LAG_WINDOW_SECONDS:
+                    continue
+                record = db.scalar(select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id,
+                    OrderRecord.id == str(order.get('id') or ''),
+                ))
+                if record is not None and record.strategy_id:
+                    total += as_float(order.get('filled_qty'))
+        return total
+
+    def _possible_entry_snapshot_race(
+        self, symbol: str, positions: list[dict[str, Any]], open_orders: list[dict[str, Any]],
+        observed_orders: list[dict[str, Any]],
+    ) -> bool:
+        """A just-filled tracked buy can reach the ledger before the position endpoint."""
+        actual = self._position_qty(positions, symbol)
+        if actual < -1e-6 or self._reserved_sell_qty(open_orders, symbol) > max(actual, 0.0) + 1e-6:
+            return False
+        with SessionLocal() as db:
+            owned = sum(db.scalars(select(StrategyPosition.qty).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.symbol == symbol,
+                StrategyPosition.qty > 0,
+            )).all())
+        gap = owned - actual
+        return gap > 1e-6 and gap <= self._recent_owned_buy_fill_qty(symbol, observed_orders) + 1e-6
+
+    def _incident_snapshot_details(
+        self, symbol: str, positions: list[dict[str, Any]], orders: list[dict[str, Any]],
+        **observation_times: Any,
+    ) -> dict[str, Any]:
+        return {
+            **observation_times,
+            'snapshot_completed_at': datetime.now(timezone.utc).isoformat(),
+            'actual_qty': self._position_qty(positions, symbol),
+            'reserved_sell_qty': self._reserved_sell_qty(orders, symbol),
+            'open_orders': [
+                {**{key: order.get(key) for key in (
+                    'id', 'parent_order_id', 'side', 'status', 'qty', 'filled_qty', 'order_class',
+                    'submitted_at', 'updated_at', 'filled_at', 'canceled_at')},
+                 'remaining_qty': max(0.0, as_float(order.get('qty')) - as_float(order.get('filled_qty')))}
+                for order in self._flatten_orders(orders)
+                if str(order.get('symbol', '')).upper() == symbol
+                and self._order_side(order) == 'sell' and not self._order_is_terminal(order)
+            ],
+        }
+
+    async def _audit_reconciliation_snapshot(
+        self, recent_orders: list[dict[str, Any]], all_orders_observed_at: str
+    ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+        history: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for attempt in range(INVARIANT_SNAPSHOT_ATTEMPTS):
+            started_at = datetime.now(timezone.utc).isoformat()
+            if attempt:
+                # Also recover an exit that became terminal between the initial
+                # all-orders read and the position read (it is no longer open).
+                recent_orders = self._flatten_orders(await asyncio.to_thread(self.alpaca.get_orders, 'all'))
+                all_orders_observed_at = datetime.now(timezone.utc).isoformat()
+            open_orders = await self._fresh_open_orders()
+            orders_at = datetime.now(timezone.utc).isoformat()
+            positions = await self._fresh_positions()
+            positions_at = datetime.now(timezone.utc).isoformat()
+            observed_orders = self._flatten_orders(open_orders + recent_orders)
+            observed_by_id = {str(order.get('id') or ''): order for order in observed_orders}
+            # Restrict reservations to the open inventory, but retain a newer
+            # cumulative fill/terminal status from the other broker observation.
+            open_orders = [observed_by_id.get(str(order.get('id') or ''), order)
+                           for order in open_orders]
+            external_fills = self._sync_audit_fills(observed_orders)
+            violations = self._audit_long_only_invariants(positions, open_orders)
+            violations.update({symbol: 'REST 对账检测到未由 QuantPilot 跟踪的卖出增量'
+                               for symbol in external_fills})
+            details = {}
+            entry_lag = {symbol for symbol in violations if symbol not in external_fills
+                         and self._possible_entry_snapshot_race(symbol, positions, open_orders, observed_orders)}
+            for symbol in violations:
+                snapshot = self._incident_snapshot_details(
+                    symbol, positions, open_orders, snapshot_started_at=started_at,
+                    orders_observed_at=orders_at, positions_observed_at=positions_at,
+                    all_orders_observed_at=all_orders_observed_at,
+                )
+                history[symbol].append(snapshot)
+                details[symbol] = {**snapshot, 'snapshot_attempts': attempt + 1,
+                                   'snapshot_history': history[symbol]}
+                if symbol in external_fills:
+                    details[symbol]['external_order_id'] = external_fills[symbol]
+                if symbol in entry_lag:
+                    details[symbol]['kind'] = 'entry_fill_lag'
+            immediate = {symbol: reason for symbol, reason in violations.items()
+                         if symbol in external_fills or (symbol not in entry_lag and not
+                             self._possible_exit_snapshot_race(symbol, positions, observed_orders))}
+            if immediate or not violations or attempt == INVARIANT_SNAPSHOT_ATTEMPTS - 1:
+                for symbol in immediate:
+                    details[symbol].pop('kind', None)
+                return (immediate or violations), details
+            # Caller holds the submission lock: no new orders during ambiguity.
+            await asyncio.sleep(INVARIANT_SNAPSHOT_RETRY_DELAYS[attempt])
+        raise AssertionError('unreachable')
+
+    def _hold_incidents(self) -> list[ExecutionIncident]:
+        with SessionLocal() as db:
+            return [row for row in db.scalars(select(ExecutionIncident).where(
+                ExecutionIncident.user_id == self.user_id,
+                ExecutionIncident.status == 'active',
+            )).all() if (row.details or {}).get('destructive') is False]
+
+    async def _resolve_ownership_lag_holds(self) -> None:
+        """Auto-confirm non-destructive holds from fresh broker data, or escalate."""
+        holds = self._hold_incidents()
+        if not holds:
+            return
+        positions = await self._fresh_positions()
+        open_orders = await self._fresh_open_orders()
+        confirm_positions = await self._fresh_positions()
+        violations = self._audit_long_only_invariants(positions, open_orders)
+        confirm = self._audit_long_only_invariants(confirm_positions, open_orders)
+        now = datetime.now(timezone.utc)
+        recovered, escalated = [], []
+        with SessionLocal() as db:
+            for held in holds:
+                incident = db.get(ExecutionIncident, held.id)
+                details = dict(incident.details or {})
+                created = self._payload_datetime(details.get('triggered_at')) or now
+                if incident.symbol not in violations and incident.symbol not in confirm:
+                    incident.status = 'contained'
+                    incident.resolved_at = now
+                    incident.details = {**details, 'resolution': 'auto_recovered_consistent',
+                                        'recovered_at': now.isoformat(),
+                                        'recovery_actual_qty': self._position_qty(confirm_positions, incident.symbol)}
+                    recovered.append(incident.symbol)
+                elif (now - created).total_seconds() >= OWNERSHIP_LAG_ESCALATE_SECONDS:
+                    incident.reason = f"{OWNERSHIP_LAG_REASON}超过{OWNERSHIP_LAG_ESCALATE_SECONDS // 60}分钟，转为安全隔离"
+                    incident.details = {**details, 'destructive': True, 'escalated_at': now.isoformat(),
+                                        'snapshot_completed_at': None}
+                    db.query(StrategyPosition).filter(
+                        StrategyPosition.user_id == self.user_id,
+                        StrategyPosition.symbol == incident.symbol,
+                    ).update({StrategyPosition.qty: 0.0})
+                    escalated.append(incident.symbol)
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
+            remaining = db.scalar(select(ExecutionIncident.id).where(
+                ExecutionIncident.user_id == self.user_id, ExecutionIncident.status == 'active'))
+            resumed = bool(recovered and remaining is None and state is not None and state.status == 'paused'
+                           and str(state.reason or '').startswith(HOLD_REASON_PREFIX))
+            if resumed:
+                state.status = 'running'
+                state.reason = '执行安全核对通过：券商持仓已与策略归属一致，自动恢复'
+            elif escalated and state is not None:
+                state.reason = f"执行安全隔离：{'、'.join(escalated)} 持仓长时间与策略归属不一致"
+            db.commit()
+        for symbol in recovered:
+            await self.log('warning', 'risk', f'{symbol} 成交后持仓已追平，执行安全核对自动通过')
+        if resumed:
+            await self.log('info', 'engine', '交易引擎已自动恢复：执行安全核对通过')
+            await websocket_manager.broadcast(self.user_id, 'engine', {'status': 'running'})
+        for symbol in escalated:
+            await self.log('critical', 'risk', f'{symbol} 持仓长时间未追平，已转为安全隔离，需人工确认')
+
     async def _contain_active_execution_incidents(self) -> bool:
-        symbols = self._active_incident_symbols()
+        held = {row.symbol for row in self._hold_incidents()}
+        symbols = [symbol for symbol in self._active_incident_symbols() if symbol not in held]
         if not symbols or not self.alpaca.configured:
-            return not symbols
+            return not self._active_incident_symbols()
         contained: list[str] = []
         async with self._order_submission_lock:
+            started_at = datetime.now(timezone.utc).isoformat()
             try:
                 open_orders = await self._fresh_open_orders()
-                await self._fresh_positions()
-            except Exception:
+                orders_at = datetime.now(timezone.utc).isoformat()
+                positions = await self._fresh_positions()
+                positions_at = datetime.now(timezone.utc).isoformat()
+                snapshot_error = None
+            except Exception as exc:
+                snapshot_error = type(exc).__name__
+            # External fills pause immediately, then capture the pre-cancel
+            # broker observations. Keep the trigger pair for invariant incidents.
+            with SessionLocal() as db:
+                for symbol in symbols:
+                    incident = db.scalar(select(ExecutionIncident).where(
+                        ExecutionIncident.user_id == self.user_id,
+                        ExecutionIncident.symbol == symbol,
+                    ))
+                    if incident is None or (incident.details or {}).get('snapshot_completed_at'):
+                        continue
+                    snapshot = ({'snapshot_started_at': started_at,
+                                 'snapshot_error': snapshot_error,
+                                 'snapshot_completed_at': datetime.now(timezone.utc).isoformat(),
+                                 'actual_qty': None, 'open_orders': None}
+                                if snapshot_error else self._incident_snapshot_details(
+                                    symbol, positions, open_orders, snapshot_started_at=started_at,
+                                    orders_observed_at=orders_at, positions_observed_at=positions_at))
+                    incident.details = {**(incident.details or {}), **snapshot}
+                    db.add(EventLog(user_id=self.user_id, level='critical', category='risk',
+                                    message=f'{symbol} 执行安全隔离快照：{incident.reason}', details=incident.details))
+                db.commit()
+            if snapshot_error:
                 return False
             for symbol in symbols:
                 local_order_ids, local_client_ids = self._quantpilot_order_identity(
@@ -879,32 +1292,34 @@ class TradingEngine:
                     )
                 ).all()
             )
+        current = await self._fresh_open_orders()
         if open_orders is None:
-            open_orders = await asyncio.to_thread(self.alpaca.get_orders, "open")
-        cancelled_ids: set[str] = set()
-        failed_ids: list[str] = []
-        for order in list(open_orders):
-            order_id = str(order.get("id", ""))
-            parent_id = str(order.get("parent_order_id") or "")
-            if order_id in own_order_ids or parent_id in own_order_ids:
+            open_orders = current
+        else:
+            open_orders[:] = current
+        for _attempt in range(2):
+            targets = [order for order in current
+                       if not self._order_is_terminal(order) and
+                       (str(order.get('id') or '') in own_order_ids or
+                        str(order.get('parent_order_id') or '') in own_order_ids)]
+            if not targets:
+                return
+            for order in targets:
+                order_id = str(order.get('id') or '')
                 try:
                     await asyncio.to_thread(self.alpaca.cancel_order, order_id)
-                    cancelled_ids.add(order_id)
                 except Exception as exc:
-                    failed_ids.append(order_id)
                     logger.warning("Unable to cancel strategy order %s: %s", order_id, exc)
-        if cancelled_ids:
-            open_orders[:] = [
-                order
-                for order in open_orders
-                if str(order.get("id", "")) not in cancelled_ids
-            ]
-        if failed_ids:
-            # A market exit submitted while a bracket/trailing order remains open
-            # can oversell the position.  Even an ambiguous cancel is treated as
-            # incomplete; the next cycle first refreshes Alpaca's open orders and
-            # retries only the still-open orders.
-            raise StrategyOrderCancellationError(failed_ids)
+            # A lost cancel response is not a failed cancellation; an ACK is
+            # not proof of completion either. Only retry broker-open orders.
+            current = await self._fresh_open_orders()
+            open_orders[:] = current
+        still_open = [str(order.get('id') or '') for order in current
+                      if not self._order_is_terminal(order) and
+                      (str(order.get('id') or '') in own_order_ids or
+                       str(order.get('parent_order_id') or '') in own_order_ids)]
+        if still_open:
+            raise StrategyOrderCancellationError(still_open)
 
     async def evaluate_active_strategies(self, *, force: bool = False) -> None:
         now = datetime.now(timezone.utc)
@@ -1012,6 +1427,7 @@ class TradingEngine:
             return
         try:
             clock = await asyncio.to_thread(self.alpaca.get_clock)
+            self.market_open_observed = bool(clock.get("is_open"))
             if not bool(clock.get("is_open")):
                 self._next_strategy_evaluation = cycle_started_at + timedelta(
                     seconds=CLOSED_MARKET_INTERVAL_SECONDS
@@ -1048,10 +1464,12 @@ class TradingEngine:
         self._abort_new_orders_for_cycle = False
         try:
             clock = await asyncio.to_thread(self.alpaca.get_clock)
+            self.market_open_observed = bool(clock.get("is_open"))
             if not bool(clock.get("is_open")):
                 self._next_strategy_evaluation = cycle_started_at + timedelta(
                     seconds=CLOSED_MARKET_INTERVAL_SECONDS
                 )
+                await self._preopen_check(prepared, clock)
                 if self._snapshot_connection_ready(
                     self._alpaca_connection_status()
                 ):
@@ -1251,6 +1669,8 @@ class TradingEngine:
                 await self._log_insufficient_bars(
                     strategy, symbol, definition.timeframe, len(frame), required_bars
                 )
+                self._record_evaluation(strategy, symbol, definition.timeframe, 'insufficient_bars',
+                                        frame.index[-1], available_bars=len(frame), required_bars=required_bars)
                 # Do not consume this bar.  A later REST refill can provide the
                 # missing history and safely evaluate the same completed bar.
                 continue
@@ -1259,12 +1679,16 @@ class TradingEngine:
             latest_key = latest_timestamp.isoformat()
             key = (strategy.id, symbol)
             if self._last_evaluated.get(key) == latest_key:
+                if key in self._evaluation_status:
+                    self._evaluation_status[key]['checked_at'] = datetime.now(timezone.utc).isoformat()
                 continue
             if self._has_pending_reconciliation(strategy.id, symbol):
+                self._record_evaluation(strategy, symbol, definition.timeframe, 'waiting_reconciliation', latest_timestamp)
                 # The previous submit may already exist remotely. Leave this bar
                 # unconsumed and wait for reconciliation instead of risking a duplicate.
                 continue
 
+            outcome = 'no_trigger'
             try:
                 self.cache_bars(symbol, definition.timeframe, frame.tail(5))
                 entry = evaluate_latest(frame, definition.entry)
@@ -1277,7 +1701,21 @@ class TradingEngine:
                 )
                 has_position = owned_qty > 0
 
+                validation = definition.paper_validation
+                if validation:
+                    expired = datetime.now(timezone.utc) >= validation.expires_at
+                    if has_position and expired:
+                        exit_ = RuleResult(True, frame.index[-1], ['Paper验证截止，仅卖出测试策略归属仓位'])
+                    elif not has_position and self._validation_entry_reason(strategy.id, definition):
+                        try:
+                            await self.disable_strategy(strategy.id)
+                            await self.log('info', 'validation', f'{strategy.name} 已达到验证上限/截止时间，自动停用')
+                        except StrategyExecutionActiveError:
+                            pass
+                        continue
+
                 if has_position and exit_.matched:
+                    outcome = 'exit_signal'
                     await self._create_exit_signal(
                         strategy,
                         definition,
@@ -1296,6 +1734,7 @@ class TradingEngine:
                         )
                     )
                     if entry.matched and (not has_position or can_pyramid):
+                        outcome = 'entry_signal'
                         await self._create_entry_signal(
                             strategy,
                             definition,
@@ -1307,7 +1746,11 @@ class TradingEngine:
                             snapshot.open_orders,
                             snapshot.clock,
                         )
+                    elif entry.matched:
+                        outcome = 'entry_matched_holding'
             except Exception as exc:
+                self._record_evaluation(strategy, symbol, definition.timeframe, 'error', latest_timestamp,
+                                        error=str(exc)[:300])
                 await self.log(
                     "error",
                     "strategy",
@@ -1318,6 +1761,9 @@ class TradingEngine:
             # Only consume the bar after all local evaluation and order handling
             # completed. Snapshot/data failures therefore leave it retryable.
             self._last_evaluated[key] = latest_key
+            self._record_evaluation(strategy, symbol, definition.timeframe, outcome, latest_timestamp,
+                                    entry_matched=bool(entry.matched), exit_matched=bool(exit_.matched),
+                                    has_position=has_position)
 
     async def _log_insufficient_bars(
         self,
@@ -1406,56 +1852,11 @@ class TradingEngine:
 
     @classmethod
     def _definition_required_bars(cls, definition: RuleDefinition) -> int:
-        """Calculate the minimum history needed by every rule operand."""
-
-        def visit(node: Any) -> int:
-            if getattr(node, "type", None) == "condition":
-                required = max(
-                    cls._operand_required_bars(node.left),
-                    cls._operand_required_bars(node.right),
-                )
-                if node.operator in {"crosses_above", "crosses_below"}:
-                    required += 1
-                return required
-            return max((visit(child) for child in node.children), default=1)
-
-        required = max(visit(definition.entry), visit(definition.exit))
-        for guard in (definition.order.stop_loss, definition.order.take_profit):
-            if guard is not None and guard.mode == "atr":
-                required = max(required, guard.atr_period)
-        return required
+        return required_history(definition)
 
     @staticmethod
     def _operand_required_bars(operand: Any) -> int:
-        offset = max(0, int(operand.offset or 0))
-        if operand.kind != "indicator":
-            return 1 + offset
-        params = operand.params or {}
-        name = str(operand.indicator)
-
-        def positive_int(key: str, default: int) -> int:
-            try:
-                return max(1, int(params.get(key, default)))
-            except (TypeError, ValueError):
-                return default
-
-        if name in {"SMA", "EMA", "BOLLINGER", "ATR", "VOLUME_SMA", "DEVIATION"}:
-            required = positive_int("period", 20 if name != "ATR" else 14)
-        elif name == "RSI":
-            required = positive_int("period", 14) + 1
-        elif name == "MACD":
-            slow = positive_int("slow", 26)
-            signal = positive_int("signal", 9)
-            required = slow + signal
-        elif name == "ROC":
-            required = positive_int("period", 12) + 1
-        elif name in {"HIGHEST", "LOWEST"}:
-            required = positive_int("period", 20)
-            if bool(params.get("exclude_current", True)):
-                required += 1
-        else:
-            required = 1
-        return required + offset
+        return operand_required_history(operand)
 
     async def _record_connection_failure(self, exc: Exception) -> None:
         now = datetime.now(timezone.utc)
@@ -1571,6 +1972,28 @@ class TradingEngine:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) - timestamp >= timedelta(seconds=seconds)
 
+    def _validation_entry_reason(self, strategy_id, definition, *, signal_id=None, qty=None, notional=None):
+        validation = definition.paper_validation
+        if validation is None:
+            return ''
+        if not getattr(self.alpaca, 'paper', True):
+            return 'Paper验证规则不能在真实账户执行'
+        if datetime.now(timezone.utc) >= validation.expires_at:
+            return 'Paper验证已到截止时间'
+        with SessionLocal() as db:
+            statement = select(Signal.id).where(Signal.user_id == self.user_id,
+                Signal.strategy_id == strategy_id, Signal.action == 'buy')
+            if signal_id:
+                statement = statement.where(Signal.id != signal_id)
+            attempts = len(db.scalars(statement).all())
+        if attempts >= validation.max_entries:
+            return 'Paper验证已达到最大买入次数'
+        if qty is not None and qty > validation.max_quantity + 1e-9:
+            return 'Paper验证超过单次股数上限'
+        if notional is not None and notional > validation.max_notional + 0.01:
+            return 'Paper验证超过单次金额上限'
+        return ''
+
     async def _create_entry_signal(
         self,
         strategy: Strategy,
@@ -1583,12 +2006,16 @@ class TradingEngine:
         open_orders: list[dict[str, Any]],
         clock: dict[str, Any],
     ) -> None:
+        if definition.order.trailing_stop and not getattr(self.alpaca, 'supports_trailing_stop', True):
+            await self.log('warning', 'risk', f'{strategy.name}: 当前券商接入不支持移动止损，未创建买单')
+            return
         price = float(frame.iloc[-1]["close"])
         equity = as_float(account.get("equity"))
         config = definition.position
         atr_value = latest_atr(frame, definition.order.stop_loss.atr_period if definition.order.stop_loss else 14)
         stop_price = self._guard_price(price, definition.order.stop_loss, atr_value, False)
-        take_price = self._guard_price(price, definition.order.take_profit, atr_value, True)
+        take_atr = latest_atr(frame, definition.order.take_profit.atr_period) if definition.order.take_profit else None
+        take_price = self._guard_price(price, definition.order.take_profit, take_atr, True)
         if config.mode == "fixed_qty":
             qty = config.value
             desired_notional = qty * price
@@ -1613,12 +2040,29 @@ class TradingEngine:
             # cycle, but allow the next cycle to make one controlled retry.
             self._abort_new_orders_for_cycle = True
             raise
+        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True))
+        desired_notional = qty * price
+        validation_reason = self._validation_entry_reason(strategy.id, definition, qty=qty, notional=desired_notional)
+        if validation_reason:
+            await self.log('warning', 'validation', f'{strategy.name}/{symbol}: {validation_reason}')
+            return
+        if qty <= 0:
+            await self.log('warning', 'risk', f'{strategy.name}/{symbol}: 预算不足以购买符合保护单要求的整股')
+            return
         with SessionLocal() as db:
             risk_settings = db.scalar(
                 select(RiskSettings).where(RiskSettings.user_id == self.user_id)
             )
             state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
             max_age = max(risk_settings.stale_data_seconds, TIMEFRAME_SECONDS[definition.timeframe] * 3)
+            bar_timestamp = frame.index[-1].to_pydatetime()
+            if bar_timestamp.tzinfo is None:
+                bar_timestamp = bar_timestamp.replace(tzinfo=timezone.utc)
+            # Same rule as order revalidation and backtests: the previous
+            # session's final completed bar is actionable at the next open.
+            data_fresh = self._entry_intent_is_fresh(
+                bar_timestamp, bar_timestamp, definition.timeframe, datetime.now(timezone.utc),
+                max_age, self._frame_session_close(frame, bar_timestamp))
             decision = self.risk.check_entry(
                 symbol=symbol,
                 desired_notional=desired_notional,
@@ -1626,8 +2070,9 @@ class TradingEngine:
                 positions=positions,
                 asset=asset,
                 clock=clock,
-                bar_timestamp=frame.index[-1].to_pydatetime(),
+                bar_timestamp=bar_timestamp,
                 max_data_age_seconds=max_age,
+                data_fresh=data_fresh,
                 settings=risk_settings,
                 state=state,
                 strategy_max_symbol_pct=definition.risk.max_symbol_pct,
@@ -1990,6 +2435,7 @@ class TradingEngine:
                 record.raw = order
             record.filled_avg_price = as_float(order.get("filled_avg_price")) or None
             self._apply_fill_delta(db, record, order)
+            self._register_order_legs(db, record, order)
             remote_status = str(order.get("status", "accepted")).lower()
             signal.status = (
                 "rejected" if remote_status in {"rejected", "expired"} else "submitted"
@@ -2425,9 +2871,10 @@ class TradingEngine:
         )
         if quote_timestamp is None:
             return "wait", "最新报价缺少时间戳，订单意图继续等待", False, {}
+        quote_checked_at = datetime.now(timezone.utc)
         if (
-            (now - quote_timestamp).total_seconds() < 0
-            or (now - quote_timestamp).total_seconds()
+            (quote_checked_at - quote_timestamp).total_seconds() < -2
+            or (quote_checked_at - quote_timestamp).total_seconds()
             > risk_settings.stale_data_seconds
         ):
             return "wait", "最新报价已过期，订单意图继续等待", False, {}
@@ -2488,7 +2935,10 @@ class TradingEngine:
         )
         if original_qty > 0:
             qty = min(qty, original_qty)
-        if original_notional > 0:
+        # A fixed-quantity instruction caps shares, not the old quote's estimated
+        # notional. Recheck the new notional against risk limits below instead of
+        # turning a one-share protected entry into zero shares after a price tick.
+        if original_notional > 0 and config.mode != 'fixed_qty':
             qty = min(qty, original_notional / reference_price)
         desired_notional = qty * reference_price
         if qty <= 0 or desired_notional <= 0:
@@ -2499,6 +2949,14 @@ class TradingEngine:
         except Exception:
             self._abort_new_orders_for_cycle = True
             return "wait", "证券可交易状态暂不可用，订单意图继续等待", False, {}
+        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True))
+        desired_notional = qty * reference_price
+        if qty <= 0:
+            return 'reject', '预算不足以购买符合保护单要求的整股', False, {}
+        validation_reason = self._validation_entry_reason(strategy.id, definition, signal_id=signal.id,
+            qty=qty, notional=desired_notional)
+        if validation_reason:
+            return 'reject', validation_reason, False, {}
         own_client_id = str(payload.get("client_order_id") or "")
         risk_open_orders = [
             order
@@ -2839,6 +3297,21 @@ class TradingEngine:
                 ):
                     return False
                 if signal.action == "buy":
+                    current_definition = RuleDefinition.model_validate(current_strategy.definition)
+                    validation_reason = self._validation_entry_reason(current_strategy.id, current_definition,
+                        signal_id=signal.id, qty=as_float(payload.get('qty')),
+                        notional=as_float(payload.get('notional')))
+                    if validation_reason:
+                        self._update_signal_state(signal.id, 'rejected', extra={'error': validation_reason})
+                        self._remove_pending_reservation(open_orders, signal.id)
+                        return True
+                    if getattr(self.alpaca, 'broker_name', 'alpaca') == 'ibkr':
+                        # IBKR's recent-order list cannot establish a permanent
+                        # 404 by cOID. Persist the attempt before a possible POST;
+                        # after a crash, absence remains unknown and is never replayed.
+                        self._update_signal_state(signal.id, 'pending_reconciliation', extra={
+                            'broker':'ibkr','broker_account_id':getattr(self.alpaca,'account_id',''),
+                            'ibkr_submission_started_at':datetime.now(timezone.utc).isoformat()})
                     if current_risk_settings and getattr(current_risk_settings, "cash_sweep_enabled", False):
                         await self._execute_cash_sweep_liquidation_if_needed(
                             current_risk_settings,
@@ -2858,6 +3331,10 @@ class TradingEngine:
                         take_price=payload.get("take_price"),
                     )
                 else:
+                    if getattr(self.alpaca, 'broker_name', 'alpaca') == 'ibkr':
+                        self._update_signal_state(signal.id, 'pending_reconciliation', extra={
+                            'broker':'ibkr','broker_account_id':getattr(self.alpaca,'account_id',''),
+                            'ibkr_submission_started_at':datetime.now(timezone.utc).isoformat()})
                     await self._verify_long_only_sell_capacity(
                         signal.symbol,
                         as_float(payload.get("qty")),
@@ -2935,7 +3412,7 @@ class TradingEngine:
             await self.log(
                 "warning",
                 "order",
-                f"{signal.symbol} 订单已被 Alpaca 接收，本地记录等待自动对账",
+                f"{signal.symbol} 订单已被券商接收，本地记录等待自动对账",
                 {"client_order_id": client_order_id},
             )
             return True
@@ -2945,7 +3422,8 @@ class TradingEngine:
             open_orders.append(
                 {**order, "_estimated_notional": saved.payload.get("notional")}
             )
-        action_label = "模拟买单" if saved.action == "buy" else "模拟平仓"
+        environment_label = "模拟" if getattr(self.alpaca, 'paper', True) else "真实"
+        action_label = environment_label + ("买单" if saved.action == "buy" else "平仓")
         await self.log(
             "info", "order", f"{strategy_name}: 已提交 {signal.symbol} {action_label}"
         )
@@ -2972,6 +3450,10 @@ class TradingEngine:
         return round(price + distance if is_take else price - distance, 2)
 
     def cache_bars(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
+        # This legacy table has no provider in its uniqueness key. IBKR keeps
+        # its own adapter cache; frozen backtests store their full input separately.
+        if getattr(self.alpaca, 'broker_name', 'alpaca') != 'alpaca':
+            return
         with SessionLocal() as db:
             for timestamp, row in frame.iterrows():
                 existing = db.scalar(
@@ -3003,20 +3485,31 @@ class TradingEngine:
                     )
             db.commit()
 
-    @staticmethod
-    def _flatten_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @classmethod
+    def _flatten_orders(cls, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
         flattened: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: dict[str, int] = {}
 
         def visit(order: dict[str, Any], parent_id: str = "") -> None:
             current = dict(order)
             order_id = str(current.get("id") or "")
             if parent_id and not current.get("parent_order_id"):
                 current["parent_order_id"] = parent_id
-            if not order_id or order_id not in seen:
-                flattened.append(current)
+            if order_id and order_id in seen:
+                index = seen[order_id]
+                previous = flattened[index]
+                # Nested and top-level copies may disagree during a fill/cancel.
+                # Cumulative fills and terminal status must never go backwards.
+                if (as_float(current.get('filled_qty')), cls._order_is_terminal(current)) > (
+                    as_float(previous.get('filled_qty')), cls._order_is_terminal(previous)
+                ):
+                    flattened[index] = {**previous, **current}
+                elif current.get('parent_order_id') and not previous.get('parent_order_id'):
+                    previous['parent_order_id'] = current['parent_order_id']
+            else:
                 if order_id:
-                    seen.add(order_id)
+                    seen[order_id] = len(flattened)
+                flattened.append(current)
             for leg in order.get("legs") or []:
                 if isinstance(leg, dict):
                     visit(leg, order_id or parent_id)
@@ -3049,7 +3542,7 @@ class TradingEngine:
             orders = self._flatten_orders(
                 await asyncio.to_thread(self.alpaca.get_orders, "all")
             )
-            positions = await asyncio.to_thread(self.alpaca.get_positions)
+            all_orders_observed_at = datetime.now(timezone.utc).isoformat()
             with SessionLocal() as db:
                 pending_snapshot = db.scalars(
                     select(Signal).where(
@@ -3167,7 +3660,7 @@ class TradingEngine:
                             )
                             pending_by_client_id.pop(client_order_id, None)
 
-                    if record is None:
+                    if record is None or record.strategy_id is None:
                         parent_id = str(order.get("parent_order_id") or "")
                         parent = db.scalar(
                             select(OrderRecord).where(
@@ -3175,7 +3668,13 @@ class TradingEngine:
                                 OrderRecord.user_id == self.user_id,
                             )
                         ) if parent_id else None
-                        if parent is not None:
+                        if parent is None:
+                            parent = self._parent_record_for_leg(db, order)
+                        if parent is not None and parent.strategy_id and record is not None:
+                            record.strategy_id = parent.strategy_id
+                            record.signal_id = parent.signal_id
+                            record.filled_qty = 0.0
+                        elif parent is not None and record is None:
                             record = OrderRecord(
                                 user_id=self.user_id,
                                 id=order_id,
@@ -3229,6 +3728,7 @@ class TradingEngine:
                         record.filled_avg_price = as_float(order.get("filled_avg_price")) or None
                         record.raw = order
                         self._apply_fill_delta(db, record, order)
+                        self._register_order_legs(db, record, order)
                         is_sweep = bool(record.client_order_id and str(record.client_order_id).startswith("qp-sweep-"))
                         if (
                             record.strategy_id is None
@@ -3302,15 +3802,25 @@ class TradingEngine:
                     details={"source": "rest_reconciliation"},
                 ):
                     newly_quarantined.add(symbol)
-            for symbol, reason in self._audit_long_only_invariants(
-                positions, orders
-            ).items():
-                if self._activate_execution_incident(
-                    symbol,
-                    reason,
-                    details={"source": "long_only_invariant"},
-                ):
-                    newly_quarantined.add(symbol)
+            # Historical/all-order snapshots can retain canceled legs. They are
+            # for fill accounting, not a current executable-sell inventory.
+            async with self._order_submission_lock:
+                violations, snapshots = await self._audit_reconciliation_snapshot(orders, all_orders_observed_at)
+                already_held = {row.symbol for row in self._hold_incidents()}
+                for symbol, reason in violations.items():
+                    if symbol in already_held:
+                        continue
+                    lag = snapshots[symbol].get('kind') == 'entry_fill_lag'
+                    if self._activate_execution_incident(
+                        symbol, OWNERSHIP_LAG_REASON if lag else reason,
+                        details={'source': 'long_only_invariant', **snapshots[symbol]},
+                        destructive=not lag,
+                    ):
+                        if lag:
+                            await self.log('warning', 'risk', f'{symbol} {OWNERSHIP_LAG_REASON}，系统将自动复核')
+                        else:
+                            newly_quarantined.add(symbol)
+                await self._resolve_ownership_lag_holds()
             for symbol in sorted(newly_quarantined):
                 await self.log(
                     "critical",
@@ -3326,7 +3836,7 @@ class TradingEngine:
                 await self.log(
                     "info",
                     "order",
-                    f"{symbol} 不确定订单已通过 Alpaca 对账恢复",
+                    f"{symbol} 不确定订单已通过券商对账恢复",
                     {"client_order_id": client_order_id},
                 )
             for symbol, client_order_id in expired_pending:
@@ -3343,7 +3853,7 @@ class TradingEngine:
     async def connection_reconfiguration(
         self, reason: str
     ) -> AsyncIterator[None]:
-        """Freeze intent creation and POSTs while Paper credentials are replaced."""
+        """Freeze intent creation and POSTs while broker/account configuration is replaced."""
         completed = False
         async with self._order_submission_lock:
             with SessionLocal() as db:
@@ -3380,6 +3890,11 @@ class TradingEngine:
         """Manually resolve and clear active execution quarantines after verification."""
         cleared: list[str] = []
         async with self._order_submission_lock:
+            if not self.alpaca.configured:
+                raise ExecutionQuarantineError()
+            open_orders = await self._fresh_open_orders()
+            positions = await self._fresh_positions()
+            violations = self._audit_long_only_invariants(positions, open_orders)
             with SessionLocal() as db:
                 stmt = select(ExecutionIncident).where(
                     ExecutionIncident.user_id == self.user_id,
@@ -3388,11 +3903,29 @@ class TradingEngine:
                 if symbol:
                     stmt = stmt.where(ExecutionIncident.symbol == symbol.upper())
                 incidents = db.scalars(stmt).all()
+                for inc in incidents:
+                    signal_rows = db.scalars(select(Signal).where(
+                        Signal.user_id == self.user_id,
+                        Signal.symbol == inc.symbol,
+                    )).all()
+                    pending = any(
+                        signal.status in UNRESOLVED_ORDER_STATUSES
+                        or ((signal.payload or {}).get('trailing_stop_intent') or {}).get('status') in UNRESOLVED_ORDER_STATUSES
+                        for signal in signal_rows
+                    )
+                    has_open_order = any(
+                        str(order.get('symbol', '')).upper() == inc.symbol
+                        and not self._order_is_terminal(order) for order in open_orders
+                    )
+                    if inc.symbol in violations or has_open_order or pending:
+                        raise ExecutionQuarantineError()
                 now = datetime.now(timezone.utc)
                 for inc in incidents:
                     inc.status = "contained"
                     inc.resolved_at = now
-                    inc.details = {**(inc.details or {}), "resolution": "manual_admin_override"}
+                    inc.details = {**(inc.details or {}), 'resolution': 'manual_fresh_snapshot_safe',
+                                   'verified_at': now.isoformat(), 'verified_by_user_id': self.user_id,
+                                   'actual_qty': self._position_qty(positions, inc.symbol)}
                     cleared.append(inc.symbol)
                 db.commit()
         for sym in cleared:
@@ -3401,7 +3934,7 @@ class TradingEngine:
 
     async def resume(self, reason: str = "用户开启") -> None:
         if not self.alpaca.configured:
-            raise RuntimeError("请先配置 Alpaca Paper API 密钥")
+            raise RuntimeError("请先完成当前券商的模拟/真实账户连接配置")
         async with self._order_submission_lock:
             with SessionLocal() as db:
                 active_incident = db.scalar(
@@ -3503,7 +4036,7 @@ class TradingEngine:
                     StrategyPosition.user_id == self.user_id
                 ).update({StrategyPosition.qty: 0.0})
                 db.commit()
-        await self.log("critical", "risk", "已向 Alpaca 模拟盘发送全部平仓指令")
+        await self.log("critical", "risk", "已向当前券商账户发送全部平仓指令")
         await websocket_manager.broadcast(self.user_id, "engine", {"status": "liquidating"})
         return result
 
@@ -3574,11 +4107,54 @@ class TradingEngine:
         except Exception as exc:
             await self.log("warning", "risk", f"[现金管理] 自动赎回 {sweep_symbol} 失败: {exc}")
 
+    def last_cash_rotation_at(self) -> datetime | None:
+        """Last strategy buy or SGOV redemption; reinvestment waits after either."""
+        with SessionLocal() as db:
+            values = [
+                db.scalar(select(func.max(EventLog.created_at)).where(
+                    EventLog.user_id == self.user_id,
+                    EventLog.message.like('[现金管理] 买入 %自动市价卖出%'),
+                )),
+                db.scalar(select(func.max(OrderRecord.submitted_at)).where(
+                    OrderRecord.user_id == self.user_id,
+                    OrderRecord.strategy_id.is_not(None),
+                    OrderRecord.side == 'buy',
+                )),
+            ]
+        stamps = [value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+                  for value in values if value is not None]
+        return max(stamps) if stamps else None
+
+    def cash_sweep_status(self, risk_settings: RiskSettings, now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(timezone.utc)
+        paused_until = getattr(risk_settings, 'cash_sweep_paused_until', None)
+        if paused_until is not None and paused_until.tzinfo is None:
+            paused_until = paused_until.replace(tzinfo=timezone.utc)
+        last = self.last_cash_rotation_at()
+        cooldown_until = (last + timedelta(minutes=int(getattr(risk_settings, 'cash_sweep_cooldown_minutes', 0) or 0))
+                          if last else None)
+        if not getattr(risk_settings, 'cash_sweep_enabled', False):
+            state, reason, until = 'disabled', '自动现金管理未启用', None
+        elif paused_until and paused_until > now:
+            state, reason, until = 'paused', '自动买入已暂停（赎回仍可为策略买单释放资金）', paused_until
+        elif cooldown_until and cooldown_until > now:
+            state, reason, until = 'cooldown', '最近发生策略买入或赎回，冷却期内不再买入', cooldown_until
+        else:
+            state, reason, until = 'ready', '满足条件时可自动买入', None
+        return {'state': state, 'reason': reason, 'until': until, 'last_rotation_at': last,
+                'min_trade_usd': float(getattr(risk_settings, 'cash_sweep_min_trade_usd', 0) or 0)}
+
+    def cash_sweep_block_reason(self, risk_settings: RiskSettings) -> str:
+        status = self.cash_sweep_status(risk_settings)
+        return '' if status['state'] == 'ready' else status['reason']
+
     async def _execute_cash_sweep_investment(
         self,
         risk_settings: RiskSettings,
     ) -> None:
-        if not getattr(risk_settings, "cash_sweep_enabled", False):
+        if not getattr(self.alpaca,'supports_cash_sweep',True) or not getattr(risk_settings, "cash_sweep_enabled", False):
+            return
+        if self.cash_sweep_block_reason(risk_settings):
             return
         sweep_symbol = (risk_settings.cash_sweep_symbol or "SGOV").upper()
         try:
@@ -3602,18 +4178,30 @@ class TradingEngine:
             quote = quotes.get(sweep_symbol) or {}
             ask_price = as_float(quote.get("ask_price") or quote.get("price")) or 100.0
             invest_cash = cash - 50.0 # leave  buffer
+            if invest_cash < float(getattr(risk_settings, 'cash_sweep_min_trade_usd', 0) or 0):
+                return
             buy_qty = int(invest_cash // max(ask_price, 0.01))
             if buy_qty >= 1:
                 client_order_id = f"qp-sweep-buy-{uuid.uuid4().hex[:16]}"
-                await asyncio.to_thread(
-                    self.alpaca.submit_entry_order,
-                    symbol=sweep_symbol,
-                    qty=buy_qty,
-                    notional=None,
-                    order_type="market",
-                    time_in_force="day",
-                    client_order_id=client_order_id,
-                )
+                async with self._order_submission_lock:
+                    with SessionLocal() as db:
+                        state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
+                        current_risk = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
+                        pending = db.scalar(select(Signal.id).where(Signal.user_id == self.user_id, Signal.status.in_(UNRESOLVED_ORDER_STATUSES)))
+                        if (state is None or state.status != 'running' or current_risk is None
+                            or not current_risk.cash_sweep_enabled or pending is not None
+                            or self.cash_sweep_block_reason(current_risk)
+                            or self._active_incident_symbols()):
+                            return
+                    await asyncio.to_thread(
+                        self.alpaca.submit_entry_order,
+                        symbol=sweep_symbol,
+                        qty=buy_qty,
+                        notional=None,
+                        order_type="market",
+                        time_in_force="day",
+                        client_order_id=client_order_id,
+                    )
                 await self.log(
                     "info",
                     "order",

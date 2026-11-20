@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Trading from './Trading'
 
 const { api } = vi.hoisted(() => ({ api: vi.fn() }))
@@ -16,6 +16,7 @@ function renderPage() {
 }
 
 describe('Trading operational status', () => {
+  afterEach(cleanup)
   beforeEach(() => {
     api.mockReset()
   })
@@ -36,7 +37,7 @@ describe('Trading operational status', () => {
         definition: { symbols: ['SPY'], timeframe: '15Min' },
       }])
       if (path.startsWith('/api/signals')) return Promise.resolve([])
-      if (path.startsWith('/api/orders')) return Promise.reject(new Error('暂时无法确认开放订单'))
+      if (path.startsWith('/api/portfolio')) return Promise.reject(new Error('暂时无法确认开放订单'))
       return Promise.resolve({})
     })
 
@@ -48,5 +49,17 @@ describe('Trading operational status', () => {
     expect(screen.queryByText('ACTIVE')).not.toBeInTheDocument()
     expect(await screen.findByText('暂时无法确认开放订单')).toBeInTheDocument()
     expect(screen.queryByText('没有开放订单')).not.toBeInTheDocument()
+  })
+
+  it('shows the actual partial fill instead of only submitted status', async () => {
+    api.mockImplementation((path: string) => {
+      if (path === '/api/engine') return Promise.resolve({ status: 'paused', operational_status: 'paused', reason: '执行安全隔离' })
+      if (path.startsWith('/api/signals')) return Promise.resolve([{ id: 's', symbol: 'SPY', action: 'buy', price: 100,
+        status: 'submitted', execution_status: 'partially_filled_canceled', filled_qty: 12, reason: '突破' }])
+      return Promise.resolve([])
+    })
+    renderPage()
+    expect(await screen.findByText('部分成交后撤单/到期')).toBeInTheDocument()
+    expect(screen.getByText('12')).toBeInTheDocument()
   })
 })

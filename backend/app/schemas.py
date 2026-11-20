@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 Timeframe = Literal["5Min", "15Min", "30Min", "1Hour", "1Day"]
@@ -115,6 +115,13 @@ class StrategyRiskConfig(BaseModel):
     cooldown_bars: int = Field(default=1, ge=0, le=1000)
 
 
+class PaperValidationConfig(BaseModel):
+    expires_at: AwareDatetime
+    max_entries: int = Field(default=2, ge=1, le=4)
+    max_quantity: float = Field(default=1, gt=0, le=1)
+    max_notional: float = Field(default=1000, gt=0, le=2000)
+
+
 class RuleDefinition(BaseModel):
     version: Literal[1] = 1
     name: str = Field(min_length=1, max_length=120)
@@ -128,6 +135,7 @@ class RuleDefinition(BaseModel):
     position: PositionSizing = Field(default_factory=PositionSizing)
     order: OrderConfig = Field(default_factory=OrderConfig)
     risk: StrategyRiskConfig = Field(default_factory=StrategyRiskConfig)
+    paper_validation: PaperValidationConfig | None = None
 
     @field_validator("symbols")
     @classmethod
@@ -247,6 +255,9 @@ class RiskSettingsUpdate(BaseModel):
     cash_sweep_enabled: bool = Field(default=False)
     cash_sweep_symbol: str = Field(default="SGOV", max_length=16)
     cash_sweep_buffer_pct: float = Field(default=2.0, ge=0.0, le=20.0)
+    cash_sweep_paused_until: datetime | None = None
+    cash_sweep_cooldown_minutes: int = Field(default=60, ge=0, le=1440)
+    cash_sweep_min_trade_usd: float = Field(default=1000.0, ge=0, le=1_000_000)
 
 
 class RiskSettingsRead(RiskSettingsUpdate):
@@ -255,8 +266,21 @@ class RiskSettingsRead(RiskSettingsUpdate):
     id: int
 
 
+class LlmSettingsUpdate(BaseModel):
+    provider: Literal["openai", "openai_responses", "anthropic"] = "openai"
+    base_url: str = Field(min_length=8, max_length=500, pattern=r"^https?://")
+    model: str = Field(min_length=1, max_length=120)
+    api_key: str = Field(default="", max_length=4000)
+
+
+class StrategyDraftRequest(BaseModel):
+    text: str = Field(min_length=4, max_length=4000)
+    current_definition: dict[str, Any] | None = None
+
+
 class EngineAction(BaseModel):
     reason: str = Field(default="用户操作", max_length=300)
+    cancel_orders: bool = True
 
 
 class ConnectionConfigUpdate(BaseModel):
@@ -269,11 +293,25 @@ class ConnectionConfigUpdate(BaseModel):
 
 class ConnectionConfigRead(BaseModel):
     configured: bool
-    paper: Literal[True] = True
+    paper: bool = True
     source: Literal["web", "env", "none"]
     api_key_hint: str | None = None
-    feed: Literal["iex"] = "iex"
+    feed: str = "iex"
     updated_at: datetime | None = None
+
+
+class BrokerConfigTarget(BaseModel):
+    broker: Literal['alpaca', 'ibkr'] = 'alpaca'
+    trading_mode: Literal['paper', 'live'] = 'paper'
+    ibkr_gateway_url: str = 'https://127.0.0.1:5000/v1/api'
+    ibkr_account_id: str = ''
+    ibkr_verify_tls: bool = True
+    revision: int = Field(default=0, ge=0)
+
+
+class BrokerConfigUpdate(BrokerConfigTarget):
+    confirmation_text: str = ''
+    challenge_token: str = ''
 
 
 class AuthSetupRequest(BaseModel):

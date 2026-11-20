@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from .api import router, websocket_endpoint
 from .auth_api import router as auth_router
 from .users_api import router as users_router
+from .broker_api import router as broker_router
 from .config import get_settings
 from .database import SessionLocal, init_db
 from .models import AuthUser, BacktestRun, EngineState, utcnow
@@ -59,8 +60,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantPilot",
-    description="只连接 Alpaca Paper Trading 的自托管量化交易平台",
-    version="1.5.0",
+    description="支持 Alpaca Paper 与 IBKR 的自托管量化交易平台，默认模拟环境",
+    version="1.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -104,6 +105,7 @@ async def oauth_session_auth(request: Request, call_next):
 
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(broker_router)
 app.include_router(router)
 
 
@@ -176,7 +178,7 @@ async def spa(full_path: str):
     return JSONResponse(
         {
             "name": "QuantPilot API",
-            "paper": True,
+            "default_mode": "paper",
             "message": "前端尚未构建；开发模式请运行 Vite，或执行 Docker 构建。",
         }
     )

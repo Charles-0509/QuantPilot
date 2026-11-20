@@ -8,7 +8,7 @@ import { Badge, Button, Card, Empty, ErrorPanel, Loading, PageHeader } from '../
 
 const PRESET_GROUPS = [
   { label: '全部', value: 'ALL' },
-  { label: '运行中', value: 'RUNNING' },
+  { label: '已启用', value: 'RUNNING' },
   { label: '未启用', value: 'DISABLED' },
   { label: '15分钟线', value: '15Min' },
   { label: '日线', value: '1Day' },
@@ -111,7 +111,7 @@ export default function Strategies() {
             key={strategy.id}
             strategy={strategy}
             onAction={(action) => mutate.mutate({ id: strategy.id, action })}
-            onQuickBacktest={() => navigate(`/backtests?strategy=${strategy.id}&symbol=${strategy.definition.symbols[0] || 'SPY'}`)}
+            onQuickBacktest={() => navigate(`/backtests?strategy=${strategy.id}`)}
           />
         ))}
       </div>
@@ -136,7 +136,7 @@ export default function Strategies() {
             key={strategy.id}
             strategy={strategy}
             onAction={(action) => mutate.mutate({ id: strategy.id, action })}
-            onQuickBacktest={() => navigate(`/backtests?strategy=${strategy.id}&symbol=${strategy.definition.symbols[0] || 'SPY'}`)}
+            onQuickBacktest={() => navigate(`/backtests?strategy=${strategy.id}`)}
           />
         ))}
       </div>
@@ -164,7 +164,7 @@ function StrategyCard({
       <div className="strategy-card-top">
         <div className="strategy-orb">{strategy.is_template ? <Sparkles size={19} /> : <Settings2 size={19} />}</div>
         <Badge tone={strategy.is_template ? 'info' : strategy.enabled ? 'success' : 'neutral'}>
-          {strategy.is_template ? '内置模板' : strategy.enabled ? '运行中' : '未启用'}
+          {strategy.is_template ? '内置模板' : strategy.enabled ? '已启用' : '未启用'}
         </Badge>
       </div>
       <h3>{strategy.name}</h3>

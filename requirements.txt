@@ -8,6 +8,7 @@ alpaca-py==0.43.5
 requests>=2.32,<3
 pandas>=2.2,<3
 numpy>=2.0,<3
+exchange-calendars>=4.5,<5
 httpx>=0.28,<1
 python-multipart>=0.0.20,<1
 cryptography>=48.0.1,<49

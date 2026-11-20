@@ -8,3 +8,4 @@ backend/**/__pycache__
 backend/**/*.pyc
 .pytest_cache
 .DS_Store
+**/._*

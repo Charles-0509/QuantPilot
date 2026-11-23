@@ -69,6 +69,7 @@ from .services.engine import (
 )
 from .services.runtime import UserRuntime, UserRuntimeManager, build_alpaca, build_ibkr, with_market_data
 from .services.portfolio import build_portfolio, enabled_strategy_count
+from .services.market_cache import TIMEFRAMES as CACHE_TIMEFRAMES, MarketCache
 from .services.quotes import market_quotes
 from .services.strategy_safety import strategy_has_unresolved_execution
 from .services.websocket import websocket_manager
@@ -410,16 +411,30 @@ async def latest_quotes(
         raise service_error(exc) from exc
 
 
+def market_cache_for(request: Request, client: Any) -> MarketCache | None:
+    """The shared server cache, when this user's market data comes from Alpaca."""
+    cache = getattr(request.app.state, "market_cache", None)
+    source = getattr(client, "market_data_source", None) or getattr(client, "broker_name", "alpaca")
+    if cache is None or source != "alpaca" or not getattr(client, "configured", False):
+        return None
+    return cache if cache.available else None
+
+
 @router.get("/market/bars")
 async def market_bars(
+    request: Request,
     symbol: str,
     timeframe: str = "15Min",
     limit: int = Query(default=200, ge=20, le=1000),
     alpaca: AlpacaService = Depends(get_alpaca),
 ) -> list[dict[str, Any]]:
     try:
-        frames = await asyncio.to_thread(alpaca.recent_bars, [symbol.upper()], timeframe, limit)
-        frame = frames.get(symbol.upper())
+        cache = await asyncio.to_thread(market_cache_for, request, alpaca) if timeframe in CACHE_TIMEFRAMES else None
+        if cache is not None:
+            frame = await asyncio.to_thread(cache.bars, symbol.upper(), timeframe, limit)
+        else:
+            frames = await asyncio.to_thread(alpaca.recent_bars, [symbol.upper()], timeframe, limit)
+            frame = frames.get(symbol.upper())
         if frame is None or frame.empty:
             return []
         feed = frame.attrs.get('data_feed') or getattr(alpaca, 'feed', '')
@@ -623,24 +638,29 @@ def delete_watchlist_item(symbol: str, db: Session = Depends(get_db),
 
 
 @router.get("/market/watch-quotes")
-async def get_market_quotes(symbols: str = Query(default="", max_length=600),
+async def get_market_quotes(request: Request, symbols: str = Query(default="", max_length=600),
                             alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
     requested = [item.strip().upper() for item in symbols.split(",") if item.strip()][:40]
     if any(not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", item) for item in requested):
         raise HTTPException(status_code=422, detail="股票代码格式不正确")
     if not alpaca.configured:
         return {"as_of": datetime.now(timezone.utc), "errors": ["券商未配置"], "quotes": []}
+    cache = await asyncio.to_thread(market_cache_for, request, alpaca)
+    if cache is not None:
+        return await asyncio.to_thread(cache.quotes, requested)
     return await asyncio.to_thread(market_quotes, alpaca, requested)
 
 
 @router.get("/market/detail")
-async def get_market_detail(symbol: str, alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
+async def get_market_detail(request: Request, symbol: str, alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
     symbol = symbol.strip().upper()
     if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
         raise HTTPException(status_code=422, detail="股票代码格式不正确")
     if not alpaca.configured:
         raise HTTPException(status_code=409, detail="券商未配置")
-    quote = (await asyncio.to_thread(market_quotes, alpaca, [symbol]))["quotes"][0]
+    cache = await asyncio.to_thread(market_cache_for, request, alpaca)
+    reader = cache.quotes if cache is not None else (lambda items: market_quotes(alpaca, items))
+    quote = (await asyncio.to_thread(reader, [symbol]))["quotes"][0]
     try:
         asset = await asyncio.to_thread(alpaca.get_asset, symbol)
     except Exception:

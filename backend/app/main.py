@@ -17,9 +17,10 @@ from .users_api import router as users_router
 from .broker_api import router as broker_router
 from .config import get_settings
 from .database import SessionLocal, init_db
-from .models import AuthUser, BacktestRun, EngineState, utcnow
+from .models import AuthUser, BacktestRun, EngineState, WatchlistItem, utcnow
 from .services.auth import SESSION_COOKIE, authenticate_raw_token, authenticate_request, validate_csrf
-from .services.runtime import UserRuntimeManager
+from .services.market_cache import MarketCache
+from .services.runtime import UserRuntimeManager, build_alpaca
 from .templates import seed_templates, seed_user_defaults
 
 settings = get_settings()
@@ -27,6 +28,22 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+
+def market_data_client():
+    """A dedicated Alpaca data client (first active user with keys) for the shared market cache."""
+    with SessionLocal() as db:
+        user_ids = db.scalars(select(AuthUser.id).where(AuthUser.is_active.is_(True)).order_by(AuthUser.id)).all()
+    for user_id in user_ids:
+        client = build_alpaca(settings, user_id)
+        if client.configured:
+            return client
+    return None
+
+
+def watchlist_symbols() -> list[str]:
+    with SessionLocal() as db:
+        return sorted(set(db.scalars(select(WatchlistItem.symbol)).all()))
 
 
 @asynccontextmanager
@@ -54,7 +71,12 @@ async def lifespan(app: FastAPI):
     runtime_manager = UserRuntimeManager(settings)
     app.state.runtime_manager = runtime_manager
     await runtime_manager.start()
+    db_path = Path(settings.investor_db_path)
+    market_cache = MarketCache(market_data_client, (db_path if db_path.is_absolute() else Path.cwd() / db_path).parent / "market-cache")
+    app.state.market_cache = market_cache
+    market_cache.start(watchlist_symbols)
     yield
+    await market_cache.shutdown()
     await runtime_manager.shutdown()
 
 

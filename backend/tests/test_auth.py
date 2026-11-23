@@ -61,6 +61,7 @@ def auth_app(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(main, "SessionLocal", testing_session)
     monkeypatch.setattr(database, "SessionLocal", testing_session)
     monkeypatch.setattr(main, "UserRuntimeManager", FakeRuntimeManager)
+    monkeypatch.setattr(main, "market_data_client", lambda: None)  # no real market data in tests
     main.app.dependency_overrides[get_db] = override_db
     main.app.openapi_schema = None
     yield main.app, testing_session

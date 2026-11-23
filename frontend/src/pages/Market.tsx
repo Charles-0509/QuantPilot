@@ -90,7 +90,7 @@ export default function Market() {
         <button className="icon-button" title="刷新" aria-label="刷新行情" onClick={() => { bars.refetch(); quotes.refetch(); detail.refetch() }}><RefreshCw size={15} className={bars.isFetching ? 'spin' : ''} /></button>
       </div>
       <div className="market-chart-area">
-        {bars.isLoading ? <Loading label="正在获取K线" /> : bars.error && !bars.data ? <div style={{ padding: 20 }}><ErrorPanel message={(bars.error as Error).message} /></div>
+        {bars.isLoading ? <Loading label={timeframe === '1Day' ? '正在获取日线（该股票首次加载约需半分钟，之后由服务器缓存直接返回）' : '正在获取K线'} /> : bars.error && !bars.data ? <div style={{ padding: 20 }}><ErrorPanel message={(bars.error as Error).message} /></div>
           : bars.data?.length ? <MarketChart bars={bars.data} viewKey={`${symbol}-${timeframe}`} visibleMa={visibleMa} daily={timeframe === '1Day'} /> : <Empty title="没有行情数据" detail="该代码在当前周期没有已完成的 K 线。" />}
       </div>
       <p className="market-footnote">

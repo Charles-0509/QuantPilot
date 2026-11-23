@@ -7,6 +7,7 @@ import { connectionPresentation, errorCategoryLabel } from '../status'
 import type { AuthUser, ConnectionConfig, ConnectionStatus } from '../types'
 import BrokerSettingsPanel from '../components/BrokerSettingsPanel'
 import AiSettingsPanel from '../components/AiSettingsPanel'
+import { useMarketDataInfo } from '../components/MarketDataSourcePanel'
 
 export default function SettingsPage() {
   const client = useQueryClient()
@@ -17,12 +18,14 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState('')
   const connection = useQuery({ queryKey: ['connection'], queryFn: () => api<ConnectionStatus>('/api/connection'), refetchInterval: 15000 })
   const config = useQuery({ queryKey: ['connection-config'], queryFn: () => api<ConnectionConfig>('/api/connection/config') })
+  const marketData = useMarketDataInfo()
 
   const refresh = () => {
     client.invalidateQueries({ queryKey: ['connection'] })
     client.invalidateQueries({ queryKey: ['connection-config'] })
     client.invalidateQueries({ queryKey: ['dashboard'] })
     client.invalidateQueries({ queryKey: ['engine'] })
+    client.invalidateQueries({ queryKey: ['market-data-info'] })
   }
   const save = useMutation({
     mutationFn: () => api<ConnectionConfig>('/api/connection/config', {
@@ -33,7 +36,7 @@ export default function SettingsPage() {
       setApiKeyId('')
       setApiSecretKey('')
       setFormError('')
-      setNotice('Alpaca Paper 配置已验证并保存。交易引擎已暂停，请在自动交易页面确认后重新启动。')
+      setNotice(connection.data?.broker === 'ibkr' ? 'Alpaca 行情密钥已验证并保存，行情来源已更新；IBKR 交易不受影响。' : 'Alpaca Paper 配置已验证并保存。交易引擎已暂停，请在自动交易页面确认后重新启动。')
       refresh()
     },
     onError: (error: Error) => setFormError(error instanceof ApiError ? error.message : '保存连接配置失败，请稍后重试'),
@@ -67,7 +70,7 @@ export default function SettingsPage() {
     save.mutate()
   }
   const removeWebConfig = () => {
-    if (window.confirm('移除当前账户保存的 Alpaca Paper 密钥并暂停交易引擎？')) {
+    if (window.confirm(status?.broker === 'ibkr' ? '移除 Alpaca 行情密钥？行情将改用 IBKR。' : '移除当前账户保存的 Alpaca Paper 密钥并暂停交易引擎？')) {
       setNotice('')
       remove.mutate()
     }
@@ -83,8 +86,8 @@ export default function SettingsPage() {
     <BrokerSettingsPanel />
     <AiSettingsPanel />
     <div className="two-column">
-      {status?.broker !== 'ibkr' && <Card>
-        <div className="card-header"><div><h2>Alpaca Paper 连接</h2><p>保存前会连接 Alpaca Paper 验证账户</p></div><ShieldCheck size={19} color="#3df6de" /></div>
+      <Card>
+        <div className="card-header"><div><h2>{status?.broker === 'ibkr' ? 'Alpaca 行情密钥' : 'Alpaca Paper 连接'}</h2><p>{status?.broker === 'ibkr' ? '只用于读取免费行情，不会在 Alpaca 下单；免费注册的 Paper 账户密钥即可' : '保存前会连接 Alpaca Paper 验证账户'}</p></div><ShieldCheck size={19} color="#3df6de" /></div>
         <form className="form-section" onSubmit={submit}>
           <Field label="API Key ID" hint="填入 Alpaca Paper Account 生成的 Key ID；保存后只显示末四位。">
             <input aria-label="API Key ID" autoComplete="off" value={apiKeyId} onChange={(event) => setApiKeyId(event.target.value)} placeholder={saved?.api_key_hint ? `当前已保存 ${saved.api_key_hint}，输入新值以替换` : '输入 Alpaca Paper API Key ID'} />
@@ -95,9 +98,6 @@ export default function SettingsPage() {
               <button type="button" className="icon-button input-action" onClick={() => setShowSecret((value) => !value)} title={showSecret ? '隐藏 Secret' : '显示 Secret'} aria-label={showSecret ? '隐藏 Secret' : '显示 Secret'}>{showSecret ? <EyeOff size={16} /> : <Eye size={16} />}</button>
             </div>
           </Field>
-          <Field label="行情数据源" hint="Alpaca 接入固定使用免费 IEX 和 Paper，不提供 SIP 或 Alpaca 实盘选择。">
-            <select aria-label="行情数据源" value="iex" disabled><option value="iex">IEX 免费实时行情</option></select>
-          </Field>
           {formError && <div className="form-error" role="alert">{formError}</div>}
           {notice && <div className="success-callout" role="status">{notice}</div>}
           <div className="settings-actions">
@@ -105,15 +105,16 @@ export default function SettingsPage() {
             {saved?.source === 'web' && <Button type="button" variant="danger" disabled={save.isPending || remove.isPending} onClick={removeWebConfig}><Trash2 size={15} />{remove.isPending ? '正在移除...' : '移除网页配置'}</Button>}
           </div>
         </form>
-      </Card>}
+      </Card>
       <Card>
         <div className="card-header"><div><h2>当前连接状态</h2><p>当前券商与交易环境</p></div>{connectionView.state === 'connected' ? <CheckCircle2 size={19} color={statusIconColor} /> : <WifiOff size={19} color={statusIconColor} />}</div>
         <div className="card-pad stack">
           <StatusRow icon={<ShieldCheck size={16} />} label="运行状态" value={connectionView.label} />
           <StatusRow icon={<KeyRound size={16} />} label="配置来源" value={sourceLabel} />
+          {status?.broker === 'ibkr' && <StatusRow icon={<KeyRound size={16} />} label="Alpaca 行情密钥" value={saved?.configured ? (saved.api_key_hint || '已保存') : '尚未配置'} />}
           <StatusRow icon={<KeyRound size={16} />} label={status?.broker === 'ibkr' ? '账户ID' : 'API 密钥'} value={status?.broker === 'ibkr' ? (status.account_id || '尚未选择') : saved?.configured ? (saved.api_key_hint || '已保存') : '尚未配置'} />
           <StatusRow icon={<LockKeyhole size={16} />} label="交易环境" value={status?.paper === false ? 'IBKR 真实账户' : 'Paper Trading'} />
-          <StatusRow icon={<Server size={16} />} label="行情数据源" value={status?.broker === 'ibkr' ? 'IBKR 行情订阅' : 'IEX 免费实时数据'} />
+          <StatusRow icon={<Server size={16} />} label="行情数据源" value={marketData.data ? `${marketData.data.label}：盘中 ${marketData.data.live}；历史 ${marketData.data.history}` : '—'} />
           <StatusRow icon={<Database size={16} />} label="最后更新" value={saved?.updated_at ? formatTime(saved.updated_at) : '—'} />
           <StatusRow icon={<CheckCircle2 size={16} />} label="最近连接成功" value={formatTime(status?.last_success_at)} />
           <StatusRow icon={<WifiOff size={16} />} label="最近连接失败" value={formatTime(status?.last_failure_at)} />

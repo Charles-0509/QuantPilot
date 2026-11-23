@@ -14,7 +14,7 @@ from .api import current_user_id, get_runtime
 from .database import get_db
 from .config import get_settings
 from .models import BrokerSettings, BrokerLiveChallenge, EventLog, RiskSettings
-from .schemas import BrokerConfigTarget, BrokerConfigUpdate
+from .schemas import BrokerConfigTarget, BrokerConfigUpdate, MarketDataSourceUpdate
 from .services.broker_config import (
     normalize_target,
     context_hash,
@@ -24,7 +24,8 @@ from .services.broker_config import (
     DISCLAIMER_VERSION,
 )
 from .services.ibkr_service import IBKRService, IBKRError
-from .services.runtime import UserRuntime, UserRuntimeManager, build_ibkr
+from .services.runtime import UserRuntime, UserRuntimeManager, build_alpaca, build_ibkr, with_market_data
+from .services.market_data import market_data_info
 from .services.engine import ConnectionReconfigurationBlockedError
 
 router = APIRouter(prefix="/api/brokers")
@@ -36,6 +37,39 @@ def target_values(payload):
         return normalize_target(payload)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/market-data")
+def market_data_status(runtime: UserRuntime = Depends(get_runtime)):
+    return market_data_info(runtime.alpaca)
+
+
+@router.put("/market-data")
+async def set_market_data_source(
+    payload: MarketDataSourceUpdate,
+    db: Session = Depends(get_db),
+    runtime: UserRuntime = Depends(get_runtime),
+    user_id: int = Depends(current_user_id),
+):
+    """Only bar/quote reads move; orders, positions and account stay on the broker."""
+    async with _configuration_lock:
+        current = db.get(BrokerSettings, user_id)
+        if current is None:
+            current = BrokerSettings(user_id=user_id)
+            db.add(current)
+        if payload.source == 'alpaca' and current.broker == 'ibkr' and not build_alpaca(runtime.alpaca.settings, user_id).configured:
+            raise HTTPException(status_code=422, detail='请先在设置页填写 Alpaca 密钥（免费账户即可），才能使用 Alpaca 行情')
+        current.market_data_source = payload.source
+        db.add(EventLog(user_id=user_id, category='broker', level='info',
+                        message=f"行情来源改为 {'Alpaca 免费行情' if payload.source == 'alpaca' else 'IBKR 行情'}",
+                        details={'source': payload.source}))
+        db.commit()
+        db.refresh(current)
+        if current.broker == 'ibkr':
+            client = with_market_data(runtime.alpaca.settings, user_id, current,
+                                      build_ibkr(runtime.alpaca.settings, current))
+            await runtime.replace_broker(client)
+    return {**market_data_info(runtime.alpaca), "configured_source": current.market_data_source}
 
 
 @router.get("/config")
@@ -222,7 +256,8 @@ async def change_broker(
             db.commit()
             db.refresh(current)
             if values["broker"] == "ibkr":
-                client = build_ibkr(runtime.alpaca.settings, current)
+                client = with_market_data(runtime.alpaca.settings, user_id, current,
+                                          build_ibkr(runtime.alpaca.settings, current))
             else:
                 # Current config already points to Alpaca; the factory loads only this user's keys.
                 client = UserRuntimeManager(runtime.alpaca.settings)._build(user_id).alpaca

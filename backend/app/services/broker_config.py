@@ -71,6 +71,7 @@ def current_config(row, *, default_gateway_url="https://127.0.0.1:5000/v1/api"):
         "ibkr_account_id": row.ibkr_account_id if row else "",
         "ibkr_verify_tls": row.ibkr_verify_tls if row else True,
         "revision": row.revision if row else 0,
+        "market_data_source": getattr(row, "market_data_source", None) or "alpaca",
         "updated_at": row.updated_at if row else None,
     }
 

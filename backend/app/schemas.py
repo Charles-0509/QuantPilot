@@ -186,6 +186,7 @@ class BacktestRequest(BaseModel):
     commission: float = Field(default=0, ge=0)
     symbols: list[str] | None = Field(default=None, min_length=1, max_length=10)
     benchmark: str = "SPY"
+    data_feed: Literal["sip", "iex"] = "sip"
 
     @field_validator("symbols")
     @classmethod
@@ -307,6 +308,10 @@ class BrokerConfigTarget(BaseModel):
     ibkr_account_id: str = ''
     ibkr_verify_tls: bool = True
     revision: int = Field(default=0, ge=0)
+
+
+class MarketDataSourceUpdate(BaseModel):
+    source: Literal['alpaca', 'ibkr'] = 'alpaca'
 
 
 class BrokerConfigUpdate(BrokerConfigTarget):

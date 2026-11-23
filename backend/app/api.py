@@ -16,6 +16,7 @@ from .database import SessionLocal, get_db
 from .models import (
     BacktestRun,
     BacktestArtifact,
+    BrokerSettings,
     ConnectionConfig,
     EngineState,
     EventLog,
@@ -60,7 +61,7 @@ from .services.engine import (
     StrategyExecutionActiveError,
     TradingEngine,
 )
-from .services.runtime import UserRuntime, UserRuntimeManager
+from .services.runtime import UserRuntime, UserRuntimeManager, build_alpaca, build_ibkr, with_market_data
 from .services.portfolio import build_portfolio, enabled_strategy_count
 from .services.strategy_safety import strategy_has_unresolved_execution
 from .services.websocket import websocket_manager
@@ -225,10 +226,26 @@ def connection(alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
     return alpaca.connection_status()
 
 
+def data_keys_client(alpaca: Any, user_id: int) -> AlpacaService:
+    """The Alpaca client holding this user's keys (the broker itself, or the data source)."""
+    if getattr(alpaca, 'broker_name', 'alpaca') == 'alpaca':
+        return alpaca
+    return getattr(alpaca, 'data', None) or build_alpaca(alpaca.settings, user_id)
+
+
 @router.get("/connection/config", response_model=ConnectionConfigRead)
-def connection_config(alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
+def connection_config(alpaca: AlpacaService = Depends(get_alpaca),
+                      user_id: int = Depends(current_user_id)) -> dict[str, Any]:
     """Return connection metadata only; API secrets are never returned."""
-    return alpaca.connection_config()
+    return data_keys_client(alpaca, user_id).connection_config()
+
+
+async def rebuild_market_data(runtime: UserRuntime, user_id: int) -> None:
+    with SessionLocal() as db:
+        broker_settings = db.get(BrokerSettings, user_id)
+    client = with_market_data(runtime.alpaca.settings, user_id, broker_settings,
+                              build_ibkr(runtime.alpaca.settings, broker_settings))
+    await runtime.replace_broker(client)
 
 
 @router.put("/connection/config", response_model=ConnectionConfigRead)
@@ -237,10 +254,10 @@ async def update_connection_config(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
     engine: TradingEngine = Depends(get_engine),
+    runtime: UserRuntime = Depends(get_runtime),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
-    if getattr(alpaca,'broker_name','alpaca') != 'alpaca':
-        raise HTTPException(status_code=409, detail='请先切换至Alpaca，再更新Alpaca密钥')
+    data_only = getattr(alpaca, 'broker_name', 'alpaca') != 'alpaca'
     api_key_id = payload.api_key_id.strip()
     api_secret_key = payload.api_secret_key.strip()
     if not AlpacaService._credentials_valid(api_key_id, api_secret_key):
@@ -258,6 +275,18 @@ async def update_connection_config(
         api_secret_cipher = encrypt_credential(api_secret_key, alpaca.settings)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="无法安全保存本机 Alpaca 配置") from exc
+
+    if data_only:
+        # IBKR executes; these keys only feed bars/quotes, so trading is not paused.
+        saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
+        if saved is None:
+            db.add(ConnectionConfig(user_id=user_id, api_key_cipher=api_key_cipher,
+                                    api_secret_cipher=api_secret_cipher, data_feed="iex"))
+        else:
+            saved.api_key_cipher, saved.api_secret_cipher, saved.data_feed = api_key_cipher, api_secret_cipher, "iex"
+        db.commit()
+        await rebuild_market_data(runtime, user_id)
+        return data_keys_client(runtime.alpaca, user_id).connection_config()
 
     reason = "Alpaca 连接配置已更新，请检查后重新启动引擎"
     try:
@@ -298,10 +327,16 @@ async def delete_connection_config(
     db: Session = Depends(get_db),
     alpaca: AlpacaService = Depends(get_alpaca),
     engine: TradingEngine = Depends(get_engine),
+    runtime: UserRuntime = Depends(get_runtime),
     user_id: int = Depends(current_user_id),
 ) -> dict[str, Any]:
-    if getattr(alpaca,'broker_name','alpaca') != 'alpaca':
-        raise HTTPException(status_code=409, detail='请先切换至Alpaca，再移除Alpaca配置')
+    if getattr(alpaca, 'broker_name', 'alpaca') != 'alpaca':
+        saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
+        if saved is not None:
+            db.delete(saved)
+            db.commit()
+        await rebuild_market_data(runtime, user_id)
+        return data_keys_client(runtime.alpaca, user_id).connection_config()
     reason = "已移除网页 Alpaca 配置，请检查后重新启动引擎"
     try:
         async with engine.connection_reconfiguration(reason):
@@ -380,6 +415,7 @@ async def market_bars(
         frame = frames.get(symbol.upper())
         if frame is None or frame.empty:
             return []
+        feed = frame.attrs.get('data_feed') or getattr(alpaca, 'feed', '')
         return [
             {
                 "timestamp": index.isoformat(),
@@ -388,6 +424,7 @@ async def market_bars(
                 "low": float(row["low"]),
                 "close": float(row["close"]),
                 "volume": float(row["volume"]),
+                "feed": feed,
             }
             for index, row in frame.tail(limit).iterrows()
         ]
@@ -791,18 +828,21 @@ async def execute_backtest_job(
             requested = list(dict.fromkeys([*definition.symbols, payload.benchmark]))
             history_bars = max(definition.warmup_bars, required_history(definition))
             history_start = payload.start - timedelta(days=AlpacaService._recent_window_days(definition.timeframe, history_bars))
+            feed_kwargs = {'feed': payload.data_feed} if hasattr(getattr(alpaca, 'data', alpaca), '_sip_history_available') else {}
             frames = alpaca.get_bars(
                 requested,
                 definition.timeframe,
                 history_start,
                 payload.end,
                 use_cache=True,
+                **feed_kwargs,
             )
             for symbol in requested:
                 if symbol not in frames or frames[symbol].empty:
                     raise ValueError(f'{symbol} 缺少回测行情，无法生成可信结果')
             artifact, metadata = pack_experiment(definition_data, payload_data, frames, frozen_risk,
-                data_feed=getattr(alpaca,'feed','iex'), adjustment=getattr(alpaca,'history_adjustment','all'))
+                data_feed=frames[requested[0]].attrs.get('data_feed') or getattr(alpaca,'feed','iex'),
+                adjustment=getattr(alpaca,'history_adjustment','all'))
             metadata['warnings'] = [
                 f'{symbol} 在区间开始时预热不足（需要 {history_bars} 根）；数据满足前不会生成信号'
                 for symbol in definition.symbols

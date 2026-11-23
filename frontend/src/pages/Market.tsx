@@ -39,7 +39,7 @@ export default function Market() {
           {last && <div style={{ marginLeft: 'auto' }}><span className="eyebrow">LATEST CLOSE</span><div style={{ fontSize: 25, fontWeight: 700, marginTop: 5 }}>${Number(last.close).toFixed(2)}</div></div>}
         </div>
         <p className="field-hint" style={{ padding: '0 20px' }}>
-          最新已完成K线起始时间：{formatTime(last?.timestamp)} · 最近读取成功：{bars.dataUpdatedAt ? formatTime(new Date(bars.dataUpdatedAt).toISOString()) : '尚未成功'}
+          数据：{last?.feed === 'sip' ? 'SIP 全市场（15 分钟前）' : last?.feed === 'iex' ? 'IEX 实时（成交量只含 IEX）' : last?.feed || '—'} · 最新已完成K线起始时间：{formatTime(last?.timestamp)} · 最近读取成功：{bars.dataUpdatedAt ? formatTime(new Date(bars.dataUpdatedAt).toISOString()) : '尚未成功'}
           {bars.error ? ' · 刷新失败，显示的数据为缓存' : ' · 每15秒刷新'}
         </p>
         {bars.isLoading ? <Loading label="正在获取券商 K线" /> : bars.error ? <div style={{ padding: 20 }}><ErrorPanel message={(bars.error as Error).message} /></div> : bars.data?.length ? <CandleChart bars={bars.data} /> : <Empty title="没有行情数据" />}

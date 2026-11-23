@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, PlugZap, ShieldCheck } from 'lucide-react'
 import { api } from '../api'
 import { Badge, Button, Card, Field } from './UI'
+import MarketDataSourcePanel from './MarketDataSourcePanel'
 
 export type BrokerConfig = {
   broker: 'alpaca' | 'ibkr'
@@ -11,6 +12,7 @@ export type BrokerConfig = {
   ibkr_account_id: string
   ibkr_verify_tls: boolean
   revision: number
+  market_data_source?: 'alpaca' | 'ibkr'
 }
 const defaults: BrokerConfig = { broker: 'alpaca', trading_mode: 'paper', ibkr_gateway_url: 'https://127.0.0.1:5000/v1/api', ibkr_account_id: '', ibkr_verify_tls: true, revision: 0 }
 type Challenge = { challenge_token: string; disclaimer: string; account_id: string; expires_at: string }
@@ -83,7 +85,8 @@ export default function BrokerSettingsPanel() {
   }
   const live = config.data?.broker === 'ibkr' && config.data.trading_mode === 'live'
 
-  return <Card style={{ marginBottom: 16 }}>
+  return <>
+  <Card style={{ marginBottom: 16 }}>
     <div className="card-header"><div><h2>券商与交易账户</h2><p>Alpaca Paper / IBKR；新连接默认模拟环境</p></div><Badge tone={live ? 'danger' : 'info'}>{live ? 'IBKR 真实账户' : '模拟环境'}</Badge></div>
     <div className="form-section">
       <Field label="选择券商"><select aria-label="选择券商" value={target.broker} onChange={(e) => edit({ broker: e.target.value as BrokerConfig['broker'] })}><option value="alpaca">Alpaca Paper</option><option value="ibkr">Interactive Brokers（IBKR）</option></select></Field>
@@ -125,4 +128,6 @@ export default function BrokerSettingsPanel() {
       </section>
     </div>}
   </Card>
+  {config.data && <MarketDataSourcePanel broker={config.data.broker} configuredSource={config.data.market_data_source || 'alpaca'} />}
+  </>
 }

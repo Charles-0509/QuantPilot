@@ -15,6 +15,7 @@ from app.services.credentials import CredentialDecryptionError, decrypt_credenti
 from app.services.engine import TradingEngine
 from app.services.ibkr_service import IBKRService
 from app.services.broker_config import live_context
+from app.services.market_data import MarketDataRouter
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,37 @@ def build_ibkr(settings, saved):
         client_id_resolver=resolve, submission_attempted=attempted)
 
 
+def build_alpaca(settings, user_id: int) -> AlpacaService:
+    # Environment credentials are retained as a backwards-compatible fallback
+    # for the original administrator only. Web credentials always take priority.
+    alpaca = AlpacaService(settings, use_env=user_id == 1)
+    with SessionLocal() as db:
+        saved = db.scalar(select(ConnectionConfig).where(ConnectionConfig.user_id == user_id))
+        if saved is not None:
+            try:
+                alpaca.configure(
+                    decrypt_credential(saved.api_key_cipher, settings),
+                    decrypt_credential(saved.api_secret_cipher, settings),
+                    feed=saved.data_feed,
+                    source="web",
+                    updated_at=saved.updated_at,
+                )
+            except (CredentialDecryptionError, ValueError):
+                logger.warning("Stored Alpaca credentials for user %s could not be decrypted", user_id)
+    return alpaca
+
+
+def with_market_data(settings, user_id: int, broker_settings, client):
+    """Use the user's Alpaca keys for bars and quotes when trading on IBKR."""
+    if getattr(broker_settings, 'market_data_source', 'alpaca') != 'alpaca':
+        return client
+    data = build_alpaca(settings, user_id)
+    if not data.configured:
+        logger.warning("Alpaca market data selected but user %s has no Alpaca keys; using IBKR data", user_id)
+        return client
+    return MarketDataRouter(client, data)
+
+
 class UserRuntimeManager:
     """Owns one selected broker client and engine per active QuantPilot user."""
 
@@ -77,26 +109,9 @@ class UserRuntimeManager:
         with SessionLocal() as db:
             broker_settings = db.get(BrokerSettings, user_id)
         if broker_settings is not None and broker_settings.broker == 'ibkr':
-            client = build_ibkr(self.settings, broker_settings)
+            client = with_market_data(self.settings, user_id, broker_settings, build_ibkr(self.settings, broker_settings))
             return UserRuntime(alpaca=client, engine=TradingEngine(self.settings, client, user_id=user_id))
-        # Environment credentials are retained as a backwards-compatible fallback
-        # for the original administrator only. Web credentials always take priority.
-        alpaca = AlpacaService(self.settings, use_env=user_id == 1)
-        with SessionLocal() as db:
-            saved = db.scalar(
-                select(ConnectionConfig).where(ConnectionConfig.user_id == user_id)
-            )
-            if saved is not None:
-                try:
-                    alpaca.configure(
-                        decrypt_credential(saved.api_key_cipher, self.settings),
-                        decrypt_credential(saved.api_secret_cipher, self.settings),
-                        feed=saved.data_feed,
-                        source="web",
-                        updated_at=saved.updated_at,
-                    )
-                except (CredentialDecryptionError, ValueError):
-                    logger.warning("Stored Alpaca credentials for user %s could not be decrypted", user_id)
+        alpaca = build_alpaca(self.settings, user_id)
         return UserRuntime(alpaca=alpaca, engine=TradingEngine(self.settings, alpaca, user_id=user_id))
 
     async def ensure(self, user_id: int) -> UserRuntime:

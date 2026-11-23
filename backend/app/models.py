@@ -290,6 +290,7 @@ class BrokerSettings(Base):
     ibkr_gateway_url: Mapped[str] = mapped_column(String(500), default='https://127.0.0.1:5000/v1/api')
     ibkr_account_id: Mapped[str] = mapped_column(String(32), default='')
     ibkr_verify_tls: Mapped[bool] = mapped_column(Boolean, default=True)
+    market_data_source: Mapped[str] = mapped_column(String(16), default='alpaca')
     revision: Mapped[int] = mapped_column(Integer, default=0)
     live_consent_context: Mapped[str | None] = mapped_column(String(64), nullable=True)
     live_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

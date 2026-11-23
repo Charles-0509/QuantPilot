@@ -18,6 +18,7 @@ import {
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import { connectionPresentation } from '../status'
+import { useMarketDataInfo } from './MarketDataSourcePanel'
 import type { AuthUser, ConnectionStatus } from '../types'
 import { Badge } from './UI'
 
@@ -94,6 +95,7 @@ export default function Shell() {
     },
   })
   const connectionView = connectionPresentation(connection.data, Boolean(connection.error))
+  const marketData = useMarketDataInfo()
 
   return (
     <div className="app-shell">
@@ -125,7 +127,7 @@ export default function Shell() {
         <div className="topbar">
           <div className="topbar-context">
             <BarChart3 size={17} />
-            <span>美股 / ETF · IEX 免费行情</span>
+            <span>美股 / ETF · {marketData.data?.label || '行情来源待确认'}</span>
           </div>
           <div className="connection-status">
             <span className={`connection-dot ${connectionView.dotClass}`} />

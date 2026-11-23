@@ -53,6 +53,7 @@ export default function Backtests() {
   const [strategyId, setStrategyId] = useState(linkedStrategy)
   const [symbolInput, setSymbolInput] = useState('')
   const [benchmark, setBenchmark] = useState('SPY')
+  const [dataFeed, setDataFeed] = useState<'sip' | 'iex'>('sip')
   const [start, setStart] = useState(shanghaiDateOffset(-365))
   const [end, setEnd] = useState(shanghaiDateOffset(-1))
   const [capital, setCapital] = useState(100000)
@@ -107,6 +108,7 @@ export default function Backtests() {
         slippage_bps: slippage,
         commission,
         benchmark,
+        data_feed: dataFeed,
       }),
     }),
     onSuccess: (created) => {
@@ -158,7 +160,7 @@ export default function Backtests() {
 
     <Card style={{ marginBottom: 16 } as any}>
       <div className="form-section">
-        <div className="form-section-title"><div><h3>配置回测任务</h3><p>历史行情来自 Alpaca IEX；覆盖标的只影响本次回测，不会修改原策略。</p></div><FlaskConical size={19} color="#3df6de" /></div>
+        <div className="form-section-title"><div><h3>配置回测任务</h3><p>历史行情来自 Alpaca，默认用 SIP 全市场数据；覆盖标的只影响本次回测，不会修改原策略。</p></div><FlaskConical size={19} color="#3df6de" /></div>
         <div className="backtest-form-grid">
           <Field label="选择策略" hint="使用该策略的指标、入场、离场、仓位和风控规则。">
             <select aria-label="选择策略" value={strategyId} onChange={(event) => setStrategyId(event.target.value)}>
@@ -171,6 +173,12 @@ export default function Backtests() {
           <Field label="对比基准" hint="衡量策略是否优于代表性市场ETF。">
             <select aria-label="对比基准" value={benchmark} onChange={(event) => setBenchmark(event.target.value)}>
               {BENCHMARKS.map(([symbol, label]) => <option key={symbol} value={symbol}>{symbol} · {label}</option>)}
+            </select>
+          </Field>
+          <Field label="行情数据" hint="SIP 成交量覆盖全市场，更贴近真实；盘中实盘信号用 IEX，含成交量条件的分钟线策略可选 IEX 与实盘同源。">
+            <select aria-label="行情数据" value={dataFeed} onChange={(event) => setDataFeed(event.target.value as 'sip' | 'iex')}>
+              <option value="sip">SIP 全市场（推荐）</option>
+              <option value="iex">IEX（与盘中实盘同源）</option>
             </select>
           </Field>
           <Field label="开始日期"><input aria-label="开始日期" type="date" value={start} onChange={(event) => setStart(event.target.value)} /></Field>
@@ -200,7 +208,7 @@ export default function Backtests() {
       {result.error && <ErrorPanel message={result.error} />}
       {result.status === 'completed' && <>
         <div className="warning-callout">
-          {result.parameters.dataset_sha256 ? <>实验已冻结规则、风控与行情快照。策略版本：{String(result.parameters.strategy_version ?? '未知')} · <a href={`/api/backtests/${result.id}/artifact`}>下载实验快照</a></> : '此历史结果未保存完整实验快照，请重新回测后用于比较。'}
+          {result.parameters.dataset_sha256 ? <>实验已冻结规则、风控与行情快照。策略版本：{String(result.parameters.strategy_version ?? '未知')} · 行情：{result.parameters.data_feed === 'sip' ? 'SIP 全市场' : result.parameters.data_feed === 'iex' ? 'IEX' : String(result.parameters.data_feed ?? '未知')} · <a href={`/api/backtests/${result.id}/artifact`}>下载实验快照</a></> : '此历史结果未保存完整实验快照，请重新回测后用于比较。'}
           {Array.isArray(result.parameters.warnings) && result.parameters.warnings.map((warning, index) => <p key={index}>{String(warning)}</p>)}
           <br />费用与滑点计入结果；“—”表示样本不足或指标无法计算。期末未平仓按最后收盘价模拟平仓。
         </div>

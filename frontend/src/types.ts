@@ -339,6 +339,8 @@ export type StrategyDraft = {
   warnings: string[]
 }
 
+export type MarketDataInfo = { source: 'alpaca' | 'ibkr'; label: string; live: string; history: string; configured_source?: 'alpaca' | 'ibkr' }
+
 export type AiProvider = 'openai' | 'openai_responses' | 'anthropic'
 
 export type AiSettings = { configured: boolean; provider: AiProvider; base_url: string; model: string; updated_at: string | null }

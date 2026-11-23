@@ -43,6 +43,7 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
+SIP_HISTORY_DELAY_MINUTES = 16
 
 
 class AlpacaServiceError(RuntimeError):
@@ -307,6 +308,8 @@ class AlpacaService:
         self.api_key_id = ""
         self.api_secret_key = ""
         self.feed = "iex"
+        # Free accounts may read consolidated SIP history older than 15 minutes.
+        self._sip_history_available: bool | None = None
         self.source = "none"
         self.configuration_updated_at: datetime | None = None
         self.historical: StockHistoricalDataClient | None = None
@@ -1018,14 +1021,24 @@ class AlpacaService:
         end: datetime,
         limit: int | None = None,
         use_cache: bool = False,
+        feed: str = "iex",
     ) -> dict[str, pd.DataFrame]:
         normalized_symbols = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if feed == "sip" and self._sip_history_available is False:
+            feed = "iex"
+        if feed == "sip":
+            end = min(end, datetime.now(timezone.utc) - timedelta(minutes=SIP_HISTORY_DELAY_MINUTES))
         cache_key = (
             tuple(normalized_symbols),
             timeframe,
             start.isoformat(),
             end.isoformat(),
             limit,
+            feed,
         )
         if use_cache:
             with self._bars_cache_lock:
@@ -1049,11 +1062,24 @@ class AlpacaService:
             limit=request_limit,
             sort=Sort.DESC if request_limit is not None else Sort.ASC,
             adjustment=Adjustment.ALL,
-            feed=DataFeed.IEX,
+            feed=DataFeed.SIP if feed == "sip" else DataFeed.IEX,
         )
-        response = self._data_read(
-            "stock_bars", lambda: self.historical.get_stock_bars(request)
-        )
+        try:
+            response = self._data_read(
+                "stock_bars_sip" if feed == "sip" else "stock_bars",
+                lambda: self.historical.get_stock_bars(request),
+            )
+            if feed == "sip":
+                self._sip_history_available = True
+        except AlpacaServiceError as exc:
+            if feed != "sip" or self._http_status(exc.__cause__ or exc) not in {403, 422}:
+                raise
+            self._mark_operation_success("data", "stock_bars_sip")
+            if "recent" not in str(exc.__cause__ or exc).lower():
+                # The subscription does not include SIP at all: stop asking.
+                self._sip_history_available = False
+                logger.warning("Alpaca SIP history unavailable; using IEX history")
+            return self.get_bars(symbols, timeframe, start, end, limit=limit, use_cache=use_cache, feed="iex")
         frame = response.df.copy()
         if frame.empty:
             result = {symbol: pd.DataFrame() for symbol in normalized_symbols}
@@ -1079,6 +1105,8 @@ class AlpacaService:
             result[normalized_symbols[0]] = prepared.tail(limit) if limit is not None else prepared
         for symbol in normalized_symbols:
             result.setdefault(symbol, pd.DataFrame())
+        for prepared in result.values():
+            prepared.attrs["data_feed"] = feed
         if use_cache:
             self._store_bars_cache(cache_key, result)
         return result
@@ -1141,7 +1169,11 @@ class AlpacaService:
             if latest:
                 incremental_start = min(latest).to_pydatetime() - timedelta(days=10)
                 start = max(start, incremental_start)
-        frames = self.get_bars(list(normalized), timeframe, start, end, limit=None)
+        # Daily strategies only act on finished sessions, so the consolidated
+        # (all-exchange) tape is usable; intraday keeps one real-time IEX feed so
+        # volume comparisons never mix two sources inside one frame.
+        frames = self.get_bars(list(normalized), timeframe, start, end, limit=None,
+                               feed="sip" if timeframe == "1Day" else "iex")
         result: dict[str, pd.DataFrame] = {}
         for symbol in normalized:
             fresh = frames.get(symbol, pd.DataFrame())
@@ -1160,6 +1192,7 @@ class AlpacaService:
                 **(fresh.attrs.get("session_closes", {}) if not fresh.empty else {}),
             }
             result[symbol] = merged.tail(bars).copy()
+            result[symbol].attrs["data_feed"] = fresh.attrs.get("data_feed") or previous.attrs.get("data_feed")
         self._recent_bars_cache[cache_key] = (
             self._monotonic(),
             {symbol: frame.copy() for symbol, frame in result.items()},

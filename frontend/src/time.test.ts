@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { formatShanghaiChartTick, formatShanghaiDateTime, parseUtcDate, shanghaiDateOffset } from './time'
+import { formatShanghaiChartTick, formatShanghaiDateTime, formatTradingDate, parseUtcDate, shanghaiDateOffset } from './time'
 
 describe('UTC+8 time formatting', () => {
   it('treats timezone-less backend timestamps as UTC and displays Asia/Shanghai', () => {
@@ -17,5 +17,11 @@ describe('UTC+8 time formatting', () => {
     expect(shanghaiDateOffset(0)).toBe('2026-07-11')
     expect(shanghaiDateOffset(-1)).toBe('2026-07-10')
     vi.useRealTimers()
+  })
+
+  it('labels daily bars by their New York trading date', () => {
+    const epoch = Math.floor(parseUtcDate('2026-11-20T05:00:00Z').getTime() / 1000)
+    expect(formatTradingDate(epoch)).toBe('2026/11/20')
+    expect(formatTradingDate(epoch, false)).toBe('11/20')
   })
 })

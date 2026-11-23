@@ -58,3 +58,11 @@ export function formatShanghaiChartTick(unixSeconds: number): string {
     hourCycle: 'h23',
   }).format(date)
 }
+
+/** Daily bars are stamped at New York midnight; label them by their US trading date. */
+export function formatTradingDate(unixSeconds: number, withYear = true): string {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(unixSeconds * 1000))
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? ''
+  return withYear ? `${get('year')}/${get('month')}/${get('day')}` : `${get('month')}/${get('day')}`
+}

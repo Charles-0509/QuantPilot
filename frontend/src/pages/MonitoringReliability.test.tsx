@@ -8,7 +8,7 @@ import Market from './Market'
 
 const { api } = vi.hoisted(() => ({ api: vi.fn() }))
 vi.mock('../api', () => ({ api, formatTime: (value: string) => value || '—' }))
-vi.mock('../components/CandleChart', () => ({ default: () => <div>chart</div> }))
+vi.mock('../components/market/MarketChart', () => ({ default: () => <div>chart</div> }))
 afterEach(() => { cleanup(); vi.useRealTimers(); api.mockReset() })
 function show(component: React.ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -32,13 +32,21 @@ describe('monitoring reliability', () => {
     expect(screen.getAllByText('已启用').length).toBeGreaterThan(0)
   })
   it('shows bar time and schedules refreshing rather than implying an old quote is live', async () => {
-    api.mockImplementation((path: string) => Promise.resolve(path.includes('watchlist') ? ['NVDA'] : [
-      { timestamp: '2026-11-04T18:30:00Z', open: 100, high: 102, low: 99, close: 101, volume: 10 },
-    ]))
+    api.mockImplementation((path: string) => {
+      if (path.startsWith('/api/watchlist/groups')) return Promise.resolve([{ id: 1, name: '自选', position: 0, symbols: ['NVDA'] }])
+      if (path.startsWith('/api/market/watch-quotes')) return Promise.resolve({ as_of: '2026-11-04T18:31:00Z', quotes: [
+        { symbol: 'NVDA', price: 101, change: 1, change_pct: 1, session: 'regular' }] })
+      if (path.startsWith('/api/market/detail')) return Promise.resolve({ symbol: 'NVDA', name: 'NVIDIA Corp', exchange: 'NASDAQ', price: 101, change: 1, change_pct: 1 })
+      if (path.startsWith('/api/market/bars')) return Promise.resolve([
+        { timestamp: '2026-11-04T18:30:00Z', open: 100, high: 102, low: 99, close: 101, volume: 10 }])
+      return Promise.resolve(null)
+    })
+    localStorage.setItem('qp-market-view', JSON.stringify({ symbol: 'NVDA' }))
     vi.useFakeTimers()
     show(<Market />)
     await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     expect(screen.getByText(/2026-11-04T18:30:00Z/)).toBeInTheDocument()
+    expect(screen.getByText('NVIDIA Corp · NASDAQ')).toBeInTheDocument()
     const reads = () => api.mock.calls.filter(([path]) => path.includes('/api/market/bars')).length
     expect(reads()).toBe(1)
     await act(async () => { await vi.advanceTimersByTimeAsync(15000) })

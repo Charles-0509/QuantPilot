@@ -344,3 +344,27 @@ export type MarketDataInfo = { source: 'alpaca' | 'ibkr'; label: string; live: s
 export type AiProvider = 'openai' | 'openai_responses' | 'anthropic'
 
 export type AiSettings = { configured: boolean; provider: AiProvider; base_url: string; model: string; updated_at: string | null }
+
+export type WatchlistGroup = { id: number; name: string; position: number; symbols: string[] }
+
+export type WatchQuote = {
+  symbol: string
+  price: number | null
+  price_time: string | null
+  session: 'pre' | 'regular' | 'post' | 'closed' | null
+  prev_close: number | null
+  change: number | null
+  change_pct: number | null
+  open: number | null
+  high: number | null
+  low: number | null
+  volume_live: number | null
+  prev_volume: number | null
+  avg_volume_30: number | null
+  high_52w: number | null
+  low_52w: number | null
+  history_feed: string | null
+  live_feed: string | null
+}
+
+export type SymbolDetail = WatchQuote & { name: string | null; exchange: string | null; asset_class: string | null }

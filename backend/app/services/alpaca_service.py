@@ -24,7 +24,7 @@ from alpaca.common.enums import Sort
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
@@ -1380,6 +1380,13 @@ class AlpacaService:
         result = frame.rename(columns={"trade_count": "trades", "vwap": "vwap"})
         result.index = pd.to_datetime(result.index, utc=True)
         return result[[column for column in ["open", "high", "low", "close", "volume", "trades", "vwap"] if column in result.columns]].sort_index()
+
+    def get_snapshots(self, symbols: list[str]) -> dict[str, Any]:
+        """Latest IEX trade plus today's and the previous IEX daily bar."""
+        request = StockSnapshotRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX)
+        return serialize_model(
+            self._data_read("snapshots", lambda: self.historical.get_stock_snapshot(request))
+        )
 
     def get_latest_quotes(self, symbols: list[str]) -> dict[str, Any]:
         request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX)

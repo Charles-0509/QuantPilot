@@ -237,6 +237,18 @@ class EngineState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class WatchlistGroup(Base):
+    """User-named watchlist section; every symbol belongs to exactly one."""
+
+    __tablename__ = "watchlist_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("auth_users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(40))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class WatchlistItem(Base):
     __tablename__ = "watchlist"
 
@@ -244,6 +256,8 @@ class WatchlistItem(Base):
         ForeignKey("auth_users.id", ondelete="CASCADE"), primary_key=True, default=1
     )
     symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    group_id: Mapped[int | None] = mapped_column(ForeignKey("watchlist_groups.id", ondelete="SET NULL"), nullable=True, index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import AuthUser, EngineState, RiskSettings, Strategy, StrategyVersion, WatchlistItem
+from .models import AuthUser, EngineState, RiskSettings, Strategy, StrategyVersion, WatchlistGroup, WatchlistItem
 from .schemas import RuleDefinition
 
 
@@ -380,13 +380,17 @@ def seed_user_defaults(db: Session, user_id: int) -> None:
     if db.scalar(select(EngineState).where(EngineState.user_id == user_id)) is None:
         db.add(EngineState(user_id=user_id))
 
-    settings = get_settings()
-    existing_symbols = set(
-        db.scalars(select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)).all()
-    )
-    for symbol in settings.default_symbols:
-        if symbol not in existing_symbols:
-            db.add(WatchlistItem(user_id=user_id, symbol=symbol))
+    # Seed a watchlist only once: a user's deletions must survive restarts.
+    if db.scalar(select(WatchlistGroup.id).where(WatchlistGroup.user_id == user_id)) is None:
+        group = WatchlistGroup(user_id=user_id, name="自选", position=0)
+        db.add(group)
+        db.flush()
+        items = db.scalars(select(WatchlistItem).where(WatchlistItem.user_id == user_id)).all()
+        for position, item in enumerate(sorted(items, key=lambda row: row.symbol)):
+            item.group_id, item.position = group.id, position
+        if not items:
+            for position, symbol in enumerate(get_settings().default_symbols):
+                db.add(WatchlistItem(user_id=user_id, symbol=symbol, group_id=group.id, position=position))
     db.commit()
 
 

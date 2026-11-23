@@ -1,62 +1,109 @@
-import { useMemo, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus, RefreshCw, X } from 'lucide-react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { RefreshCw, Search } from 'lucide-react'
 import { api, formatTime } from '../api'
-import type { Timeframe } from '../types'
-import CandleChart from '../components/CandleChart'
-import { Button, Card, Empty, ErrorPanel, Field, Loading, PageHeader } from '../components/UI'
+import type { SymbolDetail, Timeframe, WatchlistGroup, WatchQuote } from '../types'
+import MarketChart from '../components/market/MarketChart'
+import WatchlistPanel from '../components/market/WatchlistPanel'
+import SymbolDetailPanel from '../components/market/SymbolDetailPanel'
+import { MA_LINES, type Bar } from '../components/market/indicators'
+import { useMarketDataInfo } from '../components/MarketDataSourcePanel'
+import { Empty, ErrorPanel, Loading } from '../components/UI'
+import { readJson, writeJson } from '../storage'
+import { formatTradingDate, parseUtcDate } from '../time'
+
+const TIMEFRAMES: Array<[Timeframe, string]> = [['5Min', '5分'], ['15Min', '15分'], ['30Min', '30分'], ['1Hour', '1小时'], ['1Day', '日']]
+const STORE = 'qp-market-view'
+
+function loadView() {
+  const defaults = { symbol: 'SPY', timeframe: '15Min' as Timeframe, ma: { 20: true, 50: true, 100: true } as Record<number, boolean> }
+  return { ...defaults, ...readJson<Partial<typeof defaults>>(STORE, {}) }
+}
 
 export default function Market() {
-  const queryClient = useQueryClient()
-  const watchlist = useQuery({ queryKey: ['watchlist'], queryFn: () => api<string[]>('/api/watchlist') })
-  const [symbol, setSymbol] = useState('SPY')
-  const [timeframe, setTimeframe] = useState<Timeframe>('15Min')
-  const [newSymbol, setNewSymbol] = useState('')
+  const client = useQueryClient()
+  const initial = useMemo(loadView, [])
+  const [symbol, setSymbol] = useState<string>(initial.symbol)
+  const [timeframe, setTimeframe] = useState<Timeframe>(initial.timeframe)
+  const [visibleMa, setVisibleMa] = useState<Record<number, boolean>>(initial.ma)
+  const [search, setSearch] = useState('')
+  useEffect(() => { writeJson(STORE, { symbol, timeframe, ma: visibleMa }) }, [symbol, timeframe, visibleMa])
+
+  const marketData = useMarketDataInfo()
+  const groups = useQuery({ queryKey: ['watchlist-groups'], queryFn: () => api<WatchlistGroup[]>('/api/watchlist/groups') })
+  const allSymbols = useMemo(() => (groups.data || []).flatMap((group) => group.symbols), [groups.data])
+  const quoteSymbols = useMemo(() => [...new Set([...allSymbols, symbol])], [allSymbols, symbol])
+  const quotes = useQuery({
+    queryKey: ['watch-quotes', quoteSymbols.join(',')],
+    queryFn: () => api<{ as_of: string; errors?: string[]; quotes: WatchQuote[] }>(`/api/market/watch-quotes?symbols=${encodeURIComponent(quoteSymbols.join(','))}`),
+    enabled: quoteSymbols.length > 0,
+    refetchInterval: 15000,
+    placeholderData: keepPreviousData,
+  })
+  const quoteMap = useMemo(() => Object.fromEntries((quotes.data?.quotes || []).map((quote) => [quote.symbol, quote])), [quotes.data])
+  const detail = useQuery({
+    queryKey: ['market-detail', symbol],
+    queryFn: () => api<SymbolDetail>(`/api/market/detail?symbol=${encodeURIComponent(symbol)}`),
+    refetchInterval: 15000,
+    retry: false,
+  })
   const bars = useQuery({
     queryKey: ['bars', symbol, timeframe],
-    queryFn: () => api<any[]>(`/api/market/bars?symbol=${symbol}&timeframe=${timeframe}&limit=260`),
+    queryFn: () => api<Bar[]>(`/api/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=${timeframe === '1Day' ? 500 : 600}`),
     retry: false,
     refetchInterval: 15000,
+    placeholderData: keepPreviousData,
   })
-  const saveWatchlist = useMutation({
-    mutationFn: (symbols: string[]) => api<string[]>('/api/watchlist', { method: 'PUT', body: JSON.stringify({ symbols }) }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['watchlist'] }),
+  const addCurrent = useMutation({
+    mutationFn: () => api<WatchlistGroup[]>('/api/watchlist/items', { method: 'POST', body: JSON.stringify({ symbol, group_id: groups.data?.[0]?.id }) }),
+    onSuccess: (next) => client.setQueryData(['watchlist-groups'], next),
   })
-  const symbols = watchlist.data || []
-  const last = useMemo(() => bars.data?.[bars.data.length - 1], [bars.data])
 
-  return <>
-    <PageHeader eyebrow="MARKET INTELLIGENCE" title="行情中心" description="使用当前券商的数据查看已完成K线。Alpaca 默认 IEX；IBKR 数据取决于账户的行情权限。" actions={
-      <Button variant="ghost" onClick={() => bars.refetch()}><RefreshCw size={15} />刷新行情</Button>
-    } />
-    <div className="dashboard-grid">
-      <Card>
-        <div className="chart-toolbar">
-          <Field label="股票代码"><select value={symbol} onChange={(e) => setSymbol(e.target.value)}>{symbols.map((item) => <option key={item}>{item}</option>)}</select></Field>
-          <Field label="K线周期"><select value={timeframe} onChange={(e) => setTimeframe(e.target.value as Timeframe)}>
-            <option value="5Min">5 分钟</option><option value="15Min">15 分钟</option><option value="30Min">30 分钟</option><option value="1Hour">1 小时</option><option value="1Day">日线</option>
-          </select></Field>
-          {last && <div style={{ marginLeft: 'auto' }}><span className="eyebrow">LATEST CLOSE</span><div style={{ fontSize: 25, fontWeight: 700, marginTop: 5 }}>${Number(last.close).toFixed(2)}</div></div>}
+  const last = bars.data?.[bars.data.length - 1]
+  const current = quoteMap[symbol] || detail.data
+  const showSymbol = (event: FormEvent) => {
+    event.preventDefault()
+    const next = search.trim().toUpperCase()
+    if (/^[A-Z][A-Z0-9.-]{0,14}$/.test(next)) { setSymbol(next); setSearch('') }
+  }
+
+  return <div className="market-workspace">
+    <section className="market-main" aria-label="K线图">
+      <div className="market-toolbar">
+        <form className="market-search" onSubmit={showSymbol}>
+          <Search size={14} />
+          <input aria-label="查看股票" placeholder={symbol} value={search} onChange={(event) => setSearch(event.target.value.toUpperCase())} />
+        </form>
+        <div className="market-title">
+          <h1>{symbol}</h1>
+          {current?.price != null && <span className={(current.change ?? 0) >= 0 ? 'positive' : 'negative'}>
+            {current.price.toFixed(2)} {current.change_pct != null && `${current.change_pct >= 0 ? '+' : ''}${current.change_pct.toFixed(2)}%`}
+          </span>}
         </div>
-        <p className="field-hint" style={{ padding: '0 20px' }}>
-          数据：{last?.feed === 'sip' ? 'SIP 全市场（15 分钟前）' : last?.feed === 'iex' ? 'IEX 实时（成交量只含 IEX）' : last?.feed || '—'} · 最新已完成K线起始时间：{formatTime(last?.timestamp)} · 最近读取成功：{bars.dataUpdatedAt ? formatTime(new Date(bars.dataUpdatedAt).toISOString()) : '尚未成功'}
-          {bars.error ? ' · 刷新失败，显示的数据为缓存' : ' · 每15秒刷新'}
-        </p>
-        {bars.isLoading ? <Loading label="正在获取券商 K线" /> : bars.error ? <div style={{ padding: 20 }}><ErrorPanel message={(bars.error as Error).message} /></div> : bars.data?.length ? <CandleChart bars={bars.data} /> : <Empty title="没有行情数据" />}
-      </Card>
-      <Card>
-        <div className="card-header"><div><h2>自选股票池</h2><p>实时订阅与策略合计最多30个代码</p></div></div>
-        <div className="card-pad">
-          <div style={{ display: 'flex', gap: 8 }}>
-            <input placeholder="例如 AAPL" value={newSymbol} onChange={(e) => setNewSymbol(e.target.value.toUpperCase())} />
-            <Button onClick={() => { const next = [...new Set([...symbols, newSymbol.trim().toUpperCase()])].filter(Boolean); if (next.length <= 30) saveWatchlist.mutate(next); setNewSymbol('') }} disabled={!newSymbol.trim()}><Plus size={15} />添加</Button>
-          </div>
-          <div className="strategy-meta" style={{ marginTop: 18 }}>{symbols.map((item) => <button className={`badge ${item === symbol ? 'badge-info' : 'badge-neutral'}`} key={item} onClick={() => setSymbol(item)}>
-            {item}<X size={12} onClick={(event) => { event.stopPropagation(); saveWatchlist.mutate(symbols.filter((value) => value !== item)) }} />
-          </button>)}</div>
-          <div className="warning-callout" style={{ marginTop: 20 }}>各券商行情来源与复权口径不同。Alpaca 免费 IEX 仅覆盖 IEX，IBKR 行情权限由账户订阅决定；请核对策略所需的成交量和数据范围。</div>
+        <div className="market-segment" role="group" aria-label="K线周期">
+          {TIMEFRAMES.map(([value, label]) => <button key={value} className={value === timeframe ? 'active' : ''} aria-pressed={value === timeframe} onClick={() => setTimeframe(value)}>{label}</button>)}
         </div>
-      </Card>
-    </div>
-  </>
+        <div className="market-segment" role="group" aria-label="均线">
+          {MA_LINES.map(({ period, color }) => <button key={period} className={visibleMa[period] ? 'active' : ''} aria-pressed={visibleMa[period]}
+            onClick={() => setVisibleMa((value) => ({ ...value, [period]: !value[period] }))}><i style={{ background: color }} />MA{period}</button>)}
+        </div>
+        <button className="icon-button" title="刷新" aria-label="刷新行情" onClick={() => { bars.refetch(); quotes.refetch(); detail.refetch() }}><RefreshCw size={15} className={bars.isFetching ? 'spin' : ''} /></button>
+      </div>
+      <div className="market-chart-area">
+        {bars.isLoading ? <Loading label="正在获取K线" /> : bars.error && !bars.data ? <div style={{ padding: 20 }}><ErrorPanel message={(bars.error as Error).message} /></div>
+          : bars.data?.length ? <MarketChart bars={bars.data} viewKey={`${symbol}-${timeframe}`} visibleMa={visibleMa} daily={timeframe === '1Day'} /> : <Empty title="没有行情数据" detail="该代码在当前周期没有已完成的 K 线。" />}
+      </div>
+      <p className="market-footnote">
+        数据：{last?.feed === 'sip' ? 'SIP 全市场（15 分钟前）' : last?.feed === 'iex' ? 'IEX 实时（成交量只含 IEX）' : last?.feed || '—'} · {timeframe === '1Day' ? <>最新日线：{last ? formatTradingDate(Math.floor(parseUtcDate(last.timestamp).getTime() / 1000)) : '—'}</> : <>最新已完成K线起始时间：{formatTime(last?.timestamp)}</>} · 最近读取成功：{bars.dataUpdatedAt ? formatTime(new Date(bars.dataUpdatedAt).toISOString()) : '尚未成功'}
+        {bars.error ? ' · 刷新失败，显示的数据为缓存' : ' · 每15秒刷新'}{marketData.data ? ` · ${marketData.data.label}` : ''}
+      </p>
+    </section>
+    <aside className="market-side">
+      {groups.isLoading ? <Loading label="正在读取自选" /> : groups.error ? <ErrorPanel message={(groups.error as Error).message} />
+        : <WatchlistPanel groups={groups.data || []} quotes={quoteMap} selected={symbol} onSelect={setSymbol}
+          error={quotes.error ? (quotes.error as Error).message : quotes.data?.errors?.join('；')} />}
+      <SymbolDetailPanel detail={detail.data} loading={detail.isLoading} error={detail.error ? (detail.error as Error).message : undefined}
+        inWatchlist={allSymbols.includes(symbol)} onAdd={() => addCurrent.mutate()} />
+    </aside>
+  </div>
 }

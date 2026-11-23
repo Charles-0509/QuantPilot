@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, defer
 
 from .auth_api import require_session
@@ -27,6 +28,7 @@ from .models import (
     Signal,
     Strategy,
     StrategyVersion,
+    WatchlistGroup,
     WatchlistItem,
     utcnow,
 )
@@ -45,6 +47,10 @@ from .schemas import (
     StrategyDraftRequest,
     StrategyRead,
     StrategyVersionRead,
+    WatchlistGroupCreate,
+    WatchlistGroupUpdate,
+    WatchlistItemCreate,
+    WatchlistItemUpdate,
     WatchlistUpdate,
 )
 from .services.alpaca_service import AlpacaService
@@ -63,6 +69,7 @@ from .services.engine import (
 )
 from .services.runtime import UserRuntime, UserRuntimeManager, build_alpaca, build_ibkr, with_market_data
 from .services.portfolio import build_portfolio, enabled_strategy_count
+from .services.quotes import market_quotes
 from .services.strategy_safety import strategy_has_unresolved_execution
 from .services.websocket import websocket_manager
 
@@ -462,11 +469,185 @@ def update_watchlist(
             status_code=409,
             detail="自选股与已启用策略合计最多订阅30个股票代码",
         )
-    db.execute(delete(WatchlistItem).where(WatchlistItem.user_id == user_id))
-    for symbol in payload.symbols:
-        db.add(WatchlistItem(user_id=user_id, symbol=symbol))
+    group_id = default_group(db, user_id).id
+    existing = {row.symbol: row for row in db.scalars(select(WatchlistItem).where(WatchlistItem.user_id == user_id)).all()}
+    for symbol, row in existing.items():
+        if symbol not in payload.symbols:
+            db.delete(row)
+    for position, symbol in enumerate(payload.symbols):
+        if symbol not in existing:
+            db.add(WatchlistItem(user_id=user_id, symbol=symbol, group_id=group_id, position=1000 + position))
     db.commit()
     return payload.symbols
+
+
+def default_group(db: Session, user_id: int) -> WatchlistGroup:
+    group = db.scalar(select(WatchlistGroup).where(WatchlistGroup.user_id == user_id)
+                      .order_by(WatchlistGroup.position, WatchlistGroup.id))
+    if group is None:
+        group = WatchlistGroup(user_id=user_id, name="自选", position=0)
+        db.add(group)
+        db.flush()
+    return group
+
+
+def watchlist_groups_view(db: Session, user_id: int) -> list[dict[str, Any]]:
+    fallback = default_group(db, user_id)
+    groups = db.scalars(select(WatchlistGroup).where(WatchlistGroup.user_id == user_id)
+                        .order_by(WatchlistGroup.position, WatchlistGroup.id)).all()
+    items = db.scalars(select(WatchlistItem).where(WatchlistItem.user_id == user_id)
+                       .order_by(WatchlistItem.position, WatchlistItem.symbol)).all()
+    known = {group.id for group in groups}
+    for item in items:
+        if item.group_id not in known:
+            item.group_id = fallback.id
+    db.commit()
+    return [{"id": group.id, "name": group.name, "position": group.position,
+             "symbols": [item.symbol for item in items if item.group_id == group.id]} for group in groups]
+
+
+def owned_group(db: Session, user_id: int, group_id: int) -> WatchlistGroup:
+    group = db.get(WatchlistGroup, group_id)
+    if group is None or group.user_id != user_id:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    return group
+
+
+def subscribed_symbol_count(db: Session, user_id: int, extra: str | None = None) -> int:
+    symbols = set(db.scalars(select(WatchlistItem.symbol).where(WatchlistItem.user_id == user_id)).all())
+    for strategy in db.scalars(select(Strategy).where(Strategy.enabled.is_(True), Strategy.owner_user_id == user_id)).all():
+        symbols.update(strategy.definition.get("symbols", []))
+    if extra:
+        symbols.add(extra)
+    return len(symbols)
+
+
+@router.get("/watchlist/groups")
+def list_watchlist_groups(db: Session = Depends(get_db), user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    return watchlist_groups_view(db, user_id)
+
+
+@router.post("/watchlist/groups")
+def create_watchlist_group(payload: WatchlistGroupCreate, db: Session = Depends(get_db),
+                           user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    count = db.scalar(select(func.count()).select_from(WatchlistGroup).where(WatchlistGroup.user_id == user_id)) or 0
+    if count >= 20:
+        raise HTTPException(status_code=409, detail="最多 20 个分组")
+    db.add(WatchlistGroup(user_id=user_id, name=payload.name.strip(), position=count))
+    db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.patch("/watchlist/groups/{group_id}")
+def update_watchlist_group(group_id: int, payload: WatchlistGroupUpdate, db: Session = Depends(get_db),
+                           user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    group = owned_group(db, user_id, group_id)
+    if payload.name is not None:
+        group.name = payload.name.strip()
+    if payload.position is not None:
+        groups = [row for row in db.scalars(select(WatchlistGroup).where(WatchlistGroup.user_id == user_id)
+                  .order_by(WatchlistGroup.position, WatchlistGroup.id)).all() if row.id != group.id]
+        groups.insert(min(payload.position, len(groups)), group)
+        for position, row in enumerate(groups):
+            row.position = position
+    db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.delete("/watchlist/groups/{group_id}")
+def delete_watchlist_group(group_id: int, db: Session = Depends(get_db),
+                           user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    group = owned_group(db, user_id, group_id)
+    others = db.scalars(select(WatchlistGroup).where(WatchlistGroup.user_id == user_id, WatchlistGroup.id != group.id)
+                        .order_by(WatchlistGroup.position, WatchlistGroup.id)).all()
+    if not others:
+        raise HTTPException(status_code=409, detail="至少保留一个分组")
+    target = others[0]
+    offset = len(db.scalars(select(WatchlistItem.symbol).where(WatchlistItem.group_id == target.id)).all())
+    for index, item in enumerate(db.scalars(select(WatchlistItem).where(
+            WatchlistItem.user_id == user_id, WatchlistItem.group_id == group.id).order_by(WatchlistItem.position)).all()):
+        item.group_id, item.position = target.id, offset + index
+    db.delete(group)
+    db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.post("/watchlist/items")
+async def add_watchlist_item(payload: WatchlistItemCreate, db: Session = Depends(get_db),
+                             alpaca: AlpacaService = Depends(get_alpaca),
+                             user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    group = owned_group(db, user_id, payload.group_id)
+    if db.get(WatchlistItem, (user_id, payload.symbol)) is not None:
+        raise HTTPException(status_code=409, detail=f"{payload.symbol} 已在自选列表中")
+    if subscribed_symbol_count(db, user_id, payload.symbol) > 30:
+        raise HTTPException(status_code=409, detail="自选股与已启用策略合计最多订阅 30 个股票代码")
+    if alpaca.configured:
+        try:
+            asset = await asyncio.to_thread(alpaca.get_asset, payload.symbol)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"无法确认股票代码 {payload.symbol}，请检查拼写或稍后重试") from exc
+        if not asset.get("tradable", True):
+            raise HTTPException(status_code=422, detail=f"{payload.symbol} 当前不可交易")
+    count = len(db.scalars(select(WatchlistItem.symbol).where(WatchlistItem.group_id == group.id)).all())
+    db.add(WatchlistItem(user_id=user_id, symbol=payload.symbol, group_id=group.id, position=count))
+    db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.patch("/watchlist/items/{symbol}")
+def update_watchlist_item(symbol: str, payload: WatchlistItemUpdate, db: Session = Depends(get_db),
+                          user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    item = db.get(WatchlistItem, (user_id, symbol.upper()))
+    if item is None:
+        raise HTTPException(status_code=404, detail="该股票不在自选列表中")
+    target = owned_group(db, user_id, payload.group_id) if payload.group_id is not None else owned_group(db, user_id, item.group_id)
+    rows = [row for row in db.scalars(select(WatchlistItem).where(
+        WatchlistItem.user_id == user_id, WatchlistItem.group_id == target.id)
+        .order_by(WatchlistItem.position, WatchlistItem.symbol)).all() if row.symbol != item.symbol]
+    rows.insert(len(rows) if payload.position is None else min(payload.position, len(rows)), item)
+    item.group_id = target.id
+    for position, row in enumerate(rows):
+        row.position = position
+    db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.delete("/watchlist/items/{symbol}")
+def delete_watchlist_item(symbol: str, db: Session = Depends(get_db),
+                          user_id: int = Depends(current_user_id)) -> list[dict[str, Any]]:
+    item = db.get(WatchlistItem, (user_id, symbol.upper()))
+    if item is not None:
+        db.delete(item)
+        db.commit()
+    return watchlist_groups_view(db, user_id)
+
+
+@router.get("/market/watch-quotes")
+async def get_market_quotes(symbols: str = Query(default="", max_length=600),
+                            alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
+    requested = [item.strip().upper() for item in symbols.split(",") if item.strip()][:40]
+    if any(not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", item) for item in requested):
+        raise HTTPException(status_code=422, detail="股票代码格式不正确")
+    if not alpaca.configured:
+        return {"as_of": datetime.now(timezone.utc), "errors": ["券商未配置"], "quotes": []}
+    return await asyncio.to_thread(market_quotes, alpaca, requested)
+
+
+@router.get("/market/detail")
+async def get_market_detail(symbol: str, alpaca: AlpacaService = Depends(get_alpaca)) -> dict[str, Any]:
+    symbol = symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
+        raise HTTPException(status_code=422, detail="股票代码格式不正确")
+    if not alpaca.configured:
+        raise HTTPException(status_code=409, detail="券商未配置")
+    quote = (await asyncio.to_thread(market_quotes, alpaca, [symbol]))["quotes"][0]
+    try:
+        asset = await asyncio.to_thread(alpaca.get_asset, symbol)
+    except Exception:
+        asset = {}
+    return {**quote, "name": asset.get("name"), "exchange": str(asset.get("exchange") or "").split(".")[-1] or None,
+            "asset_class": str(asset.get("class") or asset.get("asset_class") or "").split(".")[-1] or None,
+            "fractionable": asset.get("fractionable"), "shortable": asset.get("shortable")}
 
 
 @router.get("/strategies", response_model=list[StrategyRead])

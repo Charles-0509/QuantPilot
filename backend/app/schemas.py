@@ -369,6 +369,33 @@ class OAuthTokenRead(BaseModel):
     scope: Literal["admin", "user"] = "user"
 
 
+class WatchlistGroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+
+
+class WatchlistGroupUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=40)
+    position: int | None = Field(default=None, ge=0, le=1000)
+
+
+class WatchlistItemCreate(BaseModel):
+    symbol: str = Field(min_length=1, max_length=16)
+    group_id: int
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        symbol = value.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol):
+            raise ValueError("股票代码格式不正确")
+        return symbol
+
+
+class WatchlistItemUpdate(BaseModel):
+    group_id: int | None = None
+    position: int | None = Field(default=None, ge=0, le=1000)
+
+
 class WatchlistUpdate(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=30)
 

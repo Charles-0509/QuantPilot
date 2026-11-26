@@ -31,6 +31,10 @@ describe('InstrumentPanel', () => {
     expect(option.option?.right).toBe('call')
     expect(option.order).toMatchObject({ stop_loss: null, take_profit: null, trailing_stop: null, time_in_force: 'day' })
     expect(option.position.mode).toBe('percent_equity')
+
+    const back = withTradeKind(option, 'short')
+    expect(back.order.stop_loss).toMatchObject({ mode: 'percent', value: 2 })
+    expect(back.order.take_profit).toMatchObject({ mode: 'percent', value: 4 })
   })
 
   it('edits option parameters', () => {

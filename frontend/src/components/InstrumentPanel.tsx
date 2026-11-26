@@ -19,9 +19,14 @@ export const TRADE_KIND_LABEL: Record<TradeKind, string> = { long: '股票做多
 export function withTradeKind(definition: RuleDefinition, kind: TradeKind): RuleDefinition {
   const base = { ...definition }
   delete (base as Record<string, unknown>).paper_validation
-  if (kind === 'long') return { ...base, direction: 'long', instrument: 'stock', option: null }
+  // Options carry no bracket; coming back to stocks restores the default protection instead of none.
+  const order = definition.instrument === 'option' && !base.order.stop_loss && !base.order.trailing_stop
+    ? { ...base.order, stop_loss: { mode: 'percent' as const, value: 2, atr_period: 14 },
+        take_profit: { mode: 'percent' as const, value: 4, atr_period: 14 } }
+    : base.order
+  if (kind === 'long') return { ...base, order, direction: 'long', instrument: 'stock', option: null }
   if (kind === 'short') return { ...base, direction: 'short', instrument: 'stock', option: null,
-    order: { ...base.order, trailing_stop: null } }
+    order: { ...order, trailing_stop: null } }
   return {
     ...base, direction: 'long', instrument: 'option', option: definition.option ?? DEFAULT_OPTION,
     order: { ...base.order, stop_loss: null, take_profit: null, trailing_stop: null, time_in_force: 'day' },

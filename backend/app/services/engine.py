@@ -2029,6 +2029,10 @@ class TradingEngine:
         if unsupported:
             await self._log_throttled(strategy, symbol, f"{strategy.name}: {unsupported}，未生成订单")
             return "unsupported", False
+        validation = definition.paper_validation
+        expired = bool(validation and datetime.now(timezone.utc) >= validation.expires_at)
+        if expired:
+            exit_ = RuleResult(True, frame.index[-1], ['Paper验证截止，仅平掉测试策略归属仓位'])
         if definition.is_short:
             owned = min(self._owned_short_qty(strategy.id, symbol), max(0.0, -account_position_qty))
             has_position = owned > 0
@@ -2048,6 +2052,13 @@ class TradingEngine:
                     await self._create_exit_signal(strategy, definition, contract, frame, exit_, qty,
                                                    snapshot.open_orders, snapshot.positions)
                 return "exit_signal", True
+        if validation and not has_position and self._validation_entry_reason(strategy.id, definition):
+            try:
+                await self.disable_strategy(strategy.id)
+                await self.log('info', 'validation', f'{strategy.name} 已达到验证上限/截止时间，自动停用')
+            except StrategyExecutionActiveError:
+                pass
+            return "validation_finished", False
         can_pyramid = definition.position.allow_pyramiding and await self._cooldown_passed(strategy.id, symbol, definition)
         if entry.matched and (not has_position or can_pyramid):
             if definition.is_short:
@@ -2299,14 +2310,14 @@ class TradingEngine:
             return 'Paper验证已到截止时间'
         with SessionLocal() as db:
             statement = select(Signal.id).where(Signal.user_id == self.user_id,
-                Signal.strategy_id == strategy_id, Signal.action == 'buy')
+                Signal.strategy_id == strategy_id, Signal.action.in_(ENTRY_ACTIONS))
             if signal_id:
                 statement = statement.where(Signal.id != signal_id)
             attempts = len(db.scalars(statement).all())
         if attempts >= validation.max_entries:
             return 'Paper验证已达到最大买入次数'
         if qty is not None and qty > validation.max_quantity + 1e-9:
-            return 'Paper验证超过单次股数上限'
+            return 'Paper验证超过单次股数/张数上限'
         if notional is not None and notional > validation.max_notional + 0.01:
             return 'Paper验证超过单次金额上限'
         return ''
@@ -3424,6 +3435,10 @@ class TradingEngine:
         if qty < 1:
             await self.log("warning", "risk", f"{strategy.name}/{symbol}: 预算不足以买入 1 张期权（每张约 ${ask * 100:,.2f}）")
             return
+        validation_reason = self._validation_entry_reason(strategy.id, definition, qty=qty, notional=qty * ask * 100)
+        if validation_reason:
+            await self.log('warning', 'validation', f'{strategy.name}/{symbol}: {validation_reason}')
+            return
         timestamp = frame.index[-1].to_pydatetime()
         client_id = self._client_order_id(strategy.id, symbol, timestamp, "buy")
         notional = qty * ask * 100
@@ -3534,6 +3549,10 @@ class TradingEngine:
         if qty < 1:
             return "reject", "预算不足以买入 1 张期权", False, {}
         desired_notional = qty * premium * 100
+        validation_reason = self._validation_entry_reason(strategy.id, definition, signal_id=signal.id,
+                                                          qty=qty, notional=desired_notional)
+        if validation_reason:
+            return "reject", validation_reason, False, {}
         try:
             contract = await asyncio.to_thread(self.alpaca.get_option_contract, signal.symbol)
         except Exception:
@@ -4012,6 +4031,14 @@ class TradingEngine:
                 ):
                     return False
                 if signal.action == "short":
+                    current_definition = RuleDefinition.model_validate(current_strategy.definition)
+                    validation_reason = self._validation_entry_reason(current_strategy.id, current_definition,
+                        signal_id=signal.id, qty=as_float(payload.get('qty')),
+                        notional=as_float(payload.get('notional')))
+                    if validation_reason:
+                        self._update_signal_state(signal.id, 'rejected', extra={'error': validation_reason})
+                        self._remove_pending_reservation(open_orders, signal.id)
+                        return True
                     await self._verify_short_entry_capacity(
                         signal.symbol, as_float(payload.get("qty")), client_order_id)
                     order = await asyncio.to_thread(

@@ -527,3 +527,58 @@ async def test_short_bracket_reconciles_without_false_quarantine(env):
     with sessions() as db:
         incident = db.scalar(select(engine_module.ExecutionIncident))
     assert incident is not None and incident.status == "active"
+
+
+VALIDATION = {"expires_at": (NOW + timedelta(minutes=30)).isoformat(), "max_entries": 1, "max_quantity": 1, "max_notional": 1000}
+
+
+@pytest.mark.asyncio
+async def test_paper_validation_limits_short_entries_and_exits_at_deadline(env, monkeypatch):
+    engine, broker, sessions = env
+    add_strategy(sessions, definition(direction="short", name="short check", paper_validation=VALIDATION,
+                                      position={"mode": "fixed_qty", "value": 1, "allow_pyramiding": True, "max_additions": 3},
+                                      risk={"max_symbol_pct": 10, "max_positions": 8, "cooldown_bars": 0}))
+    await engine.evaluate_active_strategies(force=True)
+    assert len(broker.entries) == 1 and broker.entries[0]["qty"] == 1
+    await fill(engine, broker, "qp-x-", 1, 100)
+    broker.positions = [{"symbol": "SPY", "qty": "-1", "market_value": "-100"}]
+    engine._last_evaluated.clear()
+    await engine.evaluate_active_strategies(force=True)
+    assert len(broker.entries) == 1                      # max_entries=1 blocks a second short
+    later = NOW + timedelta(minutes=31)
+
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return later.astimezone(tz) if tz is not None else later.replace(tzinfo=None)
+
+    monkeypatch.setattr(engine_module, "datetime", Later)
+    monkeypatch.setattr(risk_module, "datetime", Later)
+    engine._last_evaluated.clear()
+    await engine.evaluate_active_strategies(force=True)
+    assert broker.exits and broker.exits[-1][3] == "buy" and broker.exits[-1][1] == 1
+    await fill(engine, broker, "qp-c-", 1, 99)
+    broker.positions = []
+    engine._last_evaluated.clear()
+    await engine.evaluate_active_strategies(force=True)
+    with sessions() as db:
+        assert db.get(Strategy, "s1").enabled is False      # flat after the deadline: auto-disabled
+
+
+@pytest.mark.asyncio
+async def test_paper_validation_caps_option_contracts_and_premium(env):
+    engine, broker, sessions = env
+    add_strategy(sessions, option_definition(name="call check", paper_validation=VALIDATION))
+    await engine.evaluate_active_strategies(force=True)
+    assert broker.entries == []                          # 2% of 100k buys 9 contracts > max 1
+    with sessions() as db:
+        assert any("张数上限" in row.message for row in db.scalars(select(EventLog)).all())
+    with sessions() as db:
+        strategy = db.get(Strategy, "s1")
+        strategy.definition = RuleDefinition.model_validate(option_definition(
+            name="call check", paper_validation=VALIDATION,
+            position={"mode": "fixed_qty", "value": 1, "allow_pyramiding": False, "max_additions": 1})).model_dump(mode="json")
+        db.commit()
+    engine._last_evaluated.clear()
+    await engine.evaluate_active_strategies(force=True)
+    assert len(broker.entries) == 1 and broker.entries[0]["qty"] == 1          # $210 premium <= $1,000 cap

@@ -191,8 +191,6 @@ class RuleDefinition(BaseModel):
                 raise ValueError("做空仅支持股票；看跌观点请使用买入看跌期权")
             if self.order.trailing_stop is not None:
                 raise ValueError("做空策略暂不支持移动止损，请使用 bracket 止损止盈")
-            if self.paper_validation is not None:
-                raise ValueError("做空策略不能用于 Paper 买卖验证")
         if self.instrument == "option":
             if self.option is None:
                 raise ValueError("期权策略需要填写期权参数")
@@ -202,8 +200,6 @@ class RuleDefinition(BaseModel):
                 raise ValueError("期权策略请按金额、净值比例或固定张数开仓")
             if self.order.time_in_force != "day":
                 raise ValueError("期权订单只使用当日有效（day）")
-            if self.paper_validation is not None:
-                raise ValueError("期权策略不能用于 Paper 买卖验证")
         return self
 
     @property

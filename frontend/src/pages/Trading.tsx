@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertOctagon, Bot, CheckCircle, Pause, Play, RefreshCw, ShieldAlert, XCircle } from 'lucide-react'
 import { api, formatTime, money } from '../api'
+import { actionLabel, actionTone } from '../labels'
 import { enginePresentation } from '../status'
 import type { EngineStatus, EvaluationHealth, PortfolioSnapshot, Strategy } from '../types'
 import { OrdersTable, SnapshotNotice } from '../components/PortfolioPanels'
@@ -49,7 +50,7 @@ export default function Trading() {
     {activeIncidents.length > 0 && <div className="danger-callout" style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
       <div>
         <strong><ShieldAlert size={16} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 6 }} />执行安全隔离：</strong>
-        {activeIncidents.join('、')} 检测到持仓或开放卖单不满足只做多约束。
+        {activeIncidents.join('、')} 检测到持仓或开放订单与策略归属不一致（多头超卖、未归属空头或做空数量不符）。
       </div>
       <Button variant="secondary" disabled={clearIncident.isPending} onClick={() => clearIncident.mutate(undefined)}>
         <CheckCircle size={14} />确认安全并解除隔离
@@ -68,7 +69,7 @@ export default function Trading() {
     </div>
     <EvaluationHealthCard health={engine.data?.evaluation_health} />
     <Card style={{ marginTop: 16 } as any}><div className="card-header"><div><h2>信号与执行记录</h2><p>重复的策略ID、代码、K线时间和动作不会再次下单</p></div><AlertOctagon size={17} color="#f2bd5c" /></div>
-      {signals.data?.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>时间</th><th>代码</th><th>动作</th><th>价格</th><th>执行状态</th><th>已成交数量</th><th>原因</th></tr></thead><tbody>{signals.data.map((signal) => <tr key={signal.id}><td>{formatTime(signal.created_at)}</td><td className="symbol-cell">{signal.symbol}</td><td><Badge tone={signal.action === 'buy' ? 'success' : 'warning'}>{signal.action}</Badge></td><td>{money(signal.price)}</td><td>{executionLabel(signal.execution_status || signal.status)}</td><td>{signal.filled_qty ?? '—'}</td><td>{signal.execution_error || signal.reason}</td></tr>)}</tbody></table></div> : <Empty title="尚无信号记录" />}
+      {signals.data?.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>时间</th><th>代码</th><th>动作</th><th>价格</th><th>执行状态</th><th>已成交数量</th><th>原因</th></tr></thead><tbody>{signals.data.map((signal) => <tr key={signal.id}><td>{formatTime(signal.created_at)}</td><td className="symbol-cell">{signal.symbol}</td><td><Badge tone={actionTone(signal.action)}>{actionLabel(signal.action)}</Badge></td><td>{money(signal.price)}</td><td>{executionLabel(signal.execution_status || signal.status)}</td><td>{signal.filled_qty ?? '—'}</td><td>{signal.execution_error || signal.reason}</td></tr>)}</tbody></table></div> : <Empty title="尚无信号记录" />}
     </Card>
   </>
 }

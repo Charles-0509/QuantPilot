@@ -6,6 +6,11 @@ import EquityChart from '../components/EquityChart'
 import { Badge, Card, Empty, ErrorPanel, Loading, PageHeader } from '../components/UI'
 import type { StrategyPerformance } from '../types'
 
+const OCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/
+function unit(symbol: string) {
+  return OCC.test(symbol) ? '张' : '股'
+}
+
 function pnlClass(value: number | null | undefined) {
   return (value ?? 0) >= 0 ? 'positive' : 'negative'
 }
@@ -72,15 +77,15 @@ function StrategyDetail({ row }: { row: StrategyPerformance }) {
       </Card>
     </div>
     <Card style={{ marginTop: 16 } as any}>
-      <div className="card-header"><div><h2>逐笔交易</h2><p>入场理由来自买入信号，离场方式来自成交订单类型</p></div></div>
-      {row.open_lots.length > 0 && <div className="warning-callout" style={{ margin: '0 16px 12px' }}>未平仓：{row.open_lots.map((lot) => `${lot.symbol} ${lot.qty} 股 @ ${money(lot.entry_price)}`).join('；')}</div>}
+      <div className="card-header"><div><h2>逐笔交易</h2><p>入场理由来自开仓信号，离场方式来自成交订单类型；期权盈亏按每张 100 股计算</p></div></div>
+      {row.open_lots.length > 0 && <div className="warning-callout" style={{ margin: '0 16px 12px' }}>未平仓：{row.open_lots.map((lot) => `${lot.symbol}${lot.side === 'short' ? '（空头）' : ''} ${lot.qty} ${unit(lot.symbol)} @ ${money(lot.entry_price)}`).join('；')}</div>}
       {row.trade_list.length ? <div className="table-scroll"><table className="data-table">
         <thead><tr><th>代码</th><th>入场</th><th>离场</th><th>数量</th><th>盈亏</th><th>持仓</th><th>离场方式</th><th>入场理由</th></tr></thead>
         <tbody>{row.trade_list.map((trade) => <tr key={`${trade.exit_order_id}-${trade.entry_time}`}>
-          <td className="symbol-cell">{trade.symbol}</td>
+          <td className="symbol-cell">{trade.symbol}{trade.side === 'short' && <div className="field-hint">做空</div>}</td>
           <td>{formatTime(trade.entry_time)}<div className="field-hint">{money(trade.entry_price)}</div></td>
           <td>{formatTime(trade.exit_time)}<div className="field-hint">{money(trade.exit_price)}</div></td>
-          <td>{trade.qty}</td>
+          <td>{trade.qty} {unit(trade.symbol)}</td>
           <td className={pnlClass(trade.pnl)}>{money(trade.pnl)}<div className="field-hint">{trade.pnl_pct.toFixed(2)}%</div></td>
           <td>{minutes(trade.holding_minutes)}</td>
           <td>{trade.exit_label}{trade.exit_reason ? `：${trade.exit_reason}` : ''}</td>

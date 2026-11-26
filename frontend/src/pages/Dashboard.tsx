@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Activity, CircleDollarSign, Landmark, Power, Radio, WalletCards } from 'lucide-react'
 import { api, formatTime, money } from '../api'
+import { actionLabel, actionTone } from '../labels'
 import { connectionPresentation, enginePresentation } from '../status'
 import type { DashboardData } from '../types'
 import { Badge, Card, Empty, ErrorPanel, Loading, PageHeader, StatCard } from '../components/UI'
@@ -74,7 +75,7 @@ export default function Dashboard() {
               <table className="data-table"><thead><tr><th>时间</th><th>代码</th><th>动作</th><th>参考价</th><th>状态</th><th>原因</th></tr></thead>
                 <tbody>{data.signals.map((signal, index) => <tr key={`${signal.created_at}-${index}`}>
                   <td>{formatTime(signal.created_at)}</td><td className="symbol-cell">{signal.symbol}</td>
-                  <td><Badge tone={signal.action === 'buy' ? 'success' : 'warning'}>{signal.action === 'buy' ? '买入' : '卖出'}</Badge></td>
+                  <td><Badge tone={actionTone(signal.action)}>{actionLabel(signal.action)}</Badge></td>
                   <td>{money(signal.price)}</td><td>{signal.status}</td><td>{signal.reason}</td>
                 </tr>)}</tbody>
               </table></div> : <Empty title="尚未产生交易信号" detail="策略只会基于已经完成的K线触发，并使用唯一键避免重复下单。" />}

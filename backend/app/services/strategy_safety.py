@@ -43,7 +43,7 @@ def strategy_has_unresolved_execution(
         select(StrategyPosition.id).where(
             StrategyPosition.user_id == user_id,
             StrategyPosition.strategy_id == strategy_id,
-            StrategyPosition.qty > 0,
+            StrategyPosition.qty != 0,
         )
     )
     return unresolved_signal or active_order or owned_position is not None

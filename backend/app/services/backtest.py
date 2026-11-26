@@ -27,6 +27,7 @@ class Position:
     trailing_mode: str | None = None
     high_water: float = 0
     entry_fees: float = 0
+    short: bool = False
 
 
 @dataclass(slots=True)
@@ -64,16 +65,19 @@ def _price_guard(entry_price: float, guard: PriceGuard | None, atr_value: float 
 
 
 def _position_size(definition: RuleDefinition, equity: float, cash: float, price: float, stop: float | None) -> float:
+    """Shares to open. For shorts ``cash`` is the remaining 1x short capacity."""
     config = definition.position
+    short = definition.is_short
     if config.mode == "fixed_qty":
         qty = config.value
     elif config.mode == "fixed_notional":
         qty = config.value / price
     elif config.mode == "risk_based":
-        if stop is None or price <= stop:
+        risk_per_share = (stop - price) if short and stop is not None else (price - stop if stop is not None else 0)
+        if stop is None or risk_per_share <= 0:
             return 0
         risk_dollars = equity * config.value / 100
-        qty = risk_dollars / (price - stop)
+        qty = risk_dollars / risk_per_share
     else:
         qty = equity * config.value / 100 / price
     return max(0, min(qty, cash / price))
@@ -136,6 +140,8 @@ def run_backtest(
     day_start_equity = initial_cash
     day_high_equity = initial_cash
     halted = False
+    short = definition.is_short
+    sign = -1 if short else 1
 
     def session(timestamp):
         ts = pd.Timestamp(timestamp)
@@ -159,27 +165,40 @@ def run_backtest(
         value = cash
         for symbol, position in positions.items():
             mark = mark_prices.get(symbol, position.average_price)
-            value += position.qty * mark
+            value += sign * position.qty * mark
         return value
+
+    def gross_exposure() -> float:
+        return sum(position.qty * mark_prices.get(symbol, position.average_price)
+                   for symbol, position in positions.items())
 
     def close_position(symbol: str, timestamp: pd.Timestamp, price: float, reason: str) -> None:
         nonlocal cash
         position = positions.pop(symbol)
-        exit_price = price * (1 - slippage)
-        proceeds = position.qty * exit_price - commission
-        cash += proceeds
-        cost = position.qty * position.average_price + position.entry_fees
-        pnl = proceeds - cost
+        if position.short:
+            # Buy to cover at a worse (higher) price; proceeds were credited at entry.
+            exit_price = price * (1 + slippage)
+            cash -= position.qty * exit_price + commission
+            pnl = position.qty * (position.average_price - exit_price) - position.entry_fees - commission
+            return_pct = (1 - exit_price / position.average_price) * 100
+        else:
+            exit_price = price * (1 - slippage)
+            proceeds = position.qty * exit_price - commission
+            cash += proceeds
+            cost = position.qty * position.average_price + position.entry_fees
+            pnl = proceeds - cost
+            return_pct = (exit_price / position.average_price - 1) * 100
         trades.append(
             {
                 "symbol": symbol,
+                **({"side": "short"} if position.short else {}),
                 "entry_time": position.entry_time.isoformat(),
                 "exit_time": timestamp.isoformat(),
                 "qty": round(position.qty, 6),
                 "entry_price": round(position.average_price, 4),
                 "exit_price": round(exit_price, 4),
                 "pnl": round(pnl, 2),
-                "return_pct": round((exit_price / position.average_price - 1) * 100, 3),
+                "return_pct": round(return_pct, 3),
                 "reason": reason,
                 "bars_held": max(
                     1,
@@ -232,29 +251,41 @@ def run_backtest(
                         continue
                     if action.session_date is None:
                         action.session_date = session_date
-                    if float(row["low"]) > action.limit_price:
-                        continue
-                    raw_fill = min(float(row["open"]), action.limit_price)
+                    if short:
+                        if float(row["high"]) < action.limit_price:
+                            continue
+                        raw_fill = max(float(row["open"]), action.limit_price)
+                    else:
+                        if float(row["low"]) > action.limit_price:
+                            continue
+                        raw_fill = min(float(row["open"]), action.limit_price)
                 else:
                     raw_fill = float(row["open"])
-                fill = raw_fill * (1 + slippage)
+                fill = raw_fill * (1 - slippage if short else 1 + slippage)
                 if action.limit_price is not None:
-                    fill = min(fill, action.limit_price)
+                    fill = max(fill, action.limit_price) if short else min(fill, action.limit_price)
                 equity = current_equity()
-                stop = _price_guard(fill, definition.order.stop_loss, action.stop_atr, "stop")
-                take = _price_guard(fill, definition.order.take_profit, action.take_atr, "take")
-                if (definition.order.stop_loss and (stop is None or stop <= 0)) or (definition.order.take_profit and take is None):
+                stop = _price_guard(fill, definition.order.stop_loss, action.stop_atr, "take" if short else "stop")
+                take = _price_guard(fill, definition.order.take_profit, action.take_atr, "stop" if short else "take")
+                if (definition.order.stop_loss and (stop is None or stop <= 0)) or (definition.order.take_profit and (take is None or take <= 0)):
                     pending.pop(symbol, None)
                     continue
-                qty = _position_size(definition, equity, max(0, cash - commission), fill, stop)
+                if short:
+                    # Reg-T style 1x: total short value never exceeds equity.
+                    capacity = max(0, equity - gross_exposure() - commission)
+                    qty = _position_size(definition, equity, capacity, fill, stop)
+                else:
+                    qty = _position_size(definition, equity, max(0, cash - commission), fill, stop)
                 max_notional = equity * max_symbol_pct / 100
                 current_notional = positions[symbol].qty * fill if symbol in positions else 0
                 qty = min(qty, max(0, max_notional - current_notional) / fill)
-                invested = equity - cash
+                invested = gross_exposure() if short else equity - cash
                 qty = min(qty, max(0, equity * max_exposure_pct / 100 - invested) / fill)
-                qty = normalize_entry_qty(qty, definition)
-                if qty * fill + commission <= cash and qty > 0:
-                    cash -= qty * fill + commission
+                qty = normalize_entry_qty(qty, definition, fractionable=not short)
+                affordable = (qty * fill <= max(0, equity - gross_exposure()) and commission <= cash + qty * fill
+                              if short else qty * fill + commission <= cash)
+                if affordable and qty > 0:
+                    cash += (qty * fill - commission) if short else -(qty * fill + commission)
                     if symbol in positions:
                         old = positions[symbol]
                         total_qty = old.qty + qty
@@ -277,6 +308,7 @@ def run_backtest(
                             trailing_mode=trailing.mode if trailing else None,
                             high_water=fill,
                             entry_fees=commission,
+                            short=short,
                         )
                     last_entry_index[symbol] = frames[symbol].index.get_loc(timestamp)
             pending.pop(symbol, None)
@@ -294,6 +326,15 @@ def run_backtest(
                     trailing_price = position.high_water * (1 - position.trailing_value / 100)
                 else:
                     trailing_price = position.high_water - position.trailing_value
+            if position.short:
+                if position.stop_price is not None and float(row["high"]) >= position.stop_price:
+                    close_position(symbol, timestamp, max(float(row["open"]), position.stop_price), "止损")
+                    pending.pop(symbol, None)
+                    continue
+                if position.take_price is not None and float(row["low"]) <= position.take_price:
+                    close_position(symbol, timestamp, min(float(row["open"]), position.take_price), "止盈")
+                    pending.pop(symbol, None)
+                continue
             effective_stop = max(
                 value for value in [position.stop_price, trailing_price] if value is not None
             ) if any(value is not None for value in [position.stop_price, trailing_price]) else None
@@ -332,7 +373,7 @@ def run_backtest(
                 limit = None
                 if definition.order.type == "limit":
                     limit = float(row["close"]) * (
-                        1 - definition.order.limit_offset_bps / 10_000
+                        1 + (1 if short else -1) * definition.order.limit_offset_bps / 10_000
                     )
                 values = {name: float(series.loc[timestamp]) for name, series in protection_atr[symbol].items()}
                 if any(not math.isfinite(value) for value in values.values()):
@@ -345,7 +386,7 @@ def run_backtest(
         for symbol, row in rows.items():
             mark_prices[symbol] = float(row["close"])
         equity = current_equity()
-        invested = equity - cash
+        invested = gross_exposure() if short else equity - cash
         equity_points.append({"timestamp": timestamp.isoformat(), "equity": round(equity, 2)})
         exposure_points.append(max(0, invested / equity) if equity else 0)
 

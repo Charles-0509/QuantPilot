@@ -49,6 +49,22 @@ export type RuleDefinition = {
     trailing_stop: { mode: 'percent' | 'price'; value: number } | null
   }
   risk: { max_symbol_pct: number; max_positions: number; cooldown_bars: number }
+  direction?: 'long' | 'short'
+  instrument?: 'stock' | 'option'
+  option?: OptionConfig | null
+}
+
+export type OptionConfig = {
+  right: 'call' | 'put'
+  min_dte: number
+  max_dte: number
+  strike_mode: 'atm' | 'otm_pct' | 'itm_pct'
+  strike_offset_pct: number
+  min_open_interest: number
+  max_spread_pct: number
+  stop_loss_pct: number | null
+  take_profit_pct: number | null
+  close_dte: number
 }
 
 export type PriceGuard = { mode: 'percent' | 'atr'; value: number; atr_period: number }
@@ -170,9 +186,14 @@ export type PortfolioPosition = {
   unrealized_pl: number
   unrealized_plpc: number
   change_today_pct: number
-  owners: Array<{ strategy_id: string; strategy_name: string; qty: number }>
+  owners: Array<{ strategy_id: string; strategy_name: string; qty: number; side?: 'long' | 'short' }>
   strategy_qty: number
   unattributed_qty: number
+  instrument?: 'stock' | 'option'
+  underlying?: string
+  expiration?: string
+  option_right?: 'call' | 'put'
+  strike?: number
 }
 
 export type PortfolioOrder = {
@@ -303,6 +324,7 @@ export type PerformanceTrade = {
   pnl_pct: number
   holding_minutes: number
   exit_order_id: string
+  side?: 'long' | 'short'
 }
 
 export type StrategyPerformance = {
@@ -325,7 +347,7 @@ export type StrategyPerformance = {
   exit_breakdown: Record<string, { count: number; pnl: number }>
   curve: Array<{ time: string; pnl: number }>
   trade_list: PerformanceTrade[]
-  open_lots: Array<{ symbol: string; qty: number; entry_price: number; entry_time: string; current_price: number | null; unrealized_pnl: number | null }>
+  open_lots: Array<{ symbol: string; qty: number; side?: 'long' | 'short'; entry_price: number; entry_time: string; current_price: number | null; unrealized_pnl: number | null }>
   ownership_cleared_qty: number
   unmatched_sell_qty: number
   diagnosis: string[]

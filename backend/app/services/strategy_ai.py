@@ -39,7 +39,7 @@ class StrategyAIError(RuntimeError):
 def system_prompt() -> str:
     example = {key: TEMPLATES[key] for key in ("rsi_reversion", "donchian_breakout")}
     return (
-        "你把用户的中文交易想法转换成 QuantPilot 的 RuleDefinition JSON（只做多的美股/ETF，"
+        "你把用户的中文交易想法转换成 QuantPilot 的 RuleDefinition JSON（美股/ETF，"
         "在已完成K线上计算，信号在下一可交易时点执行）。\n"
         "只输出一个 JSON 对象：{\"definition\": RuleDefinition, \"explanation\": 中文逐条解释规则, "
         "\"assumptions\": [用户没说清而你替他做的假设]}。\n"
@@ -53,6 +53,13 @@ def system_prompt() -> str:
         "- order：止损和止盈要么同时设置（bracket，mode percent|atr），要么都为 null；移动止损 trailing_stop 不能与 bracket 同时使用。"
         "用户未提风控时设置 2% 止损、4% 止盈，并写进 assumptions。\n"
         "- warmup_bars ≥ 最长指标周期的 3 倍且 ≥30；label 用简短中文。\n"
+        "- 方向与品种：默认 direction='long'、instrument='stock'、option=null。用户明确要做空股票时 direction='short'"
+        "（entry 为开空条件、exit 为平空条件；止损在上方、止盈在下方；不能用移动止损；只做易借券股票、整股）。"
+        "用户要交易期权时 instrument='option'、direction='long'，option={right:'call'|'put', min_dte, max_dte, "
+        "strike_mode:'atm'|'otm_pct'|'itm_pct', strike_offset_pct, min_open_interest, max_spread_pct, stop_loss_pct, "
+        "take_profit_pct, close_dte}；只买入开仓（看涨用 call，看跌用 put，不卖出开仓）；条件在标的K线上计算；"
+        "order.stop_loss/take_profit/trailing_stop 必须为 null，order.time_in_force='day'，position.mode 不能是 risk_based；"
+        "close_dte 必须小于 min_dte；用户未说明时用 min_dte 14、max_dte 45、atm、stop_loss_pct 50、take_profit_pct 100、close_dte 1。\n"
         "- 无法用现有指标表达的部分，用最接近的近似并在 assumptions 中说明，不要编造字段。\n"
         "示例定义：" + json.dumps(example, ensure_ascii=False)
     )
@@ -67,8 +74,14 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 def review_warnings(definition: RuleDefinition) -> list[str]:
     warnings = []
-    if not (definition.order.stop_loss or definition.order.trailing_stop):
+    if definition.is_option:
+        if not definition.option.stop_loss_pct:
+            warnings.append("期权没有设置权利金止损，最多可能亏掉全部权利金。")
+        warnings.append("期权回测使用免费 indicative 数据（非交易所实际报价），只能从 2024 年 2 月开始。")
+    elif not (definition.order.stop_loss or definition.order.trailing_stop):
         warnings.append("没有设置止损，单笔亏损没有上限。")
+    if definition.is_short:
+        warnings.append("做空理论上亏损没有上限，股价跳空上涨时止损可能以更差价格成交。")
     if definition.timeframe == "5Min":
         warnings.append("5分钟线交易频繁，免费 IEX 行情成交量偏少，信号可能失真。")
     if definition.position.mode == "percent_equity" and definition.position.value > 20:

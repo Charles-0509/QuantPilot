@@ -40,6 +40,14 @@ from .alpaca_service import (
 )
 
 from .indicators import latest_atr
+from .instruments import (
+    days_to_expiry,
+    choose_contract,
+    is_option_symbol,
+    parse_option_symbol,
+    round_option_price,
+    underlying_of,
+)
 from .risk import RiskManager, as_float
 from .rules import RuleResult, required_history, operand_required_history, evaluate_latest
 from .sizing import normalize_entry_qty
@@ -77,6 +85,11 @@ OWNERSHIP_LAG_ESCALATE_SECONDS = 600
 OWNERSHIP_LAG_REASON = "券商持仓尚未反映已成交买单，暂停新订单等待对账"
 HOLD_REASON_PREFIX = "执行安全核对中："
 UNRESOLVED_ORDER_STATUSES = ("pending_submission", "pending_reconciliation")
+# Signal actions. Long strategies keep the original buy/sell pair; short
+# strategies sell to open ("short") and buy to cover ("cover").
+ENTRY_ACTIONS = ("buy", "short")
+SHORT_ACTIONS = ("short", "cover")
+ORDER_SIDE_FOR_ACTION = {"buy": "buy", "sell": "sell", "short": "sell", "cover": "buy"}
 
 
 class StrategyOrderCancellationError(RuntimeError):
@@ -657,10 +670,23 @@ class TradingEngine:
                 qty=0,
             )
             db.add(position)
-        if record.side == "buy":
+        if self._record_is_short(db, record):
+            # Short ledger rows are negative: sells open, buys cover (never past zero).
+            if record.side == "sell":
+                position.qty -= delta
+            else:
+                position.qty = min(0.0, position.qty + delta)
+        elif record.side == "buy":
             position.qty += delta
         else:
             position.qty = max(0.0, position.qty - delta)
+
+    @staticmethod
+    def _record_is_short(db, record: OrderRecord) -> bool:
+        if not record.signal_id:
+            return False
+        signal = db.get(Signal, record.signal_id)
+        return signal is not None and signal.action in SHORT_ACTIONS
 
     def _owned_qty(self, strategy_id: str, symbol: str) -> float:
         with SessionLocal() as db:
@@ -672,6 +698,28 @@ class TradingEngine:
                 )
             )
             return max(0.0, position.qty if position else 0.0)
+
+    def _owned_short_qty(self, strategy_id: str, symbol: str) -> float:
+        with SessionLocal() as db:
+            position = db.scalar(
+                select(StrategyPosition).where(
+                    StrategyPosition.user_id == self.user_id,
+                    StrategyPosition.strategy_id == strategy_id,
+                    StrategyPosition.symbol == symbol,
+                )
+            )
+            return max(0.0, -(position.qty if position else 0.0))
+
+    def _owned_option_contracts(self, strategy_id: str, underlying: str) -> dict[str, float]:
+        """Contracts this strategy holds for one underlying (ledger only)."""
+        with SessionLocal() as db:
+            rows = db.scalars(select(StrategyPosition).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.strategy_id == strategy_id,
+                StrategyPosition.qty > 0,
+            )).all()
+        return {row.symbol.upper(): row.qty for row in rows
+                if is_option_symbol(row.symbol) and underlying_of(row.symbol) == underlying.upper()}
 
     @staticmethod
     def _order_status_str(order: dict[str, Any]) -> str:
@@ -808,6 +856,121 @@ class TradingEngine:
         )
         raise LongOnlyInvariantError(symbol, reason)
 
+    @classmethod
+    def _reserved_cover_qty(
+        cls,
+        orders: list[dict[str, Any]],
+        symbol: str,
+        *,
+        exclude_client_order_id: str = "",
+    ) -> float:
+        """Open buy quantity that would cover a short (mirror of _reserved_sell_qty)."""
+        groups: dict[str, float] = {}
+        normalized = symbol.upper()
+        flattened = cls._flatten_orders(orders)
+        by_id = {str(order.get('id')): order for order in flattened}
+        for order in flattened:
+            if cls._order_is_terminal(order) or cls._order_side(order) != "buy":
+                continue
+            if str(order.get("symbol", "")).upper() != normalized:
+                continue
+            parent = by_id.get(str(order.get('parent_order_id') or ''))
+            if (cls._order_status_str(order) == 'held' and parent
+                and cls._order_side(parent) == 'sell'
+                and str(parent.get('order_class', '')).lower().split('.')[-1] in {'bracket', 'oto'}
+                and not cls._order_is_terminal(parent)
+                and as_float(parent.get('filled_qty')) < as_float(parent.get('qty'))):
+                continue
+            if exclude_client_order_id and str(order.get("client_order_id") or "") == exclude_client_order_id:
+                continue
+            remaining = max(0.0, as_float(order.get("qty")) - as_float(order.get("filled_qty")))
+            if remaining <= 0:
+                continue
+            parent_id = str(order.get("parent_order_id") or "")
+            identity = str(order.get("id") or order.get("client_order_id") or id(order))
+            group = f"parent:{parent_id}" if parent_id else f"single:{identity}"
+            groups[group] = max(groups.get(group, 0.0), remaining)
+        return sum(groups.values())
+
+    @classmethod
+    def _short_entry_sell_qty(cls, orders: list[dict[str, Any]], symbol: str) -> float:
+        """Remaining quantity of open QuantPilot short-sale entries."""
+        total = 0.0
+        for order in cls._flatten_orders(orders):
+            if (str(order.get("symbol", "")).upper() == symbol.upper() and cls._order_side(order) == "sell"
+                    and not cls._order_is_terminal(order) and not order.get("parent_order_id")
+                    and (str(order.get("client_order_id") or "").startswith("qp-x-") or order.get("_entry"))):
+                total += max(0.0, as_float(order.get("qty")) - as_float(order.get("filled_qty")))
+        return total
+
+    def _ledger_by_symbol(self, symbol: str | None = None) -> tuple[dict[str, float], dict[str, float]]:
+        """(long, short) strategy-owned quantities by symbol; shorts are positive magnitudes."""
+        with SessionLocal() as db:
+            statement = select(StrategyPosition).where(
+                StrategyPosition.user_id == self.user_id, StrategyPosition.qty != 0)
+            if symbol is not None:
+                statement = statement.where(StrategyPosition.symbol == symbol.upper())
+            rows = db.scalars(statement).all()
+        long_owned: dict[str, float] = defaultdict(float)
+        short_owned: dict[str, float] = defaultdict(float)
+        for row in rows:
+            if row.qty > 0:
+                long_owned[row.symbol.upper()] += row.qty
+            else:
+                short_owned[row.symbol.upper()] += -row.qty
+        return long_owned, short_owned
+
+    async def _fresh_capacity_snapshot(self, message: str):
+        started_at = datetime.now(timezone.utc).isoformat()
+        try:
+            positions = await self._fresh_positions()
+            positions_at = datetime.now(timezone.utc).isoformat()
+            open_orders = await self._fresh_open_orders()
+        except Exception as exc:
+            raise AlpacaTransientError(message) from exc
+        return positions, open_orders, {
+            "snapshot_started_at": started_at, "positions_observed_at": positions_at,
+            "orders_observed_at": datetime.now(timezone.utc).isoformat()}
+
+    def _raise_short_incident(self, symbol, reason, positions, open_orders, times, source, **extra) -> None:
+        self._activate_execution_incident(
+            symbol, reason,
+            details={**self._incident_snapshot_details(symbol, positions, open_orders, **times),
+                     "source": source, **extra},
+        )
+        raise LongOnlyInvariantError(symbol, reason)
+
+    async def _verify_short_entry_capacity(self, symbol: str, intended_qty: float, client_order_id: str) -> None:
+        """Right before a short sale: the account short must be fully owned by strategies, never mixed with a long."""
+        positions, open_orders, times = await self._fresh_capacity_snapshot("无法取得最新持仓和开放订单，已阻止做空卖单提交")
+        actual = self._position_qty(positions, symbol)
+        long_owned, short_owned = self._ledger_by_symbol(symbol)
+        if intended_qty <= 0 or intended_qty != math.floor(intended_qty):
+            raise LongOnlyInvariantError(symbol, "做空数量必须是正整数股")
+        if actual > 1e-6 or long_owned.get(symbol.upper(), 0.0) > 1e-6:
+            # A long holding is not a breach; selling into it would close it instead of opening a short.
+            raise LongOnlyInvariantError(symbol, "该标的存在多头持仓，已取消做空卖单")
+        if -actual > short_owned.get(symbol.upper(), 0.0) + 1e-6:
+            self._raise_short_incident(symbol, "券商空头数量超过策略归属，禁止继续做空", positions, open_orders, times,
+                                       "pre_submit_short_capacity", actual_qty=actual,
+                                       owned_short_qty=short_owned.get(symbol.upper(), 0.0), intended_qty=intended_qty)
+
+    async def _verify_cover_capacity(self, symbol: str, intended_qty: float, client_order_id: str) -> None:
+        """Right before buy-to-cover: never buy more than the actual short (no flip to long)."""
+        positions, open_orders, times = await self._fresh_capacity_snapshot("无法取得最新持仓和开放订单，已阻止平空买单提交")
+        actual = self._position_qty(positions, symbol)
+        reserved = self._reserved_cover_qty(open_orders, symbol, exclude_client_order_id=client_order_id)
+        if actual > 1e-6:
+            reason = "做空标的出现券商多头持仓，禁止继续买入"
+        elif intended_qty <= 0:
+            reason = "待提交平空买单数量无效"
+        elif reserved + intended_qty > max(-actual, 0.0) + 1e-6:
+            reason = "平空买单与其他开放买单合计超过实际空头"
+        else:
+            return
+        self._raise_short_incident(symbol, reason, positions, open_orders, times, "pre_submit_cover_capacity",
+                                   actual_qty=actual, reserved_cover_qty=reserved, intended_qty=intended_qty)
+
     def _active_incident_symbols(self) -> list[str]:
         with SessionLocal() as db:
             return list(
@@ -835,7 +998,7 @@ class TradingEngine:
             owned_rows = db.scalars(select(StrategyPosition).where(
                 StrategyPosition.user_id == self.user_id,
                 StrategyPosition.symbol == normalized,
-                StrategyPosition.qty > 0,
+                StrategyPosition.qty != 0,
             )).all()
             details['owned_qty'] = sum(row.qty for row in owned_rows)
             details['owned_breakdown'] = {row.strategy_id: row.qty for row in owned_rows}
@@ -920,23 +1083,26 @@ class TradingEngine:
         positions: list[dict[str, Any]],
         open_orders: list[dict[str, Any]],
     ) -> dict[str, str]:
-        with SessionLocal() as db:
-            owned_rows = db.scalars(
-                select(StrategyPosition).where(
-                    StrategyPosition.user_id == self.user_id,
-                    StrategyPosition.qty > 0,
-                )
-            ).all()
-        owned_by_symbol: dict[str, float] = defaultdict(float)
-        for row in owned_rows:
-            owned_by_symbol[row.symbol.upper()] += row.qty
-        symbols = set(owned_by_symbol)
+        """Broker positions and open orders must match strategy ownership.
+
+        Long symbols keep the original long-only rules. A symbol is short-managed
+        while a strategy owns a short in it or has an open short-sale entry; then
+        the broker short must equal the owned short exactly and never mix with a long.
+        """
+        owned_by_symbol, short_by_symbol = self._ledger_by_symbol()
+        symbols = set(owned_by_symbol) | set(short_by_symbol)
         symbols.update(str(position.get("symbol", "")).upper() for position in positions)
         symbols.update(str(order.get("symbol", "")).upper() for order in open_orders)
         violations: dict[str, str] = {}
         for symbol in sorted(symbol for symbol in symbols if symbol):
             actual_qty = self._position_qty(positions, symbol)
             owned_qty = owned_by_symbol.get(symbol, 0.0)
+            short_owned = short_by_symbol.get(symbol, 0.0)
+            if short_owned > 1e-6 or self._short_entry_sell_qty(open_orders, symbol) > 1e-6:
+                reason = self._short_violation(symbol, actual_qty, owned_qty, short_owned, open_orders)
+                if reason:
+                    violations[symbol] = reason
+                continue
             reserved_sell_qty = self._reserved_sell_qty(open_orders, symbol)
             if actual_qty < -1e-6:
                 violations[symbol] = "券商账户出现空头持仓"
@@ -945,6 +1111,24 @@ class TradingEngine:
             elif reserved_sell_qty > max(actual_qty, 0.0) + 1e-6:
                 violations[symbol] = "开放卖单数量超过 券商实际多头持仓"
         return violations
+
+    def _short_violation(self, symbol: str, actual_qty: float, long_owned: float, short_owned: float,
+                         open_orders: list[dict[str, Any]]) -> str:
+        short_actual = max(0.0, -actual_qty)
+        other_sells = self._reserved_sell_qty(open_orders, symbol) - self._short_entry_sell_qty(open_orders, symbol)
+        if long_owned > 1e-6:
+            return "同一标的同时存在策略多头和空头归属"
+        if actual_qty > 1e-6:
+            return "做空标的出现券商多头持仓"
+        if short_actual > short_owned + 1e-6:
+            return "券商空头数量超过策略归属空头"
+        if short_owned > short_actual + 1e-6:
+            return "策略归属空头超过券商实际空头"
+        if self._reserved_cover_qty(open_orders, symbol) > short_actual + 1e-6:
+            return "开放买入平仓单数量超过券商实际空头"
+        if other_sells > 1e-6:
+            return "做空标的存在非策略开放卖单"
+        return ""
 
     def _sync_audit_fills(self, orders: list[dict[str, Any]]) -> dict[str, str]:
         # The all-orders response can precede executions seen by the fresh reads.
@@ -973,6 +1157,9 @@ class TradingEngine:
     ) -> bool:
         """Only a previously covered, tracked executing exit may justify a re-read."""
         actual = self._position_qty(positions, symbol)
+        _long, short_owned = self._ledger_by_symbol(symbol)
+        if short_owned.get(symbol, 0.0) > 1e-6:
+            return self._possible_cover_snapshot_race(symbol, actual, short_owned[symbol], orders)
         if actual < -1e-6:
             return False
         sells = [order for order in self._flatten_orders(orders)
@@ -1001,6 +1188,45 @@ class TradingEngine:
         # grace period to an order that exceeds that ledger, or to a short.
         return actual < owned and owned - actual <= reserved + 1e-6 and reserved <= owned + 1e-6
 
+    def _possible_cover_snapshot_race(self, symbol: str, actual: float, short_owned: float,
+                                      orders: list[dict[str, Any]]) -> bool:
+        """A tracked buy-to-cover executing between the position and order reads."""
+        if actual > 1e-6:
+            return False
+        covers = [order for order in self._flatten_orders(orders)
+                  if str(order.get('symbol', '')).upper() == symbol and self._order_side(order) == 'buy'
+                  and not self._order_is_terminal(order)]
+        if not covers or not any(as_float(order.get('filled_qty')) > 0
+                                 or str(order.get('type', '')).lower() == 'market' for order in covers):
+            return False
+        with SessionLocal() as db:
+            for order in covers:
+                record = db.scalar(select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id, OrderRecord.id == str(order.get('id') or '')))
+                if (record is None or not record.strategy_id or record.qty is None
+                        or as_float(order.get('qty')) > record.qty + 1e-6):
+                    return False
+        reserved = self._reserved_cover_qty(covers, symbol)
+        short_actual = -actual
+        return short_actual < short_owned and short_owned - short_actual <= reserved + 1e-6 and reserved <= short_owned + 1e-6
+
+    def _recent_owned_fill_qty(self, symbol: str, orders: list[dict[str, Any]], side: str) -> float:
+        now = datetime.now(timezone.utc)
+        total = 0.0
+        with SessionLocal() as db:
+            for order in self._flatten_orders(orders):
+                if (str(order.get('symbol', '')).upper() != symbol or self._order_side(order) != side
+                        or as_float(order.get('filled_qty')) <= 0):
+                    continue
+                seen = self._payload_datetime(order.get('filled_at') or order.get('updated_at'))
+                if seen is None or (now - seen).total_seconds() > ENTRY_FILL_LAG_WINDOW_SECONDS:
+                    continue
+                record = db.scalar(select(OrderRecord).where(
+                    OrderRecord.user_id == self.user_id, OrderRecord.id == str(order.get('id') or '')))
+                if record is not None and record.strategy_id:
+                    total += as_float(order.get('filled_qty'))
+        return total
+
     def _recent_owned_buy_fill_qty(self, symbol: str, orders: list[dict[str, Any]]) -> float:
         now = datetime.now(timezone.utc)
         total = 0.0
@@ -1026,6 +1252,12 @@ class TradingEngine:
     ) -> bool:
         """A just-filled tracked buy can reach the ledger before the position endpoint."""
         actual = self._position_qty(positions, symbol)
+        _long, short_owned = self._ledger_by_symbol(symbol)
+        if short_owned.get(symbol, 0.0) > 1e-6:
+            # Same lag for a just-filled short sale: the owned short leads the position endpoint.
+            gap = short_owned[symbol] - max(0.0, -actual)
+            return (actual <= 1e-6 and gap > 1e-6
+                    and gap <= self._recent_owned_fill_qty(symbol, observed_orders, 'sell') + 1e-6)
         if actual < -1e-6 or self._reserved_sell_qty(open_orders, symbol) > max(actual, 0.0) + 1e-6:
             return False
         with SessionLocal() as db:
@@ -1482,7 +1714,9 @@ class TradingEngine:
                 for item in prepared
                 if now_et.weekday() in item.definition.schedule.weekdays
             ]
-            if not eligible:
+            # Expiry and premium exits run on every trading day, whatever the entry schedule.
+            option_items = [item for item in prepared if item.definition.is_option]
+            if not eligible and not option_items:
                 await self._record_connection_recovery()
                 return
 
@@ -1536,6 +1770,11 @@ class TradingEngine:
                     "strategy",
                     f"策略 {item.strategy.name} 执行失败: {exc}",
                 )
+        if option_items and not self._abort_new_orders_for_cycle:
+            try:
+                await self._manage_option_positions(option_items, snapshot)
+            except Exception as exc:
+                await self.log("error", "strategy", f"期权持仓管理失败: {exc}")
 
     def _alpaca_connection_status(self) -> dict[str, Any]:
         status = getattr(self.alpaca, "connection_status", None)
@@ -1696,6 +1935,14 @@ class TradingEngine:
                 account_position_qty = as_float(
                     snapshot.position_map.get(symbol, {}).get("qty")
                 )
+                if definition.is_short or definition.is_option:
+                    outcome, has_position = await self._evaluate_derived_strategy(
+                        strategy, definition, symbol, frame, entry, exit_, snapshot, account_position_qty)
+                    self._last_evaluated[key] = latest_key
+                    self._record_evaluation(strategy, symbol, definition.timeframe, outcome, latest_timestamp,
+                                            entry_matched=bool(entry.matched), exit_matched=bool(exit_.matched),
+                                            has_position=has_position)
+                    continue
                 owned_qty = min(
                     self._owned_qty(strategy.id, symbol), account_position_qty
                 )
@@ -1764,6 +2011,61 @@ class TradingEngine:
             self._record_evaluation(strategy, symbol, definition.timeframe, outcome, latest_timestamp,
                                     entry_matched=bool(entry.matched), exit_matched=bool(exit_.matched),
                                     has_position=has_position)
+
+    def _supports(self, definition: RuleDefinition) -> str:
+        """Empty when the current broker can execute this strategy kind, else the reason."""
+        if definition.is_short and not getattr(self.alpaca, "supports_short", False):
+            return "当前券商接入不支持做空"
+        if definition.is_option and not getattr(self.alpaca, "supports_options", False):
+            return "当前券商接入不支持期权"
+        return ""
+
+    async def _evaluate_derived_strategy(
+        self, strategy: Strategy, definition: RuleDefinition, symbol: str, frame: pd.DataFrame,
+        entry: RuleResult, exit_: RuleResult, snapshot: "EvaluationSnapshot", account_position_qty: float,
+    ) -> tuple[str, bool]:
+        """Short-stock and long-option strategies; long stocks keep the original path."""
+        unsupported = self._supports(definition)
+        if unsupported:
+            await self._log_throttled(strategy, symbol, f"{strategy.name}: {unsupported}，未生成订单")
+            return "unsupported", False
+        if definition.is_short:
+            owned = min(self._owned_short_qty(strategy.id, symbol), max(0.0, -account_position_qty))
+            has_position = owned > 0
+            if has_position and exit_.matched:
+                await self._create_exit_signal(strategy, definition, symbol, frame, exit_, owned,
+                                               snapshot.open_orders, snapshot.positions, action="cover")
+                return "exit_signal", True
+        else:
+            contracts = {
+                contract: min(qty, as_float(snapshot.position_map.get(contract, {}).get("qty")))
+                for contract, qty in self._owned_option_contracts(strategy.id, symbol).items()
+            }
+            contracts = {contract: qty for contract, qty in contracts.items() if qty > 0}
+            has_position = bool(contracts)
+            if has_position and exit_.matched:
+                for contract, qty in sorted(contracts.items()):
+                    await self._create_exit_signal(strategy, definition, contract, frame, exit_, qty,
+                                                   snapshot.open_orders, snapshot.positions)
+                return "exit_signal", True
+        can_pyramid = definition.position.allow_pyramiding and await self._cooldown_passed(strategy.id, symbol, definition)
+        if entry.matched and (not has_position or can_pyramid):
+            if definition.is_short:
+                await self._create_entry_signal(strategy, definition, symbol, frame, entry, snapshot.account,
+                                                snapshot.positions, snapshot.open_orders, snapshot.clock)
+            else:
+                await self._create_option_entry_signal(strategy, definition, symbol, frame, entry, snapshot)
+            return "entry_signal", has_position
+        return ("entry_matched_holding" if entry.matched else "no_trigger"), has_position
+
+    async def _log_throttled(self, strategy: Strategy, symbol: str, message: str) -> None:
+        key = (strategy.id, f"notice:{symbol}")
+        now = datetime.now(timezone.utc)
+        last = self._last_insufficient_data_log.get(key)
+        if last is not None and (now - last).total_seconds() < INSUFFICIENT_DATA_LOG_INTERVAL_SECONDS:
+            return
+        self._last_insufficient_data_log[key] = now
+        await self.log("warning", "strategy", message)
 
     async def _log_insufficient_bars(
         self,
@@ -1919,7 +2221,7 @@ class TradingEngine:
             payload = signal.payload or {}
             client_order_id = str(payload.get("client_order_id") or "")
             if (
-                signal.action != "buy"
+                signal.action not in ENTRY_ACTIONS
                 or not client_order_id
                 or client_order_id in existing_client_ids
             ):
@@ -1929,7 +2231,8 @@ class TradingEngine:
                     "id": f"pending:{signal.id}",
                     "client_order_id": client_order_id,
                     "symbol": signal.symbol,
-                    "side": "buy",
+                    "side": ORDER_SIDE_FOR_ACTION[signal.action],
+                    **({"_entry": True} if signal.action == "short" else {}),
                     "qty": payload.get("qty"),
                     "status": signal.status,
                     "_estimated_notional": payload.get("notional"),
@@ -1938,32 +2241,46 @@ class TradingEngine:
         return enriched
 
     def _has_pending_reconciliation(self, strategy_id: str, symbol: str) -> bool:
-        """Return whether any unresolved order intent blocks another signal."""
+        """Return whether any unresolved order intent blocks another signal.
+
+        Option intents are stored under the contract symbol and block their underlying.
+        """
         with SessionLocal() as db:
-            return (
-                db.scalar(
-                    select(Signal.id).where(
-                        Signal.user_id == self.user_id,
-                        Signal.strategy_id == strategy_id,
-                        Signal.symbol == symbol,
-                        Signal.status.in_(UNRESOLVED_ORDER_STATUSES),
-                    )
+            symbols = db.scalars(
+                select(Signal.symbol).where(
+                    Signal.user_id == self.user_id,
+                    Signal.strategy_id == strategy_id,
+                    Signal.status.in_(UNRESOLVED_ORDER_STATUSES),
                 )
-                is not None
-            )
+            ).all()
+        target = symbol.upper()
+        return any(str(item).upper() == target
+                   or (is_option_symbol(item) and underlying_of(item) == target) for item in symbols)
 
     async def _cooldown_passed(self, strategy_id: str, symbol: str, definition: RuleDefinition) -> bool:
         with SessionLocal() as db:
-            last = db.scalar(
-                select(Signal)
-                .where(
-                    Signal.strategy_id == strategy_id,
-                    Signal.user_id == self.user_id,
-                    Signal.symbol == symbol,
-                    Signal.action == "buy",
+            if definition.is_option:
+                candidates = db.scalars(
+                    select(Signal)
+                    .where(
+                        Signal.strategy_id == strategy_id,
+                        Signal.user_id == self.user_id,
+                        Signal.action == "buy",
+                    )
+                    .order_by(Signal.bar_timestamp.desc())
+                ).all()
+                last = next((row for row in candidates if underlying_of(row.symbol) == symbol.upper()), None)
+            else:
+                last = db.scalar(
+                    select(Signal)
+                    .where(
+                        Signal.strategy_id == strategy_id,
+                        Signal.user_id == self.user_id,
+                        Signal.symbol == symbol,
+                        Signal.action == ("short" if definition.is_short else "buy"),
+                    )
+                    .order_by(Signal.bar_timestamp.desc())
                 )
-                .order_by(Signal.bar_timestamp.desc())
-            )
         if last is None:
             return True
         seconds = TIMEFRAME_SECONDS[definition.timeframe] * definition.risk.cooldown_bars
@@ -2009,13 +2326,14 @@ class TradingEngine:
         if definition.order.trailing_stop and not getattr(self.alpaca, 'supports_trailing_stop', True):
             await self.log('warning', 'risk', f'{strategy.name}: 当前券商接入不支持移动止损，未创建买单')
             return
+        short = definition.is_short
         price = float(frame.iloc[-1]["close"])
         equity = as_float(account.get("equity"))
         config = definition.position
         atr_value = latest_atr(frame, definition.order.stop_loss.atr_period if definition.order.stop_loss else 14)
-        stop_price = self._guard_price(price, definition.order.stop_loss, atr_value, False)
+        stop_price = self._guard_price(price, definition.order.stop_loss, atr_value, False, short=short)
         take_atr = latest_atr(frame, definition.order.take_profit.atr_period) if definition.order.take_profit else None
-        take_price = self._guard_price(price, definition.order.take_profit, take_atr, True)
+        take_price = self._guard_price(price, definition.order.take_profit, take_atr, True, short=short)
         if config.mode == "fixed_qty":
             qty = config.value
             desired_notional = qty * price
@@ -2023,11 +2341,13 @@ class TradingEngine:
             desired_notional = config.value
             qty = desired_notional / price
         elif config.mode == "risk_based":
-            if stop_price is None or stop_price >= price:
+            risk_per_share = (stop_price - price) if short and stop_price is not None else (
+                price - stop_price if stop_price is not None else 0)
+            if stop_price is None or risk_per_share <= 0:
                 await self.log("warning", "risk", f"{symbol} 无法计算风险仓位")
                 return
             risk_dollars = equity * config.value / 100
-            qty = risk_dollars / (price - stop_price)
+            qty = risk_dollars / risk_per_share
             desired_notional = qty * price
         else:
             desired_notional = equity * config.value / 100
@@ -2040,7 +2360,12 @@ class TradingEngine:
             # cycle, but allow the next cycle to make one controlled retry.
             self._abort_new_orders_for_cycle = True
             raise
-        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True))
+        if short:
+            blocked = self._short_entry_block_reason(account, asset, positions, symbol)
+            if blocked:
+                await self.log('warning', 'risk', f'{strategy.name}/{symbol}: {blocked}')
+                return
+        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True) and not short)
         desired_notional = qty * price
         validation_reason = self._validation_entry_reason(strategy.id, definition, qty=qty, notional=desired_notional)
         if validation_reason:
@@ -2088,20 +2413,23 @@ class TradingEngine:
             return
 
         timestamp = frame.index[-1].to_pydatetime()
-        client_id = self._client_order_id(strategy.id, symbol, timestamp, "buy")
-        limit_price = price * (1 - definition.order.limit_offset_bps / 10_000)
+        action = "short" if short else "buy"
+        client_id = self._client_order_id(strategy.id, symbol, timestamp, action)
+        offset = definition.order.limit_offset_bps / 10_000
+        limit_price = price * (1 + offset) if short else price * (1 - offset)
         signal = await self._persist_order_intent(
             strategy,
             symbol,
             timestamp,
-            "buy",
+            action,
             price,
-            "；".join(result.labels) or "入场条件成立",
+            "；".join(result.labels) or ("做空条件成立" if short else "入场条件成立"),
             {
                 "intent_version": 1,
                 "strategy_version": strategy.version,
                 "client_order_id": client_id,
-                "side": "buy",
+                "side": "sell" if short else "buy",
+                **({"direction": "short"} if short else {}),
                 "qty": qty,
                 "notional": desired_notional,
                 "original_qty": qty,
@@ -2143,22 +2471,30 @@ class TradingEngine:
         owned_qty: float,
         open_orders: list[dict[str, Any]],
         positions: list[dict[str, Any]],
+        *,
+        action: str = "sell",
+        timestamp: datetime | None = None,
+        price: float | None = None,
     ) -> None:
-        price = float(frame.iloc[-1]["close"])
-        timestamp = frame.index[-1].to_pydatetime()
-        client_id = self._client_order_id(strategy.id, symbol, timestamp, "sell")
+        price = float(frame.iloc[-1]["close"]) if price is None else price
+        timestamp = frame.index[-1].to_pydatetime() if timestamp is None else timestamp
+        client_id = self._client_order_id(strategy.id, symbol, timestamp, action)
+        extra: dict[str, Any] = {}
+        if is_option_symbol(symbol):
+            extra = {"instrument": "option", "underlying": underlying_of(symbol)}
         signal = await self._persist_order_intent(
             strategy,
             symbol,
             timestamp,
-            "sell",
+            action,
             price,
-            "；".join(result.labels) or "离场条件成立",
+            "；".join(result.labels) or ("平空条件成立" if action == "cover" else "离场条件成立"),
             {
+                **extra,
                 "intent_version": 1,
                 "strategy_version": strategy.version,
                 "client_order_id": client_id,
-                "side": "sell",
+                "side": ORDER_SIDE_FOR_ACTION[action],
                 "qty": owned_qty,
                 "notional": None,
                 "order_type": "market",
@@ -2188,7 +2524,7 @@ class TradingEngine:
             f"{timestamp.isoformat()}:{action}"
         ).encode("utf-8")
         digest = hashlib.sha256(material).hexdigest()[:40]
-        side = "t" if action == "trail" else ("s" if action == "sell" else "b")
+        side = {"trail": "t", "sell": "s", "short": "x", "cover": "c"}.get(action, "b")
         return f"qp-{side}-{digest}"
 
     async def _persist_order_intent(
@@ -2337,14 +2673,15 @@ class TradingEngine:
     ) -> None:
         self._remove_pending_reservation(open_orders, signal.id)
         payload = signal.payload or {}
-        if signal.action != "buy":
+        if signal.action not in ENTRY_ACTIONS:
             return
         open_orders.append(
             {
                 "id": f"pending:{signal.id}",
                 "client_order_id": payload.get("client_order_id"),
                 "symbol": signal.symbol,
-                "side": "buy",
+                "side": ORDER_SIDE_FOR_ACTION[signal.action],
+                **({"_entry": True} if signal.action == "short" else {}),
                 "qty": payload.get("qty"),
                 "status": status,
                 "_estimated_notional": payload.get("notional"),
@@ -2416,12 +2753,12 @@ class TradingEngine:
                     strategy_id=signal.strategy_id,
                     signal_id=signal.id,
                     symbol=signal.symbol,
-                    side=signal.action,
+                    side=ORDER_SIDE_FOR_ACTION.get(signal.action, signal.action),
                     order_type=str(order.get("type") or payload.get("order_type") or "market"),
                     qty=as_float(order.get("qty") or payload.get("qty")) or None,
                     notional=(
                         as_float(payload.get("notional")) or None
-                        if signal.action == "buy"
+                        if signal.action in ENTRY_ACTIONS
                         else None
                     ),
                     status=str(order.get("status", "accepted")),
@@ -2879,9 +3216,19 @@ class TradingEngine:
         ):
             return "wait", "最新报价已过期，订单意图继续等待", False, {}
 
+        short = signal.action == "short"
+        if short and not definition.is_short:
+            return "reject", "策略已不再是做空策略，旧做空意图已取消", False, {}
+        if not short and definition.is_short:
+            return "reject", "策略已改为做空，旧买入意图已取消", False, {}
         order_type = str(payload.get("order_type") or "market")
         if order_type == "limit":
             reference_price = as_float(payload.get("limit_price"))
+        elif short:
+            # A short sale fills at the bid.
+            reference_price = as_float(quote.get("bid_price") or quote.get("bp"))
+            if reference_price <= 0:
+                return "wait", "最新买价无效，做空意图继续等待", False, {}
         else:
             reference_price = as_float(
                 quote.get("ask_price") or quote.get("ap")
@@ -2902,10 +3249,10 @@ class TradingEngine:
             else None
         )
         stop_price = self._guard_price(
-            reference_price, stop_guard, stop_atr, False
+            reference_price, stop_guard, stop_atr, False, short=short
         )
         take_price = self._guard_price(
-            reference_price, take_guard, take_atr, True
+            reference_price, take_guard, take_atr, True, short=short
         )
         if (stop_guard is not None and stop_price is None) or (
             take_guard is not None and take_price is None
@@ -2924,10 +3271,14 @@ class TradingEngine:
             desired_notional = equity * config.value / 100
             qty = desired_notional / reference_price
         else:
-            if stop_price is None or stop_price <= 0 or stop_price >= reference_price:
+            risk_per_share = (
+                (stop_price - reference_price) if short and stop_price is not None
+                else (reference_price - stop_price if stop_price is not None else 0)
+            )
+            if stop_price is None or stop_price <= 0 or risk_per_share <= 0:
                 return "reject", "开盘价变化后无法安全计算风险仓位", False, {}
             risk_dollars = equity * config.value / 100
-            qty = risk_dollars / (reference_price - stop_price)
+            qty = risk_dollars / risk_per_share
             desired_notional = qty * reference_price
         original_qty = as_float(payload.get("original_qty") or payload.get("qty"))
         original_notional = as_float(
@@ -2949,10 +3300,16 @@ class TradingEngine:
         except Exception:
             self._abort_new_orders_for_cycle = True
             return "wait", "证券可交易状态暂不可用，订单意图继续等待", False, {}
-        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True))
+        if short:
+            blocked = self._short_entry_block_reason(account, asset, positions, signal.symbol)
+            if blocked:
+                return "reject", blocked, False, {}
+        elif self._position_qty(positions, signal.symbol) < -1e-6:
+            return "reject", "该标的存在空头持仓，不能同时买入做多", False, {}
+        qty = normalize_entry_qty(qty, definition, fractionable=asset.get('fractionable', True) and not short)
         desired_notional = qty * reference_price
         if qty <= 0:
-            return 'reject', '预算不足以购买符合保护单要求的整股', False, {}
+            return 'reject', '预算不足以做空符合保护单要求的整股' if short else '预算不足以购买符合保护单要求的整股', False, {}
         validation_reason = self._validation_entry_reason(strategy.id, definition, signal_id=signal.id,
             qty=qty, notional=desired_notional)
         if validation_reason:
@@ -3005,6 +3362,255 @@ class TradingEngine:
                 ),
             },
         )
+
+    # ----- options ------------------------------------------------------
+    @staticmethod
+    def _option_quote(quotes: dict[str, Any], symbol: str) -> tuple[float, float, datetime | None]:
+        quote = quotes.get(symbol) or quotes.get(symbol.upper()) or {}
+        bid = as_float(quote.get("bid_price") or quote.get("bp"))
+        ask = as_float(quote.get("ask_price") or quote.get("ap"))
+        return bid, ask, TradingEngine._payload_datetime(quote.get("timestamp") or quote.get("t"))
+
+    @staticmethod
+    def _option_contracts_for_budget(definition: RuleDefinition, equity: float, premium: float) -> int:
+        cost = premium * 100
+        if cost <= 0:
+            return 0
+        config = definition.position
+        if config.mode == "fixed_qty":
+            return int(math.floor(config.value))
+        budget = config.value if config.mode == "fixed_notional" else equity * config.value / 100
+        return int(math.floor(budget / cost + 1e-9))
+
+    async def _create_option_entry_signal(
+        self, strategy: Strategy, definition: RuleDefinition, underlying: str, frame: pd.DataFrame,
+        result: RuleResult, snapshot: "EvaluationSnapshot",
+    ) -> None:
+        """Choose one listed contract for the underlying signal and persist a buy-to-open intent."""
+        config = definition.option
+        price = float(frame.iloc[-1]["close"])
+        today = datetime.now(ET).date()
+        strike_room = max(0.25, config.strike_offset_pct / 100 + 0.15)
+        try:
+            contracts = await asyncio.to_thread(
+                self.alpaca.get_option_contracts, underlying, right=config.right,
+                expiration_gte=today + timedelta(days=config.min_dte),
+                expiration_lte=today + timedelta(days=config.max_dte),
+                strike_gte=price * (1 - strike_room), strike_lte=price * (1 + strike_room))
+        except Exception:
+            self._abort_new_orders_for_cycle = True
+            raise
+        contract = choose_contract(contracts, price, config, today)
+        if contract is None:
+            await self.log("warning", "strategy",
+                           f"{strategy.name}/{underlying}: 没有符合到期日和行权价条件的{'看涨' if config.right == 'call' else '看跌'}期权合约")
+            return
+        symbol = str(contract["symbol"]).upper()
+        try:
+            quotes = await asyncio.to_thread(self.alpaca.get_option_quotes, [symbol])
+        except Exception:
+            self._abort_new_orders_for_cycle = True
+            raise
+        bid, ask, _quote_time = self._option_quote(quotes, symbol)
+        if ask <= 0:
+            await self.log("warning", "strategy", f"{strategy.name}/{symbol}: 期权暂无有效卖价，未创建买单")
+            return
+        qty = self._option_contracts_for_budget(definition, as_float(snapshot.account.get("equity")), ask)
+        if qty < 1:
+            await self.log("warning", "risk", f"{strategy.name}/{symbol}: 预算不足以买入 1 张期权（每张约 ${ask * 100:,.2f}）")
+            return
+        timestamp = frame.index[-1].to_pydatetime()
+        client_id = self._client_order_id(strategy.id, symbol, timestamp, "buy")
+        notional = qty * ask * 100
+        signal = await self._persist_order_intent(
+            strategy, symbol, timestamp, "buy", ask,
+            "；".join(result.labels) or "入场条件成立",
+            {
+                "intent_version": 1,
+                "strategy_version": strategy.version,
+                "client_order_id": client_id,
+                "side": "buy",
+                "instrument": "option",
+                "underlying": underlying.upper(),
+                "underlying_price": price,
+                "contract": {key: contract.get(key) for key in (
+                    "symbol", "expiration_date", "strike_price", "type", "open_interest", "status", "tradable")},
+                "qty": qty,
+                "notional": notional,
+                "original_qty": qty,
+                "original_notional": notional,
+                "order_type": definition.order.type,
+                "time_in_force": "day",
+                "limit_price": round_option_price(ask * (1 + definition.order.limit_offset_bps / 10_000), "buy"),
+                "stop_price": None,
+                "take_price": None,
+                "timeframe": definition.timeframe,
+                "trailing_stop": None,
+            },
+        )
+        if signal is None:
+            return
+        await self._submit_pending_signal(
+            signal.id, snapshot.open_orders, account=snapshot.account, positions=snapshot.positions,
+            clock=snapshot.clock,
+            reference_bars={(definition.timeframe, underlying.upper()): (timestamp, price, frame)},
+            recover_existing=False,
+        )
+
+    async def _revalidate_option_entry(
+        self, signal: Signal, strategy: Strategy, payload: dict[str, Any], open_orders: list[dict[str, Any]],
+        account: dict[str, Any] | None, positions: list[dict[str, Any]] | None, clock: dict[str, Any] | None,
+        reference_bars: dict[tuple[str, str], tuple[datetime, float, pd.DataFrame]] | None,
+    ) -> tuple[str, str, bool, dict[str, Any]]:
+        """Option counterpart of _revalidate_pending_entry: fresh signal, live quote, budget and risk."""
+        if account is None or positions is None or clock is None:
+            return "wait", "缺少最新账户风险快照，订单意图继续等待", False, {}
+        if not bool(clock.get("is_open")):
+            return "wait", "当前不在美股常规交易时段", False, {}
+        try:
+            definition = RuleDefinition.model_validate(strategy.definition)
+        except Exception:
+            return "reject", "策略定义已失效", False, {}
+        if not definition.is_option:
+            return "reject", "策略已不再交易期权，旧期权意图已取消", False, {}
+        if payload.get("strategy_version") is not None and int(payload["strategy_version"]) != strategy.version:
+            return "reject", "策略版本已变化，旧入场意图已安全取消", False, {}
+        unsupported = self._supports(definition)
+        if unsupported:
+            return "reject", unsupported, False, {}
+        parsed = parse_option_symbol(signal.symbol)
+        if parsed is None:
+            return "reject", "期权合约代码无效", False, {}
+        now = datetime.now(timezone.utc)
+        if days_to_expiry(parsed.expiration, now.astimezone(ET)) <= definition.option.close_dte:
+            return "reject", "合约已临近到期，不再开仓", False, {}
+        bar_timestamp = signal.bar_timestamp
+        bar_timestamp = (bar_timestamp.replace(tzinfo=timezone.utc) if bar_timestamp.tzinfo is None
+                         else bar_timestamp.astimezone(timezone.utc))
+        with SessionLocal() as db:
+            risk_settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
+        if risk_settings is None or state is None:
+            return "reject", "风险设置或引擎状态不存在", False, {}
+        timeframe = str(payload.get("timeframe") or definition.timeframe)
+        max_age = max(risk_settings.stale_data_seconds, TIMEFRAME_SECONDS[timeframe] * 3)
+        latest_reference = (reference_bars or {}).get((timeframe, str(payload.get("underlying") or parsed.root).upper()))
+        if latest_reference is None:
+            return "wait", "缺少标的最新已完成K线，无法确认信号有效期", False, {}
+        latest_bar_timestamp = latest_reference[0]
+        if latest_bar_timestamp.tzinfo is None:
+            latest_bar_timestamp = latest_bar_timestamp.replace(tzinfo=timezone.utc)
+        if not self._entry_intent_is_fresh(bar_timestamp, latest_bar_timestamp.astimezone(timezone.utc), timeframe,
+                                           now, max_age, self._frame_session_close(latest_reference[2], bar_timestamp)):
+            return "reject", "入场信号对应K线或交易时段已过期", False, {}
+        try:
+            quotes = await asyncio.to_thread(self.alpaca.get_option_quotes, [signal.symbol])
+        except Exception:
+            self._abort_new_orders_for_cycle = True
+            return "wait", "期权报价暂不可用，订单意图继续等待", False, {}
+        bid, ask, quote_time = self._option_quote(quotes, signal.symbol)
+        if quote_time is None:
+            return "wait", "期权报价缺少时间戳，订单意图继续等待", False, {}
+        age = (datetime.now(timezone.utc) - quote_time).total_seconds()
+        if age < -2 or age > risk_settings.stale_data_seconds:
+            return "wait", "期权报价已过期，订单意图继续等待", False, {}
+        if ask <= 0 or bid <= 0:
+            return "wait", "期权买卖价无效，订单意图继续等待", False, {}
+        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread_pct > definition.option.max_spread_pct:
+            return "reject", f"期权买卖价差 {spread_pct:.1f}% 超过上限 {definition.option.max_spread_pct:.1f}%", False, {}
+        order_type = str(payload.get("order_type") or "market")
+        limit_price = round_option_price(ask * (1 + definition.order.limit_offset_bps / 10_000), "buy")
+        premium = limit_price if order_type == "limit" else ask
+        qty = self._option_contracts_for_budget(definition, as_float(account.get("equity")), premium)
+        original_qty = as_float(payload.get("original_qty") or payload.get("qty"))
+        if original_qty > 0:
+            qty = min(qty, int(original_qty))
+        if qty < 1:
+            return "reject", "预算不足以买入 1 张期权", False, {}
+        desired_notional = qty * premium * 100
+        try:
+            contract = await asyncio.to_thread(self.alpaca.get_option_contract, signal.symbol)
+        except Exception:
+            self._abort_new_orders_for_cycle = True
+            return "wait", "期权合约状态暂不可用，订单意图继续等待", False, {}
+        asset = {"tradable": contract.get("tradable", False), "status": contract.get("status", "inactive"),
+                 "fractionable": False}
+        own_client_id = str(payload.get("client_order_id") or "")
+        risk_open_orders = [order for order in open_orders
+                            if str(order.get("client_order_id") or "") != own_client_id
+                            and str(order.get("id") or "") != f"pending:{signal.id}"]
+        with SessionLocal() as db:
+            risk_settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
+            state = db.scalar(select(EngineState).where(EngineState.user_id == self.user_id))
+            decision = self.risk.check_entry(
+                symbol=signal.symbol, desired_notional=desired_notional, account=account, positions=positions,
+                asset=asset, clock=clock, bar_timestamp=quote_time, max_data_age_seconds=max_age,
+                settings=risk_settings, state=state, strategy_max_symbol_pct=definition.risk.max_symbol_pct,
+                strategy_max_positions=definition.risk.max_positions, open_orders=risk_open_orders,
+                reference_price=premium * 100,
+            )
+            db.commit()
+        return (
+            "allow" if decision.allowed else "reject", decision.reason, decision.halt_engine,
+            {"qty": qty, "notional": desired_notional, "risk_reference_price": premium, "limit_price": limit_price,
+             "option_bid": bid, "option_ask": ask,
+             "risk_settings_snapshot": self._risk_settings_snapshot(risk_settings)},
+        )
+
+    async def _manage_option_positions(self, items: list[PreparedStrategy], snapshot: "EvaluationSnapshot") -> None:
+        """Premium stop/take-profit and pre-expiry exits for strategy-owned contracts."""
+        now = datetime.now(timezone.utc)
+        today = now.astimezone(ET).date()
+        held: list[tuple[PreparedStrategy, str, float]] = []
+        for item in items:
+            if self._supports(item.definition):
+                continue
+            with SessionLocal() as db:
+                rows = db.scalars(select(StrategyPosition).where(
+                    StrategyPosition.user_id == self.user_id,
+                    StrategyPosition.strategy_id == item.strategy.id,
+                    StrategyPosition.qty > 0,
+                )).all()
+            for row in rows:
+                symbol = row.symbol.upper()
+                if not is_option_symbol(symbol):
+                    continue
+                qty = min(row.qty, as_float(snapshot.position_map.get(symbol, {}).get("qty")))
+                if qty > 0 and not self._has_pending_reconciliation(item.strategy.id, symbol):
+                    held.append((item, symbol, qty))
+        if not held:
+            return
+        try:
+            quotes = await asyncio.to_thread(self.alpaca.get_option_quotes, sorted({symbol for _i, symbol, _q in held}))
+        except Exception as exc:
+            quotes = {}
+            await self._log_throttled(held[0][0].strategy, "options", f"期权持仓报价读取失败，止损止盈暂缓检查：{exc}")
+        minute = now.replace(second=0, microsecond=0)
+        for item, symbol, qty in held:
+            if self._abort_new_orders_for_cycle:
+                return
+            config = item.definition.option
+            parsed = parse_option_symbol(symbol)
+            dte = days_to_expiry(parsed.expiration, today)
+            reason = ""
+            bid, _ask, quote_time = self._option_quote(quotes, symbol)
+            entry = as_float(snapshot.position_map.get(symbol, {}).get("avg_entry_price"))
+            quote_fresh = quote_time is not None and (now - quote_time).total_seconds() <= 300
+            if dte <= config.close_dte:
+                reason = f"距到期还有 {dte} 天，按规则平仓"
+            elif quote_fresh and entry > 0 and bid > 0:
+                change = (bid / entry - 1) * 100
+                if config.stop_loss_pct and change <= -config.stop_loss_pct:
+                    reason = f"权利金下跌 {abs(change):.1f}%，触发止损"
+                elif config.take_profit_pct and change >= config.take_profit_pct:
+                    reason = f"权利金上涨 {change:.1f}%，触发止盈"
+            if not reason:
+                continue
+            frame = pd.DataFrame({"close": [bid or entry]}, index=pd.DatetimeIndex([minute]))
+            await self._create_exit_signal(item.strategy, item.definition, symbol, frame, RuleResult(True, minute, [reason]),
+                                           qty, snapshot.open_orders, snapshot.positions,
+                                           timestamp=minute, price=bid or entry)
 
     @staticmethod
     def _frame_session_close(
@@ -3071,7 +3677,30 @@ class TradingEngine:
                 0,
             )
         )
+        if signal.action == "cover":
+            return min(self._owned_short_qty(signal.strategy_id, signal.symbol), max(0.0, -account_qty))
         return min(self._owned_qty(signal.strategy_id, signal.symbol), account_qty)
+
+    def _short_entry_block_reason(self, account: dict[str, Any], asset: dict[str, Any],
+                                  positions: list[dict[str, Any]] | None, symbol: str) -> str:
+        """Non-quarantine reasons a short sale must not be opened."""
+        if account.get("shorting_enabled") is False:
+            return "券商账户未开通做空（账户净值需至少 2,000 美元）"
+        if not asset.get("shortable", False):
+            return f"{symbol} 当前不可做空"
+        if not asset.get("easy_to_borrow", False):
+            return f"{symbol} 不是易借券（ETB）股票，暂不支持做空"
+        if positions is not None and self._position_qty(positions, symbol) > 1e-6:
+            return f"{symbol} 账户持有多头，不能同时做空"
+        with SessionLocal() as db:
+            long_owned = db.scalar(select(StrategyPosition.id).where(
+                StrategyPosition.user_id == self.user_id,
+                StrategyPosition.symbol == symbol.upper(),
+                StrategyPosition.qty > 0,
+            ))
+        if long_owned is not None:
+            return f"{symbol} 有策略持有多头，不能同时做空"
+        return ""
 
     async def _submit_pending_signal(
         self,
@@ -3133,7 +3762,7 @@ class TradingEngine:
                 if existing_order is not None:
                     saved = self._save_submitted_order(signal.id, existing_order)
                     self._remove_pending_reservation(open_orders, signal.id)
-                    if saved.action == "buy":
+                    if saved.action in ENTRY_ACTIONS:
                         open_orders.append(
                             {
                                 **existing_order,
@@ -3168,13 +3797,15 @@ class TradingEngine:
             return True
         strategy_name = strategy.name
 
-        if signal.action == "buy":
+        if signal.action in ENTRY_ACTIONS:
+            revalidate = (self._revalidate_option_entry if payload.get("instrument") == "option"
+                          else self._revalidate_pending_entry)
             (
                 disposition,
                 reason,
                 halt_engine,
                 intent_updates,
-            ) = await self._revalidate_pending_entry(
+            ) = await revalidate(
                 signal,
                 strategy,
                 payload,
@@ -3241,7 +3872,7 @@ class TradingEngine:
                 signal.id, "pending_submission", extra={"qty": exit_qty}
             ) or signal
 
-        if signal.action == "sell" and payload.get("cancel_strategy_orders", True):
+        if signal.action in ("sell", "cover") and payload.get("cancel_strategy_orders", True):
             try:
                 await self._cancel_strategy_symbol_orders(
                     signal.strategy_id, signal.symbol, open_orders
@@ -3296,7 +3927,33 @@ class TradingEngine:
                     )
                 ):
                     return False
-                if signal.action == "buy":
+                if signal.action == "short":
+                    await self._verify_short_entry_capacity(
+                        signal.symbol, as_float(payload.get("qty")), client_order_id)
+                    order = await asyncio.to_thread(
+                        self.alpaca.submit_entry_order,
+                        symbol=signal.symbol,
+                        qty=as_float(payload.get("qty")) or None,
+                        notional=None,
+                        order_type=str(payload.get("order_type") or "market"),
+                        time_in_force=str(payload.get("time_in_force") or "day"),
+                        client_order_id=client_order_id,
+                        limit_price=payload.get("limit_price"),
+                        stop_price=payload.get("stop_price"),
+                        take_price=payload.get("take_price"),
+                        side="sell",
+                    )
+                elif signal.action == "cover":
+                    await self._verify_cover_capacity(
+                        signal.symbol, as_float(payload.get("qty")), client_order_id)
+                    order = await asyncio.to_thread(
+                        self.alpaca.submit_exit_order,
+                        signal.symbol,
+                        as_float(payload.get("qty")),
+                        client_order_id,
+                        "buy",
+                    )
+                elif signal.action == "buy":
                     current_definition = RuleDefinition.model_validate(current_strategy.definition)
                     validation_reason = self._validation_entry_reason(current_strategy.id, current_definition,
                         signal_id=signal.id, qty=as_float(payload.get('qty')),
@@ -3313,10 +3970,14 @@ class TradingEngine:
                             'broker':'ibkr','broker_account_id':getattr(self.alpaca,'account_id',''),
                             'ibkr_submission_started_at':datetime.now(timezone.utc).isoformat()})
                     if current_risk_settings and getattr(current_risk_settings, "cash_sweep_enabled", False):
+                        estimated_cost = (
+                            as_float(payload.get("notional")) if payload.get("instrument") == "option"
+                            else as_float(payload.get("qty")) * as_float(signal.price)
+                        )
                         await self._execute_cash_sweep_liquidation_if_needed(
                             current_risk_settings,
                             signal.symbol,
-                            as_float(payload.get("qty")) * as_float(signal.price),
+                            estimated_cost,
                         )
                     order = await asyncio.to_thread(
                         self.alpaca.submit_entry_order,
@@ -3418,12 +4079,13 @@ class TradingEngine:
             return True
 
         self._remove_pending_reservation(open_orders, signal.id)
-        if saved.action == "buy":
+        if saved.action in ENTRY_ACTIONS:
             open_orders.append(
-                {**order, "_estimated_notional": saved.payload.get("notional")}
+                {**order, "_estimated_notional": saved.payload.get("notional"),
+                 **({"_entry": True} if saved.action == "short" else {})}
             )
         environment_label = "模拟" if getattr(self.alpaca, 'paper', True) else "真实"
-        action_label = environment_label + ("买单" if saved.action == "buy" else "平仓")
+        action_label = environment_label + {"buy": "买单", "short": "做空卖单", "cover": "平空买单"}.get(saved.action, "平仓")
         await self.log(
             "info", "order", f"{strategy_name}: 已提交 {signal.symbol} {action_label}"
         )
@@ -3438,7 +4100,7 @@ class TradingEngine:
         )
 
     @staticmethod
-    def _guard_price(price: float, guard, atr_value: float | None, is_take: bool) -> float | None:
+    def _guard_price(price: float, guard, atr_value: float | None, is_take: bool, short: bool = False) -> float | None:
         if guard is None:
             return None
         if guard.mode == "percent":
@@ -3447,7 +4109,9 @@ class TradingEngine:
             if atr_value is None:
                 return None
             distance = atr_value * guard.value
-        return round(price + distance if is_take else price - distance, 2)
+        # Long: stop below, take above. Short: stop above, take below.
+        upward = is_take != short
+        return round(price + distance if upward else price - distance, 2)
 
     def cache_bars(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
         # This legacy table has no provider in its uniqueness key. IBKR keeps
@@ -4163,6 +4827,11 @@ class TradingEngine:
                 return
             account = await asyncio.to_thread(self.alpaca.get_account)
             cash = as_float(account.get("cash") or account.get("buying_power"))
+            # Short-sale proceeds sit in cash but are collateral, not idle money.
+            reader = getattr(self.alpaca, "get_positions", None)
+            positions = await asyncio.to_thread(reader) if reader is not None else []
+            cash -= sum(abs(as_float(position.get("market_value"))) for position in positions
+                        if as_float(position.get("qty")) < 0)
             # Keep at least  buffer or min trade threshold
             if cash < 150.0:
                 return

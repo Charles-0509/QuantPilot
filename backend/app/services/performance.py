@@ -1,7 +1,9 @@
 """Per-strategy live (Paper) performance reconstructed from broker fills.
 
-Each strategy's buys open FIFO lots and its own sells close them, so P&L is
-never mixed with manual holdings, cash sweep or another strategy.
+Each strategy's opening fills create FIFO lots and its own closing fills match
+them, so P&L is never mixed with manual holdings, cash sweep or another strategy.
+Long lots open with buys; short lots (short/cover signals) open with sells.
+Option P&L uses the 100-share contract multiplier.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import OrderRecord, Signal, Strategy, StrategyPosition
+from .instruments import multiplier
 from .risk import as_float
 
 EXIT_LABELS = {
@@ -46,9 +49,9 @@ def exit_kind(record: OrderRecord, signal: Signal | None) -> str:
     if "stop" in order_type:
         return "stop_loss"
     if order_type == "limit" and (_order_payload(record).get("parent_order_id") or record.client_order_id.startswith("leg-")
-                                  or (signal is not None and signal.action == "buy")):
+                                  or (signal is not None and signal.action in ("buy", "short"))):
         return "take_profit"
-    if signal is not None and signal.action == "sell":
+    if signal is not None and signal.action in ("sell", "cover"):
         return "strategy_exit"
     return "other"
 
@@ -67,7 +70,7 @@ def strategy_performance(db: Session, user_id: int, prices: dict[str, float] | N
         Strategy.owner_user_id == user_id, Strategy.is_template.is_(False))).all()}
     owned = defaultdict(float)
     for row in db.scalars(select(StrategyPosition).where(StrategyPosition.user_id == user_id)).all():
-        owned[(row.strategy_id, row.symbol.upper())] += max(0.0, row.qty)
+        owned[(row.strategy_id, row.symbol.upper())] += abs(row.qty)
     records = db.scalars(select(OrderRecord).where(
         OrderRecord.user_id == user_id, OrderRecord.strategy_id.is_not(None), OrderRecord.filled_qty > 0)).all()
     signals = {row.id: row for row in db.scalars(select(Signal).where(Signal.user_id == user_id)).all()}
@@ -81,22 +84,28 @@ def strategy_performance(db: Session, user_id: int, prices: dict[str, float] | N
         if price <= 0:
             continue
         signal = signals.get(record.signal_id) if record.signal_id else None
-        if record.side == "buy":
+        short = signal is not None and signal.action in ("short", "cover")
+        opening_side = "sell" if short else "buy"
+        if record.side == opening_side:
             lots[key].append({"qty": record.filled_qty, "price": price, "time": _fill_time(record),
-                              "reason": signal.reason if signal else "", "order_id": record.id})
+                              "reason": signal.reason if signal else "", "order_id": record.id,
+                              "short": short})
             continue
         remaining = record.filled_qty
         kind = exit_kind(record, signal)
+        sign = -1 if short else 1
+        size = multiplier(record.symbol)
         while remaining > 1e-9 and lots[key]:
             lot = lots[key][0]
             qty = min(lot["qty"], remaining)
-            pnl = (price - lot["price"]) * qty
+            pnl = (price - lot["price"]) * qty * sign * size
             trades[record.strategy_id].append({
-                "symbol": record.symbol.upper(), "qty": qty,
+                "symbol": record.symbol.upper(), "qty": qty, "side": "short" if short else "long",
                 "entry_time": lot["time"], "entry_price": lot["price"], "entry_reason": lot["reason"],
                 "exit_time": _fill_time(record), "exit_price": price, "exit_kind": kind,
-                "exit_label": EXIT_LABELS[kind], "exit_reason": signal.reason if signal and signal.action == "sell" else "",
-                "pnl": pnl, "pnl_pct": (price / lot["price"] - 1) * 100,
+                "exit_label": EXIT_LABELS[kind],
+                "exit_reason": signal.reason if signal and signal.action in ("sell", "cover") else "",
+                "pnl": pnl, "pnl_pct": (price / lot["price"] - 1) * 100 * sign,
                 "holding_minutes": (_fill_time(record) - lot["time"]).total_seconds() / 60,
                 "exit_order_id": record.id,
             })
@@ -119,9 +128,11 @@ def strategy_performance(db: Session, user_id: int, prices: dict[str, float] | N
                 cleared_by_strategy[strategy_id] += lot["qty"] - qty
             if qty > 1e-9:
                 mark = prices.get(symbol)
+                sign = -1 if lot.get("short") else 1
                 open_by_strategy[strategy_id].append({
-                    "symbol": symbol, "qty": qty, "entry_price": lot["price"], "entry_time": lot["time"],
-                    "current_price": mark, "unrealized_pnl": (mark - lot["price"]) * qty if mark else None})
+                    "symbol": symbol, "qty": qty, "side": "short" if lot.get("short") else "long",
+                    "entry_price": lot["price"], "entry_time": lot["time"], "current_price": mark,
+                    "unrealized_pnl": (mark - lot["price"]) * qty * sign * multiplier(symbol) if mark else None})
 
     result = []
     for strategy_id in set(strategies) | set(trades) | set(open_by_strategy):

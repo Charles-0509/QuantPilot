@@ -133,7 +133,7 @@ export default function SettingsPage() {
         <SecurityItem label="加密保存" value="密文存入 SQLite，解密密钥保存在服务器 data/.credentials.key" />
         <SecurityItem label="账户隔离" value="每位用户独立使用自己的 Alpaca Paper 凭据或 IBKR 网关和账户" />
         <SecurityItem label="变更保护" value="保存或移除配置后，引擎会暂停且不会自动恢复" />
-        <SecurityItem label="资产范围" value="美股 / ETF，只做多；常规交易时段" />
+        <SecurityItem label="资产范围" value="美股 / ETF 做多；按策略开启的股票做空与买入期权；常规交易时段" />
         <SecurityItem label="实时订阅" value="IEX 最多 30 个股票代码" />
         <SecurityItem label="部署要求" value="保护 data/ 目录，运行自动交易的主机需保持开机联网" />
       </div>

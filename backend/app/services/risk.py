@@ -174,7 +174,12 @@ class RiskManager:
         for order in orders:
             side = str(order.get("side", "")).lower()
             status = str(order.get("status", "")).lower()
-            if "buy" not in side or status in {"filled", "canceled", "cancelled", "expired", "rejected"}:
+            client_order_id = str(order.get("client_order_id") or "")
+            # Entries add exposure: long buys, plus QuantPilot short-sale entries.
+            # Buys that cover a short (bracket legs, qp-c- exits) reduce it instead.
+            short_entry = "sell" in side and (bool(order.get("_entry")) or client_order_id.startswith("qp-x-"))
+            cover = "buy" in side and (client_order_id.startswith("qp-c-") or bool(order.get("parent_order_id")))
+            if ("buy" not in side and not short_entry) or cover or status in {"filled", "canceled", "cancelled", "expired", "rejected"}:
                 continue
             symbol = str(order.get("symbol", "")).upper()
             if not symbol:

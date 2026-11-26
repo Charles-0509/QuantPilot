@@ -420,3 +420,9 @@ select option { background: #0a111d; }
   .market-title { width: 100%; order: -1; }
   .watchlist-group-actions, .watchlist-row-menu .icon-button { opacity: 1; }
 }
+
+.segmented { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.02); }
+.segmented button { min-height: 32px; padding: 5px 14px; border-radius: 8px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.segmented button:hover:not(:disabled) { color: var(--text); }
+.segmented button.active { color: var(--cyan); background: rgba(61,246,222,.1); }
+.segmented button:disabled { cursor: not-allowed; opacity: .6; }

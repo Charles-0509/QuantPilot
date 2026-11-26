@@ -24,8 +24,10 @@ export function PositionsTable({ snapshot }: { snapshot?: PortfolioSnapshot }) {
     <table className="data-table">
       <thead><tr><th>代码</th><th>数量</th><th>归属</th><th>成本价</th><th>现价</th><th>市值</th><th>未实现盈亏</th><th>今日</th></tr></thead>
       <tbody>{positions.map((position) => <tr key={position.symbol}>
-        <td className="symbol-cell">{position.symbol}</td>
-        <td>{number(position.qty, 4)}</td>
+        <td className="symbol-cell">{position.symbol}
+          {position.instrument === 'option' && <div className="field-hint">{position.underlying} {position.option_right === 'call' ? '看涨' : '看跌'} {position.strike} · {position.expiration} 到期</div>}
+          {position.qty < 0 && <div><Badge tone="warning">空头</Badge></div>}</td>
+        <td>{number(position.qty, 4)}{position.instrument === 'option' ? ' 张' : ''}</td>
         <td>{position.owners.map((owner) => `${owner.strategy_name} ${number(owner.qty, 4)}`).join('；') || '—'}
           {position.unattributed_qty > 0 && <div className="field-hint">手动/未归属 {number(position.unattributed_qty, 4)}</div>}</td>
         <td>{money(position.avg_entry_price)}</td>

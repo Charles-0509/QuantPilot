@@ -5,6 +5,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import type { Strategy } from '../types'
 import { Badge, Button, Card, Empty, ErrorPanel, Loading, PageHeader } from '../components/UI'
+import { TRADE_KIND_LABEL, tradeKind } from '../components/InstrumentPanel'
 
 const PRESET_GROUPS = [
   { label: '全部', value: 'ALL' },
@@ -171,6 +172,8 @@ function StrategyCard({
       <p style={{ minHeight: 38 }}>{strategy.description}</p>
       <div className="strategy-meta">
         <Badge>{strategy.definition.timeframe}</Badge>
+        {tradeKind(strategy.definition) !== 'long' && <Badge tone="warning">{TRADE_KIND_LABEL[tradeKind(strategy.definition)]}
+          {strategy.definition.instrument === 'option' && strategy.definition.option ? (strategy.definition.option.right === 'call' ? ' · 看涨' : ' · 看跌') : ''}</Badge>}
         <Badge>{strategy.definition.symbols.join(' · ')}</Badge>
       </div>
       <div className="strategy-actions" style={{ marginTop: 14, display: 'flex', gap: 6, flexWrap: 'wrap' }}>

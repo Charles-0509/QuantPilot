@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import OrderRecord, Strategy, StrategyPosition
+from .instruments import parse_option_symbol
 from .risk import as_float
 
 EQUITY_TOLERANCE_PCT = 1.0
@@ -86,15 +87,18 @@ def build_portfolio(alpaca, db: Session, user_id: int) -> dict[str, Any]:
     names = dict(db.execute(select(Strategy.id, Strategy.name).where(Strategy.owner_user_id == user_id)).all())
     owned: dict[str, list[dict[str, Any]]] = {}
     for row in db.scalars(select(StrategyPosition).where(
-            StrategyPosition.user_id == user_id, StrategyPosition.qty > 0)).all():
+            StrategyPosition.user_id == user_id, StrategyPosition.qty != 0)).all():
         owned.setdefault(row.symbol.upper(), []).append(
-            {"strategy_id": row.strategy_id, "strategy_name": names.get(row.strategy_id, row.strategy_id), "qty": row.qty})
+            {"strategy_id": row.strategy_id, "strategy_name": names.get(row.strategy_id, row.strategy_id),
+             "qty": abs(row.qty), "side": "short" if row.qty < 0 else "long"})
     rows = []
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         qty = as_float(position.get("qty"))
-        owners = owned.get(symbol, [])
-        owned_qty = min(qty, sum(item["qty"] for item in owners))
+        side = "short" if qty < 0 else "long"
+        owners = [item for item in owned.get(symbol, []) if item["side"] == side]
+        owned_qty = min(abs(qty), sum(item["qty"] for item in owners))
+        option = parse_option_symbol(symbol)
         rows.append({
             "symbol": symbol, "qty": qty, "side": str(position.get("side") or "long").split(".")[-1].lower(),
             "avg_entry_price": as_float(position.get("avg_entry_price")),
@@ -104,7 +108,10 @@ def build_portfolio(alpaca, db: Session, user_id: int) -> dict[str, Any]:
             "unrealized_pl": as_float(position.get("unrealized_pl")),
             "unrealized_plpc": as_float(position.get("unrealized_plpc")) * 100,
             "change_today_pct": as_float(position.get("change_today")) * 100,
-            "owners": owners, "strategy_qty": owned_qty, "unattributed_qty": max(0.0, qty - owned_qty),
+            "owners": owners, "strategy_qty": owned_qty, "unattributed_qty": max(0.0, abs(qty) - owned_qty),
+            "instrument": "option" if option else "stock",
+            **({"underlying": option.root, "expiration": option.expiration.isoformat(), "option_right": option.right,
+                "strike": option.strike} if option else {}),
         })
     order_owner = dict(db.execute(select(OrderRecord.id, OrderRecord.strategy_id).where(
         OrderRecord.user_id == user_id, OrderRecord.strategy_id.is_not(None))).all())
@@ -120,13 +127,15 @@ def build_portfolio(alpaca, db: Session, user_id: int) -> dict[str, Any]:
             "type": str(order.get("type") or order.get("order_type") or "").split(".")[-1].lower(),
             "status": status, "strategy_name": names.get(strategy_id) if strategy_id else None})
     market_value = sum(row["market_value"] for row in rows)
+    gross_value = sum(abs(row["market_value"]) for row in rows)
     result.update({
         "account": {
             "equity": equity, "last_equity": last_equity, "cash": as_float(account.get("cash")),
             "buying_power": as_float(account.get("buying_power")), "market_value": market_value,
             "day_change": equity - last_equity if last_equity else None,
             "day_change_pct": (equity / last_equity - 1) * 100 if last_equity else None,
-            "exposure_pct": market_value / equity * 100 if equity > 0 else None,
+            "exposure_pct": gross_value / equity * 100 if equity > 0 else None,
+            "short_market_value": sum(row["market_value"] for row in rows if row["qty"] < 0),
             "trading_blocked": bool(account.get("trading_blocked")),
         },
         "positions": sorted(rows, key=lambda row: -abs(row["market_value"])),

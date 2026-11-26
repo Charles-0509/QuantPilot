@@ -14,6 +14,8 @@ import pandas as pd
 
 from app.schemas import BacktestRequest, RuleDefinition
 from .backtest import run_backtest
+from .instruments import is_option_symbol
+from .option_backtest import ReplayOptionHistory, run_option_backtest
 
 
 def engine_identity() -> dict[str, Any]:
@@ -25,6 +27,8 @@ def engine_identity() -> dict[str, Any]:
         "services/indicators.py",
         "services/sizing.py",
         "services/backtest_artifacts.py",
+        "services/option_backtest.py",
+        "services/instruments.py",
     ]
     digest = hashlib.sha256()
     for name in files:
@@ -38,7 +42,8 @@ def engine_identity() -> dict[str, Any]:
     }
 
 
-def pack_experiment(definition, payload, frames, risk_settings, *, data_feed='iex', adjustment='all'):
+def pack_experiment(definition, payload, frames, risk_settings, *, data_feed='iex', adjustment='all',
+                    option_chains=None):
     data = {}
     coverage = {}
     for symbol, frame in frames.items():
@@ -57,6 +62,10 @@ def pack_experiment(definition, payload, frames, risk_settings, *, data_feed='ie
     metadata = {
         "engine": engine_identity(),
         "dataset_sha256": hashlib.sha256(raw_data).hexdigest(),
+        **({"option_chains_sha256": hashlib.sha256(json.dumps(
+            option_chains, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+            "option_contracts": sorted(symbol for symbol in frames if is_option_symbol(symbol))}
+           if option_chains is not None else {}),
         "data_feed": data_feed,
         "adjustment": adjustment,
         "coverage": coverage,
@@ -68,6 +77,7 @@ def pack_experiment(definition, payload, frames, risk_settings, *, data_feed='ie
         "risk_settings": risk_settings,
         **metadata,
         "data": data,
+        **({"option_chains": option_chains} if option_chains is not None else {}),
     }
     raw = json.dumps(bundle, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return gzip.compress(raw, mtime=0), metadata
@@ -92,6 +102,17 @@ def replay_experiment(content: bytes):
         frames[symbol] = frame
     definition = RuleDefinition.model_validate(bundle["strategy_definition"])
     payload = BacktestRequest.model_validate(bundle["request"])
+    if definition.is_option:
+        chains = bundle.get("option_chains") or {}
+        digest = hashlib.sha256(json.dumps(chains, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
+        if digest.hexdigest() != bundle.get("option_chains_sha256"):
+            raise ValueError("回测期权合约快照校验失败")
+        return run_option_backtest(
+            definition, {s: frames[s] for s in definition.symbols}, ReplayOptionHistory(chains, frames),
+            initial_cash=payload.initial_cash, slippage_bps=payload.slippage_bps, commission=payload.commission,
+            benchmark=frames[payload.benchmark].loc[frames[payload.benchmark].index >= payload.start],
+            start=payload.start, end=payload.end, risk_settings=bundle["risk_settings"],
+        )
     return run_backtest(
         definition,
         {s: frames[s] for s in definition.symbols},

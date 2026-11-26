@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-DATA_METHODS = {"get_bars", "recent_bars", "get_latest_quotes", "get_snapshots"}
+DATA_METHODS = {"get_bars", "recent_bars", "get_latest_quotes", "get_snapshots",
+                "get_option_quotes", "get_option_snapshots", "get_option_bars"}
 
 
 class MarketDataRouter:

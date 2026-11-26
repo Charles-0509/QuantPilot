@@ -23,13 +23,24 @@ from alpaca.common.exceptions import APIError
 from alpaca.common.enums import Sort
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockSnapshotRequest
+from alpaca.data.enums import OptionsFeed
+from alpaca.data.requests import (
+    OptionBarsRequest,
+    OptionLatestQuoteRequest,
+    OptionSnapshotRequest,
+    StockBarsRequest,
+    StockLatestQuoteRequest,
+    StockSnapshotRequest,
+)
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import AssetStatus, ContractType
 from alpaca.trading.requests import (
     GetCalendarRequest,
+    GetOptionContractsRequest,
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
@@ -289,6 +300,8 @@ class AlpacaService:
     broker_name = 'alpaca'
     paper = True
     supports_trailing_stop = True
+    supports_short = True
+    supports_options = True
     """Thin adapter that is permanently locked to Alpaca paper trading."""
 
     def __init__(
@@ -313,6 +326,7 @@ class AlpacaService:
         self.source = "none"
         self.configuration_updated_at: datetime | None = None
         self.historical: StockHistoricalDataClient | None = None
+        self.option_data: OptionHistoricalDataClient | None = None
         self.trading: TradingClient | None = None
         self._data_stream: StockDataStream | None = None
         self._trade_stream: TradingStream | None = None
@@ -415,6 +429,12 @@ class AlpacaService:
                 self.settings.alpaca_connect_timeout_seconds,
                 self.settings.alpaca_data_read_timeout_seconds,
             )
+        if getattr(self, "option_data", None) is not None:
+            self._install_session(
+                self.option_data,
+                self.settings.alpaca_connect_timeout_seconds,
+                self.settings.alpaca_data_read_timeout_seconds,
+            )
 
     def _clear_caches(self) -> None:
         self._trading_cache.clear()
@@ -484,12 +504,16 @@ class AlpacaService:
             self.trading = None
             self._clear_caches()
             self._reset_health()
+            old_option_data = self.option_data
+            self.option_data = None
             if self.configured:
                 self.historical = StockHistoricalDataClient(self.api_key_id, self.api_secret_key)
+                self.option_data = OptionHistoricalDataClient(self.api_key_id, self.api_secret_key)
                 self.trading = TradingClient(self.api_key_id, self.api_secret_key, paper=True)
                 self._prepare_clients()
             self._close_client(old_trading)
             self._close_client(old_historical)
+            self._close_client(old_option_data)
 
     def clear_configuration(self) -> None:
         self.stop_streams()
@@ -504,10 +528,12 @@ class AlpacaService:
             self.configured = False
             self.historical = None
             self.trading = None
+            old_option_data, self.option_data = self.option_data, None
             self._clear_caches()
             self._reset_health()
             self._close_client(old_trading)
             self._close_client(old_historical)
+            self._close_client(old_option_data)
 
     def configure_from_env(self) -> None:
         if self.settings.alpaca_configured:
@@ -1388,6 +1414,87 @@ class AlpacaService:
             self._data_read("snapshots", lambda: self.historical.get_stock_snapshot(request))
         )
 
+    def get_option_contracts(
+        self,
+        underlying: str,
+        *,
+        right: str,
+        expiration_gte: date,
+        expiration_lte: date,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        include_expired: bool = False,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Listed contracts for one underlying (Trading API). Expired ones need include_expired."""
+        statuses = [AssetStatus.ACTIVE] + ([AssetStatus.INACTIVE] if include_expired else [])
+        contracts: list[dict[str, Any]] = []
+        for status in statuses:
+            page_token = None
+            for _page in range(10):
+                request = GetOptionContractsRequest(
+                    underlying_symbols=[underlying.upper()], status=status,
+                    expiration_date_gte=expiration_gte, expiration_date_lte=expiration_lte,
+                    type=ContractType.CALL if right == "call" else ContractType.PUT,
+                    strike_price_gte=None if strike_gte is None else f"{strike_gte:.2f}",
+                    strike_price_lte=None if strike_lte is None else f"{strike_lte:.2f}",
+                    limit=limit, page_token=page_token,
+                )
+                with self._trading_lock:
+                    self.require_connection()
+                    response = self._resilient_locked(
+                        "trading", "option_contracts", lambda request=request: self.trading.get_option_contracts(request))
+                data = serialize_model(response) or {}
+                contracts.extend(data.get("option_contracts") or [])
+                page_token = data.get("next_page_token")
+                if not page_token:
+                    break
+        return contracts
+
+    def get_option_contract(self, symbol: str) -> dict[str, Any]:
+        normalized = symbol.upper()
+        return self._cached_trading_read(
+            f"option_contract:{normalized}",
+            lambda: self.trading.get_option_contract(normalized),
+            ttl=self.settings.alpaca_asset_cache_seconds,
+            operation="option_contract",
+        )
+
+    def get_option_quotes(self, symbols: list[str]) -> dict[str, Any]:
+        """Latest option quotes from the free indicative feed (not actual OPRA quotes)."""
+        if self.option_data is None:
+            raise AlpacaServiceError("期权行情客户端未配置")
+        request = OptionLatestQuoteRequest(symbol_or_symbols=symbols, feed=OptionsFeed.INDICATIVE)
+        return serialize_model(self._data_read("option_quotes", lambda: self.option_data.get_option_latest_quote(request)))
+
+    def get_option_snapshots(self, symbols: list[str]) -> dict[str, Any]:
+        if self.option_data is None:
+            raise AlpacaServiceError("期权行情客户端未配置")
+        request = OptionSnapshotRequest(symbol_or_symbols=symbols, feed=OptionsFeed.INDICATIVE)
+        return serialize_model(self._data_read("option_snapshots", lambda: self.option_data.get_option_snapshot(request)))
+
+    def get_option_bars(self, symbols: list[str], timeframe: str, start: datetime, end: datetime) -> dict[str, pd.DataFrame]:
+        """Historical option bars (available since February 2024), regular and extended rows as reported."""
+        if self.option_data is None:
+            raise AlpacaServiceError("期权行情客户端未配置")
+        request = OptionBarsRequest(symbol_or_symbols=symbols, timeframe=self.timeframe(timeframe),
+                                    start=start, end=end)
+        response = self._data_read("option_bars", lambda: self.option_data.get_option_bars(request))
+        frame = response.df.copy() if hasattr(response, "df") else pd.DataFrame()
+        result: dict[str, pd.DataFrame] = {symbol: pd.DataFrame() for symbol in symbols}
+        if frame.empty:
+            return result
+        if isinstance(frame.index, pd.MultiIndex):
+            for symbol in symbols:
+                try:
+                    part = frame.xs(symbol, level="symbol").copy()
+                except (KeyError, ValueError):
+                    continue
+                result[symbol] = self._normalize_bar_frame(part)
+        else:
+            result[symbols[0]] = self._normalize_bar_frame(frame)
+        return result
+
     def get_latest_quotes(self, symbols: list[str]) -> dict[str, Any]:
         request = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX)
         return serialize_model(
@@ -1530,11 +1637,16 @@ class AlpacaService:
         limit_price: float | None = None,
         stop_price: float | None = None,
         take_price: float | None = None,
+        side: str = "buy",
     ) -> dict[str, Any]:
+        """Open a position: buy for long entries, sell for short entries.
+
+        Short brackets carry a stop above and a take-profit below the entry.
+        """
         self.require_connection()
         common: dict[str, Any] = {
             "symbol": symbol,
-            "side": OrderSide.BUY,
+            "side": OrderSide.SELL if side == "sell" else OrderSide.BUY,
             "time_in_force": TimeInForce.DAY if time_in_force == "day" else TimeInForce.GTC,
             "client_order_id": client_order_id,
         }
@@ -1576,14 +1688,17 @@ class AlpacaService:
         )
 
     def submit_exit_order(
-        self, symbol: str, qty: float, client_order_id: str
+        self, symbol: str, qty: float, client_order_id: str, side: str = "sell"
     ) -> dict[str, Any]:
-        """Sell only the quantity attributed to one QuantPilot strategy."""
+        """Close only the quantity attributed to one QuantPilot strategy.
+
+        Long positions (stocks and options) sell; short stock positions buy to cover.
+        """
         self.require_connection()
         request = MarketOrderRequest(
             symbol=symbol,
             qty=round(qty, 6),
-            side=OrderSide.SELL,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_order_id,
         )

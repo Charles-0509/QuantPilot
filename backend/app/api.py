@@ -56,6 +56,7 @@ from .schemas import (
 from .services.alpaca_service import AlpacaService
 from .services.auth import AuthenticatedSession
 from .services.backtest import run_backtest
+from .services.option_backtest import OPTION_DATA_START, RecordingOptionHistory, run_option_backtest
 from .services.backtest_artifacts import pack_experiment
 from .services.rules import required_history
 from .services.credentials import CredentialDecryptionError, decrypt_credential, encrypt_credential
@@ -847,6 +848,10 @@ def enable_strategy(
         raise HTTPException(status_code=422,detail='当前券商接入尚不支持移动止损，请改用规则离场或Bracket')
     if definition.paper_validation and not getattr(alpaca,'paper',True):
         raise HTTPException(status_code=422,detail='Paper验证策略不能在真实账户启用')
+    if definition.is_short and not getattr(alpaca, 'supports_short', False):
+        raise HTTPException(status_code=422, detail='当前券商接入不支持做空，请切换到 Alpaca 后再启用')
+    if definition.is_option and not getattr(alpaca, 'supports_options', False):
+        raise HTTPException(status_code=422, detail='当前券商接入不支持期权，请切换到 Alpaca 后再启用')
     enabled = db.scalars(
         select(Strategy).where(
             Strategy.enabled.is_(True), Strategy.owner_user_id == user_id
@@ -1044,11 +1049,34 @@ async def execute_backtest_job(
             artifact, metadata = pack_experiment(definition_data, payload_data, frames, frozen_risk,
                 data_feed=frames[requested[0]].attrs.get('data_feed') or getattr(alpaca,'feed','iex'),
                 adjustment=getattr(alpaca,'history_adjustment','all'))
-            metadata['warnings'] = [
+            warnings = [
                 f'{symbol} 在区间开始时预热不足（需要 {history_bars} 根）；数据满足前不会生成信号'
                 for symbol in definition.symbols
                 if frames[symbol].index.searchsorted(pd.Timestamp(payload.start), side='right') < history_bars
             ]
+            if definition.is_option:
+                history = RecordingOptionHistory(alpaca, definition.timeframe)
+                result = run_option_backtest(
+                    definition,
+                    {symbol: frames.get(symbol, pd.DataFrame()) for symbol in definition.symbols},
+                    history,
+                    initial_cash=payload.initial_cash,
+                    slippage_bps=payload.slippage_bps,
+                    commission=payload.commission,
+                    benchmark=frames[payload.benchmark].loc[frames[payload.benchmark].index >= payload.start],
+                    start=payload.start,
+                    end=payload.end,
+                    risk_settings=frozen_risk,
+                )
+                artifact, metadata = pack_experiment(
+                    definition_data, payload_data, {**frames, **history.frames}, frozen_risk,
+                    data_feed=frames[requested[0]].attrs.get('data_feed') or getattr(alpaca, 'feed', 'iex'),
+                    adjustment=getattr(alpaca, 'history_adjustment', 'all'), option_chains=history.chains)
+                warnings.append('期权价格来自 Alpaca 免费 indicative 数据（非交易所实际报价），成交为估算；'
+                                '历史数据从 2024 年 2 月开始，历史持仓量不可用，合约只按到期日和行权价规则选择。')
+                metadata['warnings'] = warnings
+                return result.metrics, result.equity_curve, result.benchmark_curve, result.trades, artifact, metadata
+            metadata['warnings'] = warnings
             result = run_backtest(
                 definition,
                 {symbol: frames.get(symbol, pd.DataFrame()) for symbol in definition.symbols},
@@ -1138,6 +1166,12 @@ async def create_backtest(
             status_code=422,
             detail=f"{definition.timeframe} 回测区间最多支持 {max_days} 天，请缩短日期范围",
         )
+    if definition.is_option:
+        start_utc = payload.start if payload.start.tzinfo else payload.start.replace(tzinfo=timezone.utc)
+        if start_utc < OPTION_DATA_START.to_pydatetime():
+            raise HTTPException(status_code=422, detail="期权历史数据从 2024 年 2 月开始，请把回测开始日期设在 2024-02-01 之后")
+        if not getattr(alpaca, "supports_options", False) or not hasattr(alpaca, "get_option_contracts"):
+            raise HTTPException(status_code=409, detail="期权回测需要 Alpaca 账户（当前券商接入不提供期权数据）")
     parameters = payload.model_dump(mode="json")
     parameters["symbols"] = definition.symbols
     parameters['strategy_definition'] = definition.model_dump(mode='json')
@@ -1494,7 +1528,7 @@ def signals(
     by_signal = {(order.signal_id, order.side): order for order in orders}
 
     def execution(row):
-        order = by_signal.get((row.id, row.action))
+        order = by_signal.get((row.id, {'short': 'sell', 'cover': 'buy'}.get(row.action, row.action)))
         if order is None:
             return {'execution_status': row.status, 'filled_qty': 0}
         status = TradingEngine._order_status_str({'status': order.status})

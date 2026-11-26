@@ -115,6 +115,36 @@ class StrategyRiskConfig(BaseModel):
     cooldown_bars: int = Field(default=1, ge=0, le=1000)
 
 
+class OptionConfig(BaseModel):
+    """Buy-to-open single-leg options chosen from the underlying signal.
+
+    Signals are evaluated on the underlying's bars. Each entry buys one listed
+    contract (a call for bullish rules, a put for bearish rules); exits sell the
+    same contract. Writing (selling to open) options is not supported.
+    """
+
+    right: Literal["call", "put"] = "call"
+    min_dte: int = Field(default=14, ge=1, le=365)
+    max_dte: int = Field(default=45, ge=1, le=730)
+    strike_mode: Literal["atm", "otm_pct", "itm_pct"] = "atm"
+    strike_offset_pct: float = Field(default=0.0, ge=0, le=50)
+    min_open_interest: int = Field(default=0, ge=0, le=1_000_000)
+    max_spread_pct: float = Field(default=25.0, gt=0, le=100)
+    stop_loss_pct: float | None = Field(default=50.0, gt=0, le=100)
+    take_profit_pct: float | None = Field(default=100.0, gt=0, le=1000)
+    close_dte: int = Field(default=1, ge=0, le=60)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "OptionConfig":
+        if self.max_dte < self.min_dte:
+            raise ValueError("期权最长到期天数不能小于最短到期天数")
+        if self.close_dte >= self.min_dte:
+            raise ValueError("到期前平仓天数必须小于最短到期天数，否则买入后会立即平仓")
+        if self.strike_mode == "atm" and self.strike_offset_pct:
+            raise ValueError("平值期权不需要行权价偏移")
+        return self
+
+
 class PaperValidationConfig(BaseModel):
     expires_at: AwareDatetime
     max_entries: int = Field(default=2, ge=1, le=4)
@@ -136,6 +166,11 @@ class RuleDefinition(BaseModel):
     order: OrderConfig = Field(default_factory=OrderConfig)
     risk: StrategyRiskConfig = Field(default_factory=StrategyRiskConfig)
     paper_validation: PaperValidationConfig | None = None
+    # long: buy to open / sell to close (the original behaviour).
+    # short: sell to open / buy to cover, stocks only, whole shares.
+    direction: Literal["long", "short"] = "long"
+    instrument: Literal["stock", "option"] = "stock"
+    option: OptionConfig | None = None
 
     @field_validator("symbols")
     @classmethod
@@ -146,6 +181,38 @@ class RuleDefinition(BaseModel):
         if len(set(symbols)) != len(symbols):
             raise ValueError("股票池不能包含重复代码")
         return symbols
+
+    @model_validator(mode="after")
+    def validate_instrument(self) -> "RuleDefinition":
+        if self.instrument == "stock" and self.option is not None:
+            raise ValueError("股票策略不能填写期权参数")
+        if self.direction == "short":
+            if self.instrument != "stock":
+                raise ValueError("做空仅支持股票；看跌观点请使用买入看跌期权")
+            if self.order.trailing_stop is not None:
+                raise ValueError("做空策略暂不支持移动止损，请使用 bracket 止损止盈")
+            if self.paper_validation is not None:
+                raise ValueError("做空策略不能用于 Paper 买卖验证")
+        if self.instrument == "option":
+            if self.option is None:
+                raise ValueError("期权策略需要填写期权参数")
+            if self.order.stop_loss or self.order.take_profit or self.order.trailing_stop:
+                raise ValueError("期权不支持 bracket/移动止损，请在期权参数中设置权利金止损止盈")
+            if self.position.mode == "risk_based":
+                raise ValueError("期权策略请按金额、净值比例或固定张数开仓")
+            if self.order.time_in_force != "day":
+                raise ValueError("期权订单只使用当日有效（day）")
+            if self.paper_validation is not None:
+                raise ValueError("期权策略不能用于 Paper 买卖验证")
+        return self
+
+    @property
+    def is_short(self) -> bool:
+        return self.direction == "short"
+
+    @property
+    def is_option(self) -> bool:
+        return self.instrument == "option"
 
 
 class StrategyCreate(BaseModel):

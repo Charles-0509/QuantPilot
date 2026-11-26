@@ -35,6 +35,9 @@ class IBKRService:
     supports_trailing_stop = False
     supports_streaming = False
     supports_cash_sweep = False
+    # Short selling and options need IBKR permissions and market data this adapter does not handle yet.
+    supports_short = False
+    supports_options = False
     history_adjustment = "broker_default"
 
     def __init__(

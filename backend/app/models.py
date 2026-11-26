@@ -174,7 +174,7 @@ class EventLog(Base):
 
 
 class ExecutionIncident(Base):
-    """Persistent long-only quarantine for one user and symbol."""
+    """Persistent execution quarantine (long-only or owned-short invariant) for one user and symbol."""
 
     __tablename__ = "execution_incidents"
     __table_args__ = (

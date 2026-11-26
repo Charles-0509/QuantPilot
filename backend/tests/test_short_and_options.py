@@ -481,3 +481,48 @@ def test_performance_attributes_short_and_option_pnl(env):
     assert trades["SPY"]["side"] == "short" and trades["SPY"]["pnl"] == pytest.approx(50.0)
     assert trades["SPY260814C00100000"]["pnl"] == pytest.approx(200.0)       # (3 - 2) x 2 contracts x 100
     assert rows[0]["realized_pnl"] == pytest.approx(250.0)
+
+
+@pytest.mark.asyncio
+async def test_short_bracket_reconciles_without_false_quarantine(env):
+    engine, broker, sessions = env
+    add_strategy(sessions, definition(direction="short", name="short spy"))
+    await engine.evaluate_active_strategies(force=True)
+    entry = next(iter(broker.orders.values()))
+    legs = [{"id": "leg-tp", "client_order_id": "tp", "symbol": "SPY", "side": "buy", "type": "limit", "qty": "10",
+             "filled_qty": "0", "status": "held", "parent_order_id": entry["id"], "limit_price": "96"},
+            {"id": "leg-sl", "client_order_id": "sl", "symbol": "SPY", "side": "buy", "type": "stop", "qty": "10",
+             "filled_qty": "0", "status": "held", "parent_order_id": entry["id"], "stop_price": "102"}]
+    entry.update(order_class="bracket", legs=legs)
+
+    # Unfilled: the open short entry and its held buy legs are consistent.
+    await engine.reconcile_orders()
+    with sessions() as db:
+        assert db.scalar(select(engine_module.ExecutionIncident.id)) is None
+
+    # Filled: legs become active, the account is short exactly the owned 10 shares.
+    entry.update(status="filled", filled_qty="10", filled_avg_price="100")
+    for leg in legs:
+        leg["status"] = "new"
+    broker.positions = [{"symbol": "SPY", "qty": "-10", "market_value": "-1000"}]
+    await engine.reconcile_orders()
+    assert ledger(sessions, "SPY") == -10
+    with sessions() as db:
+        assert db.scalar(select(engine_module.ExecutionIncident.id)) is None
+        assert db.scalar(select(EngineState)).status == "running"
+
+    # Take-profit leg fills: the short is covered and the ledger returns to zero.
+    legs[0].update(status="filled", filled_qty="10", filled_avg_price="96")
+    legs[1]["status"] = "canceled"
+    broker.positions = []
+    await engine.reconcile_orders()
+    assert ledger(sessions, "SPY") == 0
+    with sessions() as db:
+        assert db.scalar(select(engine_module.ExecutionIncident.id)) is None
+
+    # A manual extra short on the same symbol is still quarantined.
+    broker.positions = [{"symbol": "SPY", "qty": "-5", "market_value": "-500"}]
+    await engine.reconcile_orders()
+    with sessions() as db:
+        incident = db.scalar(select(engine_module.ExecutionIncident))
+    assert incident is not None and incident.status == "active"

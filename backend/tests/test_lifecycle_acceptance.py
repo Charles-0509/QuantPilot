@@ -123,15 +123,17 @@ def test_o1_historical_choice_skips_contracts_listed_after_the_signal():
 
     class History(ReplayOptionHistory):
         def contracts(self, *args):
-            return _chain([later_listed, listed])
+            return _chain([later_listed, never_traded, listed])
 
-    history = History({}, {later_listed: bars(underlying.index[31:], 3.0), listed: bars(underlying.index[25:], 2.5)})
+    never_traded = option_symbol("SPY", expiry, "call", 100.5)            # ranks second, never traded
+    history = History({}, {later_listed: bars(underlying.index[31:], 3.0), listed: bars(underlying.index[25:], 2.5),
+                           never_traded: pd.DataFrame()})
     model = RuleDefinition.model_validate(option_definition(timeframe="1Day", option={**OPTION_CONFIG, "min_dte": 20, "max_dte": 40,
                                                                                          "take_profit_pct": None, "stop_loss_pct": None}))
     trades = run_option_backtest(model, {"SPY": underlying}, history, slippage_bps=0, start=signal_day).trades
     assert trades[0]["symbol"] == listed
     record("O1 历史选约只用已挂牌合约", inputs={"preferred": later_listed, "preferred_first_bar": "signal+1",
-                                       "fallback": listed},
+                                       "never_traded": never_traded, "fallback": listed},
            expected={"contract": listed}, actual={"contract": trades[0]["symbol"]}, final={listed: 0})
 
 

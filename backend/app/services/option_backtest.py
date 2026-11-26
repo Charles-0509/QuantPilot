@@ -50,6 +50,14 @@ class OptionPosition:
     fees: float = 0.0
 
 
+def _option_frame(frame: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalise option bars; a contract that never traded returns an empty frame."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
+                            index=pd.DatetimeIndex([], tz="UTC"))
+    return ensure_frame(frame)
+
+
 def _et_date(timestamp: pd.Timestamp) -> date:
     stamp = pd.Timestamp(timestamp)
     return (stamp.tz_convert("America/New_York") if stamp.tzinfo else stamp).date()
@@ -146,7 +154,9 @@ def run_option_backtest(
 
     def open_position(underlying: str, signal_time: pd.Timestamp, timestamp: pd.Timestamp) -> None:
         nonlocal cash
-        spot = underlying_close.get(underlying)
+        # Same as live trading: the contract is chosen from the signal bar's close.
+        frame = frames[underlying]
+        spot = float(frame.loc[signal_time, "close"]) if signal_time in frame.index else None
         if not spot:
             return
         today = _et_date(signal_time)
@@ -161,7 +171,7 @@ def run_option_backtest(
         for candidate in rank_contracts(contracts, spot, relaxed, today)[:LISTING_CANDIDATES]:
             symbol = str(candidate["symbol"]).upper()
             parsed = parse_option_symbol(symbol)
-            bars = ensure_frame(history.bars(symbol, pd.Timestamp(signal_time) - pd.Timedelta(days=10),
+            bars = _option_frame(history.bars(symbol, pd.Timestamp(signal_time) - pd.Timedelta(days=10),
                                              min(final_end, pd.Timestamp(parsed.expiration, tz="America/New_York")
                                                  + pd.Timedelta(days=1))))
             if not bars.empty and bars.index[0] <= pd.Timestamp(signal_time):

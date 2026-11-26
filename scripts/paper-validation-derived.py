@@ -30,7 +30,7 @@ _base = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_base)
 api_session, broker, save, utc = _base.api_session, _base.broker, _base.save, _base.utc
 
-SHORT_CANDIDATES = ["TSLA", "NVDA", "AAPL", "QQQ", "SPY"]
+SHORT_CANDIDATES = ["TSLA", "NVDA", "AAPL", "QQQ", "SPY", "AMD", "INTC", "BAC", "KO", "PFE", "F", "T", "XLF", "IWM", "DIS"]
 OPTION_UNDERLYINGS = ["SPY", "QQQ"]
 MAX_NOTIONAL = 1000.0
 TERMINAL = {"filled", "canceled", "cancelled", "expired", "rejected", "replaced"}
@@ -85,19 +85,26 @@ def preflight(alpaca, user_id, require_open=True):
         raise RuntimeError(f"账户已有 {len(held)} 个持仓，加 2 个测试持仓会超过全局上限 {risk.max_positions}")
     quotes = alpaca.get_latest_quotes(SHORT_CANDIDATES)
     short_symbol = None
+    skipped = {}
     for symbol in SHORT_CANDIDATES:
         asset = alpaca.get_asset(symbol)
         bid = float((quotes.get(symbol) or {}).get("bid_price") or 0)
-        if (symbol not in held and symbol not in open_symbols and symbol not in used and asset.get("shortable")
-                and asset.get("easy_to_borrow") and 0 < bid <= MAX_NOTIONAL * 0.95):
+        reasons = [label for label, bad in (("已持有", symbol in held), ("有挂单", symbol in open_symbols),
+                                            ("其他策略使用", symbol in used), ("不可做空", not asset.get("shortable")),
+                                            ("非易借券", not asset.get("easy_to_borrow")),
+                                            ("价格不符", not 0 < bid <= MAX_NOTIONAL * 0.95)) if bad]
+        if not reasons:
             short_symbol = symbol
             break
+        skipped[symbol] = reasons
     if short_symbol is None:
-        raise RuntimeError("没有同时满足：未持有、无挂单、无其他策略使用、易借券、价格≤950 的做空候选")
+        raise RuntimeError(f"没有合适的做空候选：{json.dumps(skipped, ensure_ascii=False)}")
     today = datetime.now(timezone.utc).date()
     option_choice = None
     for underlying in OPTION_UNDERLYINGS:
-        spot = float((alpaca.get_latest_quotes([underlying]).get(underlying) or {}).get("ask_price") or 0)
+        # Latest trade, like the engine's bar close; an off-hours IEX ask can be far from the market.
+        snapshot = (alpaca.get_snapshots([underlying]) or {}).get(underlying) or {}
+        spot = float((snapshot.get("latest_trade") or {}).get("price") or 0)
         if spot <= 0:
             continue
         for offset in (4.0, 6.0, 8.0, 10.0):

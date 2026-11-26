@@ -24,7 +24,9 @@ from app.schemas import RuleDefinition
 
 from .backtest import BacktestResult, MAX_CHART_POINTS, build_benchmark_curve, calculate_metrics, curve_sample_indices
 from .indicators import ensure_frame
-from .instruments import OPTION_MULTIPLIER, choose_contract, days_to_expiry, parse_option_symbol
+from .instruments import OPTION_MULTIPLIER, days_to_expiry, parse_option_symbol, rank_contracts
+
+LISTING_CANDIDATES = 6       # contracts tried, in preference order, until one was trading at signal time
 from .rules import evaluate_tree, required_history
 
 OPTION_DATA_START = pd.Timestamp("2024-02-01", tz="UTC")
@@ -153,14 +155,21 @@ def run_option_backtest(
                                       today + timedelta(days=config.max_dte), spot * (1 - room), spot * (1 + room))
         # Historical open interest is not available per date; only the listing rule applies.
         relaxed = config.model_copy(update={"min_open_interest": 0})
-        contract = choose_contract(contracts, spot, relaxed, today)
-        if contract is None:
+        # The contract list includes contracts listed after the signal (e.g. new weeklies).
+        # Accept a candidate only if it already printed a bar at or before the signal time.
+        chosen = None
+        for candidate in rank_contracts(contracts, spot, relaxed, today)[:LISTING_CANDIDATES]:
+            symbol = str(candidate["symbol"]).upper()
+            parsed = parse_option_symbol(symbol)
+            bars = ensure_frame(history.bars(symbol, pd.Timestamp(signal_time) - pd.Timedelta(days=10),
+                                             min(final_end, pd.Timestamp(parsed.expiration, tz="America/New_York")
+                                                 + pd.Timedelta(days=1))))
+            if not bars.empty and bars.index[0] <= pd.Timestamp(signal_time):
+                chosen = (symbol, parsed, bars)
+                break
+        if chosen is None:
             return
-        symbol = str(contract["symbol"]).upper()
-        parsed = parse_option_symbol(symbol)
-        bars = ensure_frame(history.bars(symbol, pd.Timestamp(signal_time) - pd.Timedelta(days=1),
-                                         min(final_end, pd.Timestamp(parsed.expiration, tz="America/New_York")
-                                             + pd.Timedelta(days=1))))
+        symbol, parsed, bars = chosen
         stamp, bar = option_bar(bars, signal_time, after=True, same_day=False)
         if bar is None or stamp > timestamp or _et_date(stamp) != _et_date(timestamp):
             # No option print between the signal and this bar: skip rather than fill in the future.

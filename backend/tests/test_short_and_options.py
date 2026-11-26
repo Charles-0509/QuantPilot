@@ -423,9 +423,10 @@ def test_option_backtest_uses_listed_contracts_and_premium_take_profit():
     signal_day = underlying.index[30]
     expiry = (signal_day.tz_convert("America/New_York") + pd.Timedelta(days=31)).date()
     symbol = option_symbol("SPY", expiry, "call", 100)
-    premiums = [2.0, 2.4, 3.5, 3.9, 5.0]     # the 3.9 bar trades up to 4.095, through the +100% target
+    # Listed and trading before the signal; the 3.9 bar trades up to 4.095, through the +100% target.
+    premiums = [1.9, 1.9, 2.0, 2.4, 3.5, 3.9, 5.0]
     option_bars = pd.DataFrame({"open": premiums, "high": [p * 1.05 for p in premiums], "low": [p * 0.95 for p in premiums],
-                                "close": premiums, "volume": 100.0}, index=underlying.index[31:36])
+                                "close": premiums, "volume": 100.0}, index=underlying.index[29:36])
     definition_model = RuleDefinition.model_validate(option_definition(
         timeframe="1Day", entry=condition(">", 0),
         option={**OPTION_CONFIG, "min_dte": 20, "max_dte": 40}))

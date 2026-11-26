@@ -79,11 +79,17 @@ def target_strike(underlying_price: float, right: str, mode: str, offset_pct: fl
 
 
 def choose_contract(contracts: list[dict], underlying_price: float, config, today: date) -> dict | None:
-    """Pick the listed contract closest to the configured expiry window and strike.
+    """Pick the listed contract closest to the configured expiry window and strike."""
+    ranked = rank_contracts(contracts, underlying_price, config, today)
+    return ranked[0] if ranked else None
 
-    The expiration nearest the middle of [min_dte, max_dte] wins; ties prefer the
-    earlier date. Within it, the strike closest to the target wins, preferring the
-    more out-of-the-money strike on ties (it costs less).
+
+def rank_contracts(contracts: list[dict], underlying_price: float, config, today: date) -> list[dict]:
+    """Eligible contracts in preference order.
+
+    The expiration nearest the middle of [min_dte, max_dte] ranks first (ties prefer
+    the earlier date); within an expiration the strike closest to the target ranks
+    first, preferring the more out-of-the-money strike on ties (it costs less).
     """
     eligible = []
     for contract in contracts:
@@ -103,12 +109,9 @@ def choose_contract(contracts: list[dict], underlying_price: float, config, toda
         if config.min_open_interest and (open_interest is None or float(open_interest) < config.min_open_interest):
             continue
         eligible.append((parsed, contract, dte))
-    if not eligible:
-        return None
     middle = (config.min_dte + config.max_dte) / 2
-    best_dte = min({dte for _parsed, _contract, dte in eligible}, key=lambda dte: (abs(dte - middle), dte))
-    same_expiry = [(parsed, contract) for parsed, contract, dte in eligible if dte == best_dte]
     target = target_strike(underlying_price, config.right, config.strike_mode, config.strike_offset_pct)
     otm_sign = 1 if config.right == "call" else -1
-    parsed, contract = min(same_expiry, key=lambda item: (abs(item[0].strike - target), -otm_sign * item[0].strike))
-    return contract
+    ordered = sorted(eligible, key=lambda item: (abs(item[2] - middle), item[2],
+                                                 abs(item[0].strike - target), -otm_sign * item[0].strike))
+    return [contract for _parsed, contract, _dte in ordered]

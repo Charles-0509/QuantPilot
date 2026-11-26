@@ -22,6 +22,7 @@ from .risk import as_float
 EXIT_LABELS = {
     "stop_loss": "止损", "trailing_stop": "移动止损", "take_profit": "止盈",
     "strategy_exit": "策略离场信号", "other": "其他卖出",
+    "expiration": "期权到期作废", "exercise": "期权到期行权",
 }
 
 
@@ -44,6 +45,10 @@ def _fill_time(record: OrderRecord) -> datetime:
 
 def exit_kind(record: OrderRecord, signal: Signal | None) -> str:
     order_type = str(record.order_type or _order_payload(record).get("type") or "").lower().split(".")[-1]
+    if order_type == "option_expiration":
+        return "expiration"
+    if order_type == "option_exercise":
+        return "exercise"
     if "trailing" in order_type:
         return "trailing_stop"
     if "stop" in order_type:
@@ -81,7 +86,7 @@ def strategy_performance(db: Session, user_id: int, prices: dict[str, float] | N
     for record in sorted(records, key=_fill_time):
         key = (record.strategy_id, record.symbol.upper())
         price = as_float(record.filled_avg_price)
-        if price <= 0:
+        if price <= 0 and record.order_type not in ("option_expiration", "option_exercise"):
             continue
         signal = signals.get(record.signal_id) if record.signal_id else None
         short = signal is not None and signal.action in ("short", "cover")

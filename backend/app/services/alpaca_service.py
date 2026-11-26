@@ -1451,6 +1451,15 @@ class AlpacaService:
                     break
         return contracts
 
+    def get_option_activities(self, after: date) -> list[dict[str, Any]]:
+        """Option expiry (OPEXP), exercise (OPEXC) and assignment (OPASN) events since a date."""
+        params = {"activity_types": "OPEXP,OPEXC,OPASN", "after": after.isoformat(), "page_size": 100}
+        with self._trading_lock:
+            self.require_connection()
+            rows = self._resilient_locked(
+                "trading", "option_activities", lambda: self.trading.get("/account/activities", params))
+        return serialize_model(rows) or []
+
     def get_option_contract(self, symbol: str) -> dict[str, Any]:
         normalized = symbol.upper()
         return self._cached_trading_read(

@@ -2429,7 +2429,12 @@ class TradingEngine:
                 "strategy_version": strategy.version,
                 "client_order_id": client_id,
                 "side": "sell" if short else "buy",
-                **({"direction": "short"} if short else {}),
+                **({"direction": "short",
+                    # Borrow and margin facts seen when the short was decided (audit trail).
+                    "borrow": {"shortable": asset.get("shortable"), "easy_to_borrow": asset.get("easy_to_borrow"),
+                               "marginable": asset.get("marginable"), "locate_fee": 0.0,
+                               "account_multiplier": account.get("multiplier"),
+                               "shorting_enabled": account.get("shorting_enabled")}} if short else {}),
                 "qty": qty,
                 "notional": desired_notional,
                 "original_qty": qty,
@@ -3558,6 +3563,81 @@ class TradingEngine:
              "risk_settings_snapshot": self._risk_settings_snapshot(risk_settings)},
         )
 
+    async def _settle_expired_options(self) -> list[str]:
+        """Close the ledger for contracts that expired while still owned.
+
+        After expiration Alpaca removes the position (worthless expiry) or
+        replaces it with shares (exercise/assignment). Without this step the
+        audit would read "owned > actual" and quarantine a normal expiry. Only
+        contracts past their expiration close with no broker position settle.
+        """
+        now_et = datetime.now(ET)
+        with SessionLocal() as db:
+            rows = [row for row in db.scalars(select(StrategyPosition).where(
+                StrategyPosition.user_id == self.user_id, StrategyPosition.qty > 0)).all()
+                if (parsed := parse_option_symbol(row.symbol)) is not None
+                and (parsed.expiration < now_et.date() or (parsed.expiration == now_et.date() and now_et.hour >= 16))]
+        if not rows:
+            return []
+        positions = await self._fresh_positions()
+        expired = [row for row in rows if abs(self._position_qty(positions, row.symbol)) <= 1e-9]
+        if not expired:
+            return []
+        activities: dict[str, dict[str, Any]] = {}
+        reader = getattr(self.alpaca, "get_option_activities", None)
+        if reader is not None:
+            earliest = min(parse_option_symbol(row.symbol).expiration for row in expired) - timedelta(days=1)
+            try:
+                for item in await asyncio.to_thread(reader, earliest):
+                    activities[str(item.get("symbol") or "").upper()] = item
+            except Exception as exc:
+                logger.warning("Option activities unavailable: %s", exc)
+        intrinsic: dict[str, float] = {}
+        for held in expired:
+            parsed = parse_option_symbol(held.symbol)
+            kind = str((activities.get(held.symbol.upper()) or {}).get("activity_type") or "").upper().split(".")[-1]
+            if kind not in {"OPEXC", "OPASN"}:
+                continue
+            try:
+                frames = await asyncio.to_thread(self.alpaca.recent_bars, [parsed.root], "1Day", 15)
+                frame = frames.get(parsed.root)
+                closes = frame[frame.index.tz_convert(ET).date == parsed.expiration]["close"] if frame is not None else []
+                if len(closes):
+                    spot = float(closes.iloc[-1])
+                    intrinsic[held.symbol] = max(0.0, spot - parsed.strike if parsed.right == "call" else parsed.strike - spot)
+            except Exception as exc:
+                logger.warning("Expiry close for %s unavailable: %s", held.symbol, exc)
+        settled: list[str] = []
+        with SessionLocal() as db:
+            for held in expired:
+                row = db.get(StrategyPosition, held.id)
+                parsed = parse_option_symbol(row.symbol)
+                activity = activities.get(row.symbol.upper()) or {}
+                kind = str(activity.get("activity_type") or "OPEXP").upper().split(".")[-1]
+                exercised = kind in {"OPEXC", "OPASN"}
+                record_id = f"expiry-{row.strategy_id[:12]}-{row.symbol}"
+                if db.get(OrderRecord, record_id) is None:
+                    db.add(OrderRecord(
+                        id=record_id, user_id=self.user_id, client_order_id=record_id, strategy_id=row.strategy_id,
+                        signal_id=None, symbol=row.symbol, side="sell",
+                        order_type="option_exercise" if exercised else "option_expiration",
+                        qty=row.qty, notional=None, status="filled", filled_qty=row.qty,
+                        # Worthless expiry closes at 0. Exercise/assignment closes at intrinsic value
+                        # from the expiration-day close; the shares it creates are not strategy-owned.
+                        filled_avg_price=intrinsic.get(row.symbol, 0.0) if exercised else 0.0,
+                        raw={"filled_at": datetime.combine(parsed.expiration, datetime_time(16, 0), tzinfo=ET).isoformat(),
+                             "activity": activity, "settlement": "exercise" if exercised else "worthless",
+                             "settlement_price_source": ("expiration_close_intrinsic" if row.symbol in intrinsic
+                                                         else "unavailable") if exercised else "worthless"}))
+                row.qty = 0.0
+                settled.append(row.symbol)
+                db.add(EventLog(user_id=self.user_id, level="warning", category="order",
+                                message=(f"{row.symbol} 到期被行权/指派，已结束策略期权归属；生成的{parsed.root}持仓需人工确认"
+                                         if exercised else f"{row.symbol} 到期作废（价外），已结束策略期权归属"),
+                                details={"activity": activity, "qty": held.qty}))
+            db.commit()
+        return settled
+
     async def _manage_option_positions(self, items: list[PreparedStrategy], snapshot: "EvaluationSnapshot") -> None:
         """Premium stop/take-profit and pre-expiry exits for strategy-owned contracts."""
         now = datetime.now(timezone.utc)
@@ -3586,6 +3666,9 @@ class TradingEngine:
         except Exception as exc:
             quotes = {}
             await self._log_throttled(held[0][0].strategy, "options", f"期权持仓报价读取失败，止损止盈暂缓检查：{exc}")
+        with SessionLocal() as db:
+            risk_settings = db.scalar(select(RiskSettings).where(RiskSettings.user_id == self.user_id))
+        stale_seconds = getattr(risk_settings, "stale_data_seconds", None) or 300
         minute = now.replace(second=0, microsecond=0)
         for item, symbol, qty in held:
             if self._abort_new_orders_for_cycle:
@@ -3596,7 +3679,8 @@ class TradingEngine:
             reason = ""
             bid, _ask, quote_time = self._option_quote(quotes, symbol)
             entry = as_float(snapshot.position_map.get(symbol, {}).get("avg_entry_price"))
-            quote_fresh = quote_time is not None and (now - quote_time).total_seconds() <= 300
+            # A stale quote must never trigger a premium stop or take-profit.
+            quote_fresh = quote_time is not None and -2 <= (now - quote_time).total_seconds() <= stale_seconds
             if dte <= config.close_dte:
                 reason = f"距到期还有 {dte} 天，按规则平仓"
             elif quote_fresh and entry > 0 and bid > 0:
@@ -4469,6 +4553,7 @@ class TradingEngine:
             # Historical/all-order snapshots can retain canceled legs. They are
             # for fill accounting, not a current executable-sell inventory.
             async with self._order_submission_lock:
+                await self._settle_expired_options()
                 violations, snapshots = await self._audit_reconciliation_snapshot(orders, all_orders_observed_at)
                 already_held = {row.symbol for row in self._hold_incidents()}
                 for symbol, reason in violations.items():

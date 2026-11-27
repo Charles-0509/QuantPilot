@@ -56,7 +56,9 @@ def base_definition(name, symbol, run_id, expires_at):
         "schedule": {"session": "regular", "weekdays": [0, 1, 2, 3, 4]},
         "entry": ALWAYS_ENTER, "exit": NEXT_BAR_EXIT,
         "position": {"mode": "fixed_qty", "value": 1, "allow_pyramiding": False, "max_additions": 1},
-        "risk": {"max_symbol_pct": 10, "max_positions": 1, "cooldown_bars": 100},
+        # Strategy max_positions counts every account position (not only this strategy's), so a
+        # value of 1 rejects the entry whenever the account holds anything; the global limit governs.
+        "risk": {"max_symbol_pct": 10, "max_positions": 30, "cooldown_bars": 100},
         "paper_validation": {"expires_at": expires_at.isoformat(), "max_entries": 1, "max_quantity": 1,
                              "max_notional": MAX_NOTIONAL},
     }

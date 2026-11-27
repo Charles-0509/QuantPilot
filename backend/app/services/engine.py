@@ -2799,6 +2799,9 @@ class TradingEngine:
                 "submitted_at": datetime.now(timezone.utc).isoformat(),
             }
             signal_payload.pop("next_attempt_at", None)
+            # A retried submit that finally succeeded is not an error; keep the earlier reason as history.
+            if signal_payload.get("error"):
+                signal_payload["last_retry_error"] = signal_payload.pop("error")
             signal.payload = signal_payload
             db.commit()
             db.refresh(signal)

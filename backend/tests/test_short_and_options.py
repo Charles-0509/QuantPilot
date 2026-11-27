@@ -582,3 +582,20 @@ async def test_paper_validation_caps_option_contracts_and_premium(env):
     engine._last_evaluated.clear()
     await engine.evaluate_active_strategies(force=True)
     assert len(broker.entries) == 1 and broker.entries[0]["qty"] == 1          # $210 premium <= $1,000 cap
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_clears_the_error_shown_for_the_signal(env):
+    engine, broker, sessions = env
+    add_strategy(sessions, definition(name="long spy"))
+    await engine.evaluate_active_strategies(force=True)
+    with sessions() as db:
+        signal = db.scalar(select(Signal))
+        signal.payload = {**signal.payload, "error": "策略自有未成交订单未能全部取消，已中止本次平仓"}
+        db.commit()
+        signal_id = signal.id
+    order = next(iter(broker.orders.values()))
+    engine._save_submitted_order(signal_id, order)
+    with sessions() as db:
+        payload = db.get(Signal, signal_id).payload
+    assert "error" not in payload and payload["last_retry_error"].startswith("策略自有")
